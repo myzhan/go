@@ -4,9 +4,26 @@
 
 package sync
 
-import _ "unsafe"
+import "unsafe"
 
 // defined in package runtime
+
+// weave scheduling-point support. weaveGloballyActive is nonzero while a weave
+// controlled bubble exists; when it is zero (the common case) Lock/Unlock skip
+// the hook with a single load. runtime_weaveSchedPoint records the operation as
+// a weave transition and is a no-op outside a controlled bubble.
+
+//go:linkname weaveGloballyActive runtime.weaveGloballyActive
+var weaveGloballyActive uint32
+
+// weave operation codes, kept in sync with runtime weaveOp.
+const (
+	weaveOpLock   = 3
+	weaveOpUnlock = 4
+)
+
+//go:linkname runtime_weaveSchedPoint runtime.weaveSchedPoint
+func runtime_weaveSchedPoint(op uint8, addr unsafe.Pointer)
 
 // SemacquireMutex is like Semacquire, but for profiling contended
 // Mutexes and RWMutexes.

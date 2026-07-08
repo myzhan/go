@@ -59,6 +59,12 @@ const (
 //
 // See package [sync.Mutex] documentation.
 func (m *Mutex) Lock() {
+	// weave: record the lock acquisition as a scheduling point/transition so the
+	// interleaving explorer can reason about it. Gated by a single global load;
+	// no-op outside a weave controlled bubble.
+	if weaveGloballyActive != 0 {
+		runtime_weaveSchedPoint(weaveOpLock, unsafe.Pointer(m))
+	}
 	// Fast path: grab unlocked mutex.
 	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
 		if race.Enabled {
@@ -185,6 +191,11 @@ func (m *Mutex) lockSlow() {
 //
 // See package [sync.Mutex] documentation.
 func (m *Mutex) Unlock() {
+	// weave: record the unlock as a scheduling point/transition. Gated by a
+	// single global load; no-op outside a weave controlled bubble.
+	if weaveGloballyActive != 0 {
+		runtime_weaveSchedPoint(weaveOpUnlock, unsafe.Pointer(m))
+	}
 	if race.Enabled {
 		_ = m.state
 		race.Release(unsafe.Pointer(m))

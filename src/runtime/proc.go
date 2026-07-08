@@ -1131,6 +1131,15 @@ const (
 
 // Mark gp ready to run.
 func ready(gp *g, traceskip int, next bool) {
+	// In a controlled bubble, a participant woken by a synchronization operation
+	// is captured by the controller instead of being made OS-runnable; it stays
+	// parked until the controller grants it the run token. Controller grants use
+	// weaveGrant, which bypasses this path.
+	if weaveControlledParticipant(gp) {
+		weaveEnqueue(gp)
+		return
+	}
+
 	status := readgstatus(gp)
 
 	// Mark runnable.
@@ -4316,6 +4325,13 @@ func park_m(gp *g) {
 		bubble.decActive()
 	}
 
+	// In a controlled bubble, a participant that blocked on a real
+	// synchronization operation (anything other than an explicit weave yield)
+	// hands the run token to the next runnable participant.
+	if bubble != nil && bubble.controlled && gp != bubble.root && gp.waitreason != waitReasonWeaveScheduled {
+		weaveOnBlock(bubble)
+	}
+
 	schedule()
 }
 
@@ -4511,7 +4527,16 @@ func goexit0(gp *g) {
 		// Since this is running on g0, our registers are already zeroed from going through
 		// mcall in secret mode.
 	}
+	// Capture the controlled bubble before gdestroy clears gp.bubble, so we can
+	// hand the run token to the next participant after this one has fully exited.
+	var weaveBubble *synctestBubble
+	if gp.bubble != nil && gp.bubble.controlled {
+		weaveBubble = gp.bubble
+	}
 	gdestroy(gp)
+	if weaveBubble != nil {
+		weaveOnGoexit(weaveBubble)
+	}
 	schedule()
 }
 
@@ -5334,6 +5359,16 @@ func malg(stacksize int32) *g {
 func newproc(fn *funcval) {
 	gp := getg()
 	pc := sys.GetCallerPC()
+	if weaveActive() {
+		// In a controlled bubble, the child starts parked and waits for the
+		// controller to grant it the run token; the parent keeps running.
+		bubble := gp.bubble
+		systemstack(func() {
+			newg := newproc1(fn, gp, pc, true, waitReasonWeaveScheduled)
+			weaveRegisterChild(bubble, newg)
+		})
+		return
+	}
 	systemstack(func() {
 		newg := newproc1(fn, gp, pc, false, waitReasonZero)
 

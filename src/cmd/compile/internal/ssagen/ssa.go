@@ -165,6 +165,10 @@ func InitConfig() {
 	ir.Syms.Racereadrange = typecheck.LookupRuntimeFunc("racereadrange")
 	ir.Syms.Racewrite = typecheck.LookupRuntimeFunc("racewrite")
 	ir.Syms.Racewriterange = typecheck.LookupRuntimeFunc("racewriterange")
+	ir.Syms.Weaveread = typecheck.LookupRuntimeFunc("weaveread")
+	ir.Syms.Weavereadrange = typecheck.LookupRuntimeFunc("weavereadrange")
+	ir.Syms.Weavewrite = typecheck.LookupRuntimeFunc("weavewrite")
+	ir.Syms.Weavewriterange = typecheck.LookupRuntimeFunc("weavewriterange")
 	ir.Syms.TypeAssert = typecheck.LookupRuntimeFunc("typeAssert")
 	ir.Syms.WBZero = typecheck.LookupRuntimeFunc("wbZero")
 	ir.Syms.WBMove = typecheck.LookupRuntimeFunc("wbMove")
@@ -1562,6 +1566,27 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 			panic("unreachable")
 		}
 		needWidth = true
+	} else if base.Flag.Weave && t.NumComponents(types.CountBlankFields) > 1 {
+		// Composite objects: instrument the whole range, since a write might
+		// touch any subobject.
+		switch kind {
+		case instrumentRead:
+			fn = ir.Syms.Weavereadrange
+		case instrumentWrite:
+			fn = ir.Syms.Weavewriterange
+		default:
+			panic("unreachable")
+		}
+		needWidth = true
+	} else if base.Flag.Weave {
+		switch kind {
+		case instrumentRead:
+			fn = ir.Syms.Weaveread
+		case instrumentWrite:
+			fn = ir.Syms.Weavewrite
+		default:
+			panic("unreachable")
+		}
 	} else {
 		panic("unreachable")
 	}

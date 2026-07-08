@@ -572,6 +572,12 @@ type g struct {
 	coroarg *coro // argument during coroutine transfers
 	bubble  *synctestBubble
 
+	// weaveWid is this goroutine's stable participant id within a controlled
+	// weave bubble (assigned in enrollment order, deterministic given the
+	// schedule prefix). Used by the exploration engine to identify processes
+	// across runs. Only meaningful when bubble != nil && bubble.controlled.
+	weaveWid int32
+
 	// xRegs stores the extended register state if this G has been
 	// asynchronously preempted.
 	xRegs xRegPerG
@@ -1268,6 +1274,7 @@ const (
 	waitReasonSynctestSelect                          // "select (durable)"
 	waitReasonSynctestWaitGroupWait                   // "sync.WaitGroup.Wait (durable)"
 	waitReasonCleanupWait                             // "cleanup wait"
+	waitReasonWeaveScheduled                          // "weave scheduled"
 )
 
 var waitReasonStrings = [...]string{
@@ -1318,6 +1325,7 @@ var waitReasonStrings = [...]string{
 	waitReasonSynctestSelect:        "select (durable)",
 	waitReasonSynctestWaitGroupWait: "sync.WaitGroup.Wait (durable)",
 	waitReasonCleanupWait:           "cleanup wait",
+	waitReasonWeaveScheduled:        "weave scheduled",
 }
 
 func (w waitReason) String() string {

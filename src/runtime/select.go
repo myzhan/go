@@ -167,6 +167,9 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	// generate permuted order
 	norder := 0
 	allSynctest := true
+	// In a weave controlled bubble the poll order must be deterministic so that
+	// select's choice among ready cases is reproducible (and, later, explorable).
+	weaveControlled := weaveActive()
 	for i := range scases {
 		cas := &scases[i]
 
@@ -188,7 +191,10 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 			cas.c.timer.maybeRunChan(cas.c)
 		}
 
-		j := cheaprandn(uint32(norder + 1))
+		j := norder
+		if !weaveControlled {
+			j = int(cheaprandn(uint32(norder + 1)))
+		}
 		pollorder[norder] = pollorder[j]
 		pollorder[j] = uint16(i)
 		norder++

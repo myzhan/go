@@ -219,6 +219,12 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		t0 = cputicks()
 	}
 
+	// Record the send as a weave scheduling point/transition (no-op outside a
+	// controlled bubble). Must be before acquiring c.lock.
+	if block {
+		weaveSchedPoint(weaveOpChanSend, unsafe.Pointer(c))
+	}
+
 	lock(&c.lock)
 
 	if c.closed != 0 {
@@ -419,6 +425,10 @@ func closechan(c *hchan) {
 		fatal("close of synctest channel from outside bubble")
 	}
 
+	// Record the close as a weave scheduling point/transition (no-op outside a
+	// controlled bubble). Must be before acquiring c.lock.
+	weaveSchedPoint(weaveOpChanClose, unsafe.Pointer(c))
+
 	lock(&c.lock)
 	if c.closed != 0 {
 		unlock(&c.lock)
@@ -581,6 +591,12 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	var t0 int64
 	if blockprofilerate > 0 {
 		t0 = cputicks()
+	}
+
+	// Record the receive as a weave scheduling point/transition (no-op outside a
+	// controlled bubble). Must be before acquiring c.lock.
+	if block {
+		weaveSchedPoint(weaveOpChanRecv, unsafe.Pointer(c))
 	}
 
 	lock(&c.lock)
