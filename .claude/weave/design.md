@@ -95,6 +95,25 @@ L4 是入口。**原型阶段(M0)用库级插桩原语在纯 Go 里实现了 L3+
 
 参考:`src/runtime/race.go`;内存模型 happens-before 权威定义见 `doc/go_mem.html`。
 
+### 已落地:与 sanitizer 共享同一条插桩 pass(instrumentation fusion)
+
+`-weave` 的内存读写插桩**没有另起炉灶**,而是复用 race/msan/asan 用的同一条 pass
+(`cmd/compile/internal/ssagen/ssa.go` 的 `instrument2`),只在末尾按模式发不同的 hook:
+
+- `base.Flag.Weave` → `Cfg.Instrumenting = true`(`gc/main.go`),走 `s.instrumentMemory` 同一门控;
+  composite/scalar 分流、`weaveread/weavewrite` vs `weavereadrange/weavewriterange` 与 race 对称。
+- **白拿逃逸剪枝**:`instrument2` 开头统一调 `ssa.IsSanitizerSafeAddr(addr)`,栈地址/RODATA/闭包
+  只读字段等一律不插桩。不逃逸的 goroutine-local 变量落在栈上 → 被剪掉,不会变成调度点——对
+  weave 这是 sound 的(局部量不可能被别的 goroutine 观察,重排它天然 independent),直接缩状态空间。
+- **runtime 不被插桩**:`objabi.NoInstrument` 包(runtime 等)在 `gc/main.go` 里把 Weave 关掉,
+  避免 `weaveread` 递归回自身。
+- **与 sanitizer 互斥**(本次补的唯一缺口):`instrument2` 的 if/else 先判 race/msan/asan 再判
+  weave,同开会静默丢掉 weave 插桩。已加双重保护——`cmd/go` 的 `weaveInit`(友好报错)+
+  `cmd/compile` flag 校验(`cannot use both -weave and -race/...`),两层都验证过。
+
+即"一套插桩,两个后端":共享插入点 + 剪枝,hook 语义与构建模式各自独立。sync 对象(chan/mutex/
+waitgroup)不走编译器,由 runtime 的 park/ready 钩子处理,不在这条 pass 内。
+
 ## L3:探索引擎(DPOR)
 
 新增 `src/internal/weave/`,纯 Go,跑在 root goroutine,经 linkname 被 L2 回调:
@@ -127,12 +146,50 @@ func Wait()
 内部:`synctest.Run` 起 controlled bubble → 注册 L3 引擎 → for 循环由引擎驱动每条 schedule;
 失败用记录的 schedule 前缀确定性重放打印 trace;复用 `testing` 的 tRunner/子测试汇报。
 
+## 失败报告可读性:goroutine 图例
+
+报告以稳定 id `gN`(`weaveWid`,按入组顺序分配)标识 goroutine。为便于阅读,失败/死锁 trace
+前打印一段**图例**,把每个 `gN` 映射到它的**创建位置**(`go` 语句的源码点)与所在函数:
+
+```
+  goroutines:
+    g0: model root
+    g1: weavedemo.TestDeadlock.func1 (weave_test.go:79)
+    g2: weavedemo.TestDeadlock.func1 (weave_test.go:85)
+```
+
+实现:创建位置就是 `go` 语句 PC——`newproc` 里 `sys.GetCallerPC()` 传入 `newproc1` 存进
+`newg.gopc`。`weaveAssignWid` 分配 wid 时按 wid 记录 `gp.gopc` 到 `weaveControl.spawnPC`
+(driver 提供的输出切片,经 `runSchedule` linkname 带回);`internal/weave.buildGoroutines`
+用 `runtime.CallersFrames` 解析为 file:line+func,填入 `Result.Goroutines`;
+`testing/weave.formatGoroutines` 渲染图例。g0 是模型根(无派生 `go` 语句),标为 `model root`。
+函数名显示的是 `go` 语句的**外层函数**(通常即模型闭包),行号区分不同派生点。
+
 ## 失败复现机制
 
 失败时序完全由调度器在各决策点的选择序列(`choices []int`)决定。捕获该向量 → 编码成 seed →
 `Replay(seed, f)` 或 `WEAVE_REPLAY=<seed>` 确定性重放同一交错。前提:模型除调度外确定
 (无 rand/真实时间/map 迭代序依赖),且改代码 seed 失效。原型已实现,见
 `weaveproto/weave.go` 的 `EncodeSeed`/`DecodeSeed`/`Replay`。
+
+## 与 `-race` 的关系(互补,非竞争)
+
+用户常见疑问:weave 与 race 检测器重叠在哪、区别是什么。结论:**互补**。
+
+- **找的 bug 类别不同(最本质)**:
+  - race:数据竞态——对同一内存的**无同步并发访问**(至少一写、无 happens-before)。
+  - weave:**调度相关的逻辑 bug**——死锁、丢更新、不变量破坏、goroutine 泄漏、原子性违背。
+    一段**完全 race-free**(同步都加对了)的代码仍可能丢更新/死锁,race 永远报不出,weave 能。
+    反之纯非原子内存竞态 weave 默认不逐指令枚举,交给 race(这正是 L1"内存档"标记为"可选补"的原因)。
+- **被动观察 vs 主动控制**:race 被动旁观**这次恰好跑出的那个调度**,buggy 交错没触发就静默漏报
+  (false negative 取决于调度运气+输入);weave **接管调度**,串行化+DPOR 系统枚举交错空间,不靠运气,
+  且每条交错可用 seed 确定性复现。
+- **happens-before / 向量钟——重叠但用途不同(疑似重叠的根源)**:race 用 HB 判"这次访问算不算竞态";
+  weave/DPOR 用 HB 判"两 transition 是否独立",从而剪掉偏序等价的交错。二者都用类似 `-race` 的
+  编译器插桩(L1 明确类比 race pass),但 race 只建 HB 图**不改调度**,weave 要在同步点**改变调度**。
+
+一句话:race 回答"这一次跑有没有漏同步",weave 回答"在所有合法调度里有没有哪次会算错/死锁/泄漏"。
+二者可叠加(weave 把非原子内存竞态委托给 race),覆盖面互补。
 
 ## 关键风险
 

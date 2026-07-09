@@ -94,6 +94,49 @@ footprint 与 synctest 一致(synctest 本身也是始终编译、靠 `gp.bubble
 **验证**:`go test internal/weave`(**无 tag**)全绿;synctest/sync + runtime(chan/select/sema/
 sched/synctest/goroutine)零回归。
 
+---
+
+## D9 — "全局状态 / 泡泡外并发"是品类边界:A 可根治缓解,B 用户态不可根治,应改为显式报错
+
+**背景**:`weave.Test` 反复重跑 `f`,且只控制"从测试闭包派生"的 goroutine。用户质疑:全局状态
+与泡泡外 goroutine 的限制是否是"死点"、能否从根源解决。结论是要把它拆成两个可解性完全不同的
+子问题。
+
+**问题 A — 状态跨多次重跑残留(可根治缓解)**:
+- 根因:同进程内重跑 `f`,可变全局会带脏状态进入下一遍。
+- 根治路子:`-weave` 已在每次写前插 `weavewrite` 钩子 → 顺手记 **undo log `(addr, 旧值)`**,
+  每遍结束逆序回滚,下一遍自动从字节级相同状态开始,**免去用户手动 reset**。
+- 为何不用 `fork()` 拿干净快照(很多有状态 fuzzer/model checker 的常规做法):Go 运行时多线程下
+  fork 不安全,这条路对 Go 基本封死;undo log 是更现实的等价物。
+- 局限:只覆盖被插桩内存(命令行包),覆盖不到依赖/runtime 的写。但对"业务代码里的可变全局"这个
+  最常见场景够用。→ 列为 roadmap 候选(可选的自动重置)。
+
+**问题 B — 泡泡外 goroutine / 并发(用户态不可根治)**:
+- 根因:控制范围 = synctest 泡泡 = "从闭包派生"。init 期单例、全局池、真 I/O、真时钟、cgo 线程
+  生在泡泡外,跑在真实调度器上、真并行、对 weave 不可见。
+- 两条"根治"路都不成立:(1) 把控制扩到**整个进程**→ 会连 GC/sysmon/netpoller/timer 一起串行化,
+  死锁或改变运行时语义;泡泡边界的存在**就是为了不接管整个 runtime**,自相矛盾。(2) 变成
+  **确定性重放系统(如 `rr`)**→ 是另一个重得多的品类,且它"复现一次真实执行"而非"枚举所有交错",
+  与 weave 目标正交。
+- 这堵墙**非 weave 独有**:loom / AWS Shuttle / 微软 Coyote / CHESS 全都撞同一堵(Coyote 专门有
+  "uncontrolled concurrency detected" 报错)。是"系统化交错探索"这个**方法本身的内禀边界**。
+
+**决策**:
+1. 不追求"控制整个进程",也不把 weave 改成 rr 类工具——B 的根治在用户态里是伪命题。
+2. **最高优先级的工程回应:把 B 从"静默出错"变成"显式报错"**。当泡泡内 goroutine 与泡泡外
+   goroutine 共享/交互时,报 `weave: uncontrolled concurrency detected`,而不是给不可信绿灯。
+   复用 synctest 已有的"跨泡泡 channel 操作"检测机制做基础。
+3. A 列为 roadmap 候选:基于现有 `weavewrite` 钩子的 undo-log 自动回滚。
+4. **定位澄清**:weave 是**单元级、封闭(hermetic)的并发验证器**,不是全程序工具。全程序/真并行/
+   真 I/O 归 `-race` 与集成测试。对标物是 loom/Shuttle/Coyote(均要求被测单元封闭、并发/时间走可
+   注入接缝),**不是** rr/集成测试。DI/seam 不是丑陋补丁,是此类工具公认的正确用法。
+
+**含义**:D3 的"边界"(仅控制 bubble 内派生的 goroutine)从"已知限制"升级为"需主动检测并报错的
+契约";用户侧的正确姿势是把不可控依赖(单例/时钟/I/O)在闭包内换成 fake。与 D5(只在同步点切换)、
+[[project-weave]] 一致。
+
+---
+
 ## 待定 / 开放问题
 
 - L4 API 的 `t` 参数:目标形态 `func(t *testing.T)`,原型暂用无参 + `Assert`。M2 接入时统一。
@@ -101,3 +144,6 @@ sched/synctest/goroutine)零回归。
 - 弱内存(M5)与 DPOR 的 read-from 枚举如何组合,复杂度可控性待验证。
 - 状态空间预算/超时的默认策略与用户可调项。
 - 是否提供并行探索(多 worker 跑不同子树),与 runtime 单 bubble 的关系。
+- (来自 D9)泡泡外并发的**显式检测报错** `weave: uncontrolled concurrency detected`:如何在
+  synctest 跨泡泡检测基础上,覆盖"共享地址被泡泡内外同时触碰"的情形。
+- (来自 D9)基于 `weavewrite` 钩子的 **undo-log 自动重置**:回滚粒度、只覆盖插桩内存的边界、开销。
