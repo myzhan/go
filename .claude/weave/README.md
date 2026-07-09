@@ -120,6 +120,24 @@ func TestCounter(t *testing.T) {
 - 长期增强:DPOR-over-select-cases;抢占看门狗(死循环兜底);cmd/go 的 `-weave` flag(自动传播,
   免手写 `-gcflags`,并驱动上面的 atomic std 重建)。
 
+## 可信度 + 可用性加固(本轮)
+
+- **1a DPOR 差分健全性验证** ✅ — `TestDPORSoundnessSuite`(`-weave`):每个模型 DPOR 探索到的终态
+  集合 == 穷举终态集合(3-goroutine 版穷举不可行,对比已知集合)。**它发现并修复了一个真实竞态**:
+  异步抢占的参与者经 `ready()` 恢复,被控制器误当作同步唤醒截获而滞留 → 偶发 hang。修复:仅截获
+  控制器真正阻塞过的参与者(`g.weaveBlocked`,在 `park_m` 阻塞路径设置;抢占不走 `park_m`)。
+  另加 `weave.Wait()`(等其余参与者退出,替代 join channel)。
+- **2a 失败 trace 带源码行号** ✅ — 内存访问经 `sys.GetCallerPC` 记录 caller PC,driver 用
+  `runtime.CallersFrames` 符号化为 `file:line`;`testing/weave` 打印。丢更新 trace 现在直接指到
+  出问题的 `x = x + 1` 行(g1 `:28`、g2 `:29`)。
+- **1b 补全同步原语记录** ✅(RWMutex + WaitGroup.Wait)— `sync` 包在 `RWMutex.RLock/RUnlock/
+  Lock/Unlock` 与 `WaitGroup.Wait` 入口经 linkname 记 `weaveSchedPoint`(全局门控,非 weave 零成本)
+  → DPOR 对 RWMutex 冲突也健全(`rwmutex` 模型:DPOR 终态 == 穷举)。**剩余**:Cond.Wait/Signal/
+  Broadcast、Once.Do、WaitGroup.Add/Done(同法可加,列为后续)。
+- **1c 死锁泄漏清理**:未实现。Go 无法干净地杀死 park 在真实同步点的用户 goroutine;且这与
+  synctest 自身一致(死锁时同样保留 blocked goroutine)。仅 Explore 的最后一条失败调度会泄漏少量
+  parked goroutine,进程退出即回收,影响可忽略。列为已知限制。
+
 详细进度见 [roadmap.md](roadmap.md);L2 落地细节见 [l2-impl-notes.md](l2-impl-notes.md)。
 
 ## 快速跑通原型

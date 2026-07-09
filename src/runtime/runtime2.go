@@ -583,6 +583,10 @@ type g struct {
 	// captured by the controller in ready) from an internal resume such as after
 	// async preemption (which must proceed normally).
 	weaveBlocked bool
+	// weavePC is the caller PC of this participant's pending operation (the
+	// source site of a memory access), used to report source locations in a
+	// failing interleaving. 0 if unknown.
+	weavePC uintptr
 
 	// xRegs stores the extended register state if this G has been
 	// asynchronously preempted.

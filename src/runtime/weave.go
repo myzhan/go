@@ -79,6 +79,7 @@ type weaveControl struct {
 	traceOp      []int32
 	traceAddr    []int64
 	traceEnabled []uint64
+	tracePC      []uint64 // caller PC of each step's operation (0 if unknown)
 	step         int
 	overflow     bool // ran out of recording space or too many participants for DPOR
 }
@@ -163,6 +164,14 @@ func weaveChoose(ctl *weaveControl) int {
 			ctl.traceOp[ctl.step] = int32(ctl.runnableOp[idx])
 			ctl.traceAddr[ctl.step] = int64(ctl.runnableAddr[idx])
 			ctl.traceEnabled[ctl.step] = enabled
+			// A source PC is only meaningful for memory read/write ops; other
+			// transitions (run/exit/chan/mutex) reuse the g and would show a
+			// stale PC.
+			if o := ctl.runnableOp[idx]; o == uint8(weaveOpRead) || o == uint8(weaveOpWrite) {
+				ctl.tracePC[ctl.step] = uint64(ctl.runnable[idx].ptr().weavePC)
+			} else {
+				ctl.tracePC[ctl.step] = 0
+			}
 		} else {
 			ctl.overflow = true
 		}
@@ -309,11 +318,12 @@ func weaveSchedPoint(op weaveOp, id unsafe.Pointer) {
 	if !weaveActive() {
 		return
 	}
-	weaveSchedPointSlow(op, id)
+	weaveSchedPointSlow(op, id, 0)
 }
 
-func weaveSchedPointSlow(op weaveOp, id unsafe.Pointer) {
+func weaveSchedPointSlow(op weaveOp, id unsafe.Pointer, pc uintptr) {
 	gp := getg()
+	gp.weavePC = pc
 	bubble := gp.bubble
 	ctl := bubble.weaveCtl
 	lock(&bubble.mu)
@@ -342,25 +352,25 @@ func weaveSchedPointSlow(op weaveOp, id unsafe.Pointer) {
 
 func weaveread(addr uintptr) {
 	if weaveActive() {
-		weaveSchedPointSlow(weaveOpRead, unsafe.Pointer(addr))
+		weaveSchedPointSlow(weaveOpRead, unsafe.Pointer(addr), sys.GetCallerPC())
 	}
 }
 
 func weavewrite(addr uintptr) {
 	if weaveActive() {
-		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr))
+		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC())
 	}
 }
 
 func weavereadrange(addr, size uintptr) {
 	if weaveActive() {
-		weaveSchedPointSlow(weaveOpRead, unsafe.Pointer(addr))
+		weaveSchedPointSlow(weaveOpRead, unsafe.Pointer(addr), sys.GetCallerPC())
 	}
 }
 
 func weavewriterange(addr, size uintptr) {
 	if weaveActive() {
-		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr))
+		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC())
 	}
 }
 
@@ -461,13 +471,14 @@ func weaveRunBubble(f func(), ctl *weaveControl) {
 // it calls once per schedule.
 //
 //go:linkname weaveRunSchedule internal/weave.runSchedule
-func weaveRunSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int64, traceEnabled []uint64) (steps int, outcome int) {
+func weaveRunSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int64, traceEnabled, tracePC []uint64) (steps int, outcome int) {
 	ctl := new(weaveControl)
 	ctl.plan = plan
 	ctl.traceWid = traceWid
 	ctl.traceOp = traceOp
 	ctl.traceAddr = traceAddr
 	ctl.traceEnabled = traceEnabled
+	ctl.tracePC = tracePC
 	weaveRunBubble(f, ctl)
 	switch {
 	case ctl.deadlock:

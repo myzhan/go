@@ -4,6 +4,8 @@
 
 package weave
 
+import "runtime"
+
 // Operation codes, kept in sync with runtime weaveOp.
 const (
 	opNone uint8 = iota
@@ -26,6 +28,8 @@ type Step struct {
 	Wid  int    // participant id
 	Op   string // operation kind
 	Addr uint64 // object/variable address, or 0
+	File string // source file of the operation, or "" if unknown
+	Line int    // source line, or 0
 }
 
 // Result summarizes an exploration.
@@ -41,7 +45,7 @@ type Result struct {
 // Run executes f once in a controlled bubble (a single default schedule).
 // It panics if the run deadlocks.
 func Run(f func()) {
-	_, outcome := runSchedule(f, nil, nil, nil, nil, nil)
+	_, outcome := runSchedule(f, nil, nil, nil, nil, nil, nil)
 	if outcome == 1 {
 		panic("weave: deadlock: all goroutines in bubble are blocked")
 	}
@@ -54,6 +58,7 @@ type explorer struct {
 	traceOp      []int32
 	traceAddr    []int64
 	traceEnabled []uint64
+	tracePC      []uint64
 	res          Result
 	wrapped      func()
 }
@@ -64,6 +69,7 @@ func newExplorer(f func()) *explorer {
 		traceOp:      make([]int32, traceCap),
 		traceAddr:    make([]int64, traceCap),
 		traceEnabled: make([]uint64, traceCap),
+		tracePC:      make([]uint64, traceCap),
 	}
 	e.wrapped = func() {
 		defer func() {
@@ -124,7 +130,7 @@ func Explore(f func()) Result {
 	var plan []int32
 
 	for {
-		steps, outcome := runSchedule(e.wrapped, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled)
+		steps, outcome := runSchedule(e.wrapped, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
 		e.res.Runs++
 
 		wid := e.traceWid[:steps]
@@ -134,13 +140,13 @@ func Explore(f func()) Result {
 
 		if e.res.Failed {
 			e.res.Seed = encodeSeed(wid)
-			e.res.Trace = buildTrace(wid, op, addr)
+			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps])
 			return e.res
 		}
 		if outcome == 1 {
 			e.res.Deadlock = true
 			e.res.Seed = encodeSeed(wid)
-			e.res.Trace = buildTrace(wid, op, addr)
+			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps])
 			return e.res
 		}
 		if outcome == 2 {
@@ -211,20 +217,25 @@ func Explore(f func()) Result {
 func Replay(seed string, f func()) Result {
 	e := newExplorer(f)
 	plan := decodeSeed(seed)
-	steps, outcome := runSchedule(e.wrapped, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled)
+	steps, outcome := runSchedule(e.wrapped, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
 	e.res.Runs = 1
 	e.res.Seed = seed
-	e.res.Trace = buildTrace(e.traceWid[:steps], e.traceOp[:steps], e.traceAddr[:steps])
+	e.res.Trace = buildTrace(e.traceWid[:steps], e.traceOp[:steps], e.traceAddr[:steps], e.tracePC[:steps])
 	if outcome == 1 {
 		e.res.Deadlock = true
 	}
 	return e.res
 }
 
-func buildTrace(wid, op []int32, addr []int64) []Step {
+func buildTrace(wid, op []int32, addr []int64, pc []uint64) []Step {
 	t := make([]Step, len(wid))
 	for i := range wid {
-		t[i] = Step{Wid: int(wid[i]), Op: opName(uint8(op[i])), Addr: uint64(addr[i])}
+		s := Step{Wid: int(wid[i]), Op: opName(uint8(op[i])), Addr: uint64(addr[i])}
+		if pc[i] != 0 {
+			fr, _ := runtime.CallersFrames([]uintptr{uintptr(pc[i])}).Next()
+			s.File, s.Line = fr.File, fr.Line
+		}
+		t[i] = s
 	}
 	return t
 }
@@ -307,7 +318,7 @@ func exploreExhaustive(f func()) Result {
 	e := newExplorer(f)
 	var plan []int32
 	for {
-		steps, outcome := runSchedule(e.wrapped, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled)
+		steps, outcome := runSchedule(e.wrapped, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
 		e.res.Runs++
 		if e.res.Failed {
 			return e.res

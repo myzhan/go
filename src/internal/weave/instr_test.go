@@ -190,6 +190,15 @@ func TestDPORSoundnessSuite(t *testing.T) {
 			Wait()
 			return fmt.Sprint(x, seen)
 		}, nil},
+		{"rwmutex", func() string {
+			var mu sync.RWMutex
+			x := 0
+			seen := -1
+			go func() { mu.Lock(); x = 1; mu.Unlock() }()
+			go func() { mu.RLock(); seen = x; mu.RUnlock() }()
+			Wait()
+			return fmt.Sprint(x, seen)
+		}, nil},
 	}
 
 	for _, m := range models {

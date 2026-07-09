@@ -158,6 +158,7 @@ func (wg *WaitGroup) Done() {
 
 // Wait blocks until the [WaitGroup] task counter is zero.
 func (wg *WaitGroup) Wait() {
+	weaveSchedPoint(weaveOpWaitGroupWait, unsafe.Pointer(wg))
 	if race.Enabled {
 		race.Disable()
 	}

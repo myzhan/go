@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"internal/weave"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -89,11 +90,14 @@ func outcomeMsg(res weave.Result) string {
 func formatTrace(steps []weave.Step) string {
 	var b strings.Builder
 	for i, s := range steps {
-		if s.Addr != 0 {
-			fmt.Fprintf(&b, "  %2d: g%d %s @%#x\n", i+1, s.Wid, s.Op, s.Addr)
-		} else {
-			fmt.Fprintf(&b, "  %2d: g%d %s\n", i+1, s.Wid, s.Op)
+		loc := ""
+		switch {
+		case s.File != "":
+			loc = fmt.Sprintf("  %s:%d", filepath.Base(s.File), s.Line)
+		case s.Addr != 0:
+			loc = fmt.Sprintf("  @%#x", s.Addr)
 		}
+		fmt.Fprintf(&b, "  %2d: g%d %s%s\n", i+1, s.Wid, s.Op, loc)
 	}
 	return b.String()
 }
