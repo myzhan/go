@@ -1491,6 +1491,12 @@ func isSystemGoroutine(gp *g, fixed bool) bool {
 	if f.funcID == abi.FuncID_runtime_main || f.funcID == abi.FuncID_corostart || f.funcID == abi.FuncID_handleAsyncEvent {
 		return false
 	}
+	if funcname(f) == "runtime.weaveGoWrapper" {
+		// weaveGoWrapper runs the user's model code under the weave controlled
+		// scheduler; like corostart, its goroutines are user goroutines and must
+		// inherit the synctest/weave bubble.
+		return false
+	}
 	if f.funcID == abi.FuncID_runFinalizers {
 		// We include the finalizer goroutine if it's calling
 		// back into user code.

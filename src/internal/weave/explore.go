@@ -45,7 +45,10 @@ type Result struct {
 // Run executes f once in a controlled bubble (a single default schedule).
 // It panics if the run deadlocks.
 func Run(f func()) {
-	_, outcome := runSchedule(f, nil, nil, nil, nil, nil, nil)
+	_, outcome, failure := runSchedule(f, nil, nil, nil, nil, nil, nil)
+	if failure != nil {
+		panic(failure)
+	}
 	if outcome == 1 {
 		panic("weave: deadlock: all goroutines in bubble are blocked")
 	}
@@ -60,27 +63,18 @@ type explorer struct {
 	traceEnabled []uint64
 	tracePC      []uint64
 	res          Result
-	wrapped      func()
+	f            func() // the model; panics (main or spawned) are captured by the runtime wrapper
 }
 
 func newExplorer(f func()) *explorer {
-	e := &explorer{
+	return &explorer{
 		traceWid:     make([]int32, traceCap),
 		traceOp:      make([]int32, traceCap),
 		traceAddr:    make([]int64, traceCap),
 		traceEnabled: make([]uint64, traceCap),
 		tracePC:      make([]uint64, traceCap),
+		f:            f,
 	}
-	e.wrapped = func() {
-		defer func() {
-			if r := recover(); r != nil && !e.res.Failed {
-				e.res.Failed = true
-				e.res.Value = r
-			}
-		}()
-		f()
-	}
-	return e
 }
 
 // conflict reports whether two transitions by different participants are
@@ -130,7 +124,7 @@ func Explore(f func()) Result {
 	var plan []int32
 
 	for {
-		steps, outcome := runSchedule(e.wrapped, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
+		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
 		e.res.Runs++
 
 		wid := e.traceWid[:steps]
@@ -138,7 +132,9 @@ func Explore(f func()) Result {
 		addr := e.traceAddr[:steps]
 		en := e.traceEnabled[:steps]
 
-		if e.res.Failed {
+		if failure != nil {
+			e.res.Failed = true
+			e.res.Value = failure
 			e.res.Seed = encodeSeed(wid)
 			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps])
 			return e.res
@@ -217,10 +213,14 @@ func Explore(f func()) Result {
 func Replay(seed string, f func()) Result {
 	e := newExplorer(f)
 	plan := decodeSeed(seed)
-	steps, outcome := runSchedule(e.wrapped, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
+	steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
 	e.res.Runs = 1
 	e.res.Seed = seed
 	e.res.Trace = buildTrace(e.traceWid[:steps], e.traceOp[:steps], e.traceAddr[:steps], e.tracePC[:steps])
+	if failure != nil {
+		e.res.Failed = true
+		e.res.Value = failure
+	}
 	if outcome == 1 {
 		e.res.Deadlock = true
 	}
@@ -318,9 +318,11 @@ func exploreExhaustive(f func()) Result {
 	e := newExplorer(f)
 	var plan []int32
 	for {
-		steps, outcome := runSchedule(e.wrapped, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
+		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
 		e.res.Runs++
-		if e.res.Failed {
+		if failure != nil {
+			e.res.Failed = true
+			e.res.Value = failure
 			return e.res
 		}
 		if outcome == 1 {

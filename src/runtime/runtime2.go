@@ -587,6 +587,10 @@ type g struct {
 	// source site of a memory access), used to report source locations in a
 	// failing interleaving. 0 if unknown.
 	weavePC uintptr
+	// weaveFn is the real function a wrapped weave participant should run. The
+	// participant starts in weaveGoWrapper, which recovers panics so a panic in a
+	// spawned goroutine becomes a reported failure instead of crashing.
+	weaveFn *funcval
 
 	// xRegs stores the extended register state if this G has been
 	// asynchronously preempted.

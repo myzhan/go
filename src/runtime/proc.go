@@ -5365,11 +5365,12 @@ func newproc(fn *funcval) {
 	gp := getg()
 	pc := sys.GetCallerPC()
 	if weaveActive() {
-		// In a controlled bubble, the child starts parked and waits for the
-		// controller to grant it the run token; the parent keeps running.
+		// In a controlled bubble, the child starts parked (in weaveGoWrapper, so
+		// its panics are captured) and waits for the controller to grant it the
+		// run token; the parent keeps running.
 		bubble := gp.bubble
 		systemstack(func() {
-			newg := newproc1(fn, gp, pc, true, waitReasonWeaveScheduled)
+			newg := weaveNewParticipant(gp, pc, fn)
 			weaveRegisterChild(bubble, newg)
 		})
 		return

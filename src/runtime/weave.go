@@ -68,6 +68,8 @@ type weaveControl struct {
 	rootParked bool   // root goroutine is parked in weaveRootWait
 	waiter     *g     // participant parked in weave.Wait, or nil
 	randState  uint64 // deterministic RNG state for this run
+	panicked   bool   // a participant panicked
+	panicValue any    // the recovered panic value
 
 	// Exploration state. plan forces, at scheduling point i, the wid to run
 	// (plan[i]); beyond len(plan) the lowest runnable wid is chosen. The trace
@@ -241,6 +243,43 @@ func weaveRegisterChild(bubble *synctestBubble, newg *g) {
 	weaveAssignWid(ctl, newg)
 	weavePush(ctl, newg, weaveOpNone, 0)
 	unlock(&bubble.mu)
+}
+
+// weaveGoWrapper is the entry point of every controlled participant. It runs the
+// participant's real function with a deferred recover, so a panic in a spawned
+// goroutine (e.g. a nil-pointer dereference from a concurrency bug) is captured
+// as a reported failure with its interleaving, instead of crashing the process.
+func weaveGoWrapper() {
+	gp := getg()
+	fn := gp.weaveFn
+	gp.weaveFn = nil
+	defer weaveRecoverChild()
+	f := *(*func())(unsafe.Pointer(&fn))
+	f()
+}
+
+// weaveRecoverChild records a participant's panic on the bubble. Runs as the
+// deferred function of weaveGoWrapper.
+func weaveRecoverChild() {
+	if r := recover(); r != nil {
+		b := getg().bubble
+		lock(&b.mu)
+		if !b.weaveCtl.panicked {
+			b.weaveCtl.panicked = true
+			b.weaveCtl.panicValue = r
+		}
+		unlock(&b.mu)
+	}
+}
+
+// weaveNewParticipant creates a parked participant that starts in weaveGoWrapper
+// and runs fn. Runs on the system stack.
+func weaveNewParticipant(callergp *g, pc uintptr, fn *funcval) *g {
+	wf := weaveGoWrapper
+	wfv := *(**funcval)(unsafe.Pointer(&wf))
+	newg := newproc1(wfv, callergp, pc, true, waitReasonWeaveScheduled)
+	newg.weaveFn = fn
+	return newg
 }
 
 // weaveEnqueue captures a participant woken by a synchronization operation into
@@ -453,7 +492,7 @@ func weaveRunBubble(f func(), ctl *weaveControl) {
 	pc := sys.GetCallerPC()
 	systemstack(func() {
 		fv := *(**funcval)(unsafe.Pointer(&f))
-		main := newproc1(fv, gp, pc, true, waitReasonWeaveScheduled)
+		main := weaveNewParticipant(gp, pc, fv)
 		bubble.main = main
 		weaveStart(bubble, main)
 	})
@@ -471,7 +510,7 @@ func weaveRunBubble(f func(), ctl *weaveControl) {
 // it calls once per schedule.
 //
 //go:linkname weaveRunSchedule internal/weave.runSchedule
-func weaveRunSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int64, traceEnabled, tracePC []uint64) (steps int, outcome int) {
+func weaveRunSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int64, traceEnabled, tracePC []uint64) (steps int, outcome int, failure any) {
 	ctl := new(weaveControl)
 	ctl.plan = plan
 	ctl.traceWid = traceWid
@@ -480,13 +519,14 @@ func weaveRunSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int
 	ctl.traceEnabled = traceEnabled
 	ctl.tracePC = tracePC
 	weaveRunBubble(f, ctl)
+	failure = ctl.panicValue
 	switch {
 	case ctl.deadlock:
 		outcome = 1
 	case ctl.overflow:
 		outcome = 2
 	}
-	return ctl.step, outcome
+	return ctl.step, outcome, failure
 }
 
 // weaveYield is an explicit scheduling point: it offers to hand the run token to
