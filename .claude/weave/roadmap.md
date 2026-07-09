@@ -64,8 +64,10 @@ select 确定化 · RNG(map/maphash)确定化 · spawned goroutine panic 捕获 
 - [x] 用 backtrack 集合驱动下一条 schedule,替换 odometer(`Explore`;odometer 保留在
       `exploreExhaustive` 里做等价性对拍)
 - [ ] (可选)升级 optimal-DPOR(wakeup tree)进一步剪枝 —— **未做**
-- [~] 兜底开关:已加**调度数预算**(`ExploreBudget`/`DefaultMaxSchedules`/`WEAVE_MAX_SCHEDULES`,
-      超限标 `Truncated`);更选择性的**抢占计数上界**(CHESS 式 context bounding)仍未做
+- [x] 兜底开关:**调度数预算**(`ExploreBudget`/`DefaultMaxSchedules`/`WEAVE_MAX_SCHEDULES`,超限标 `Truncated`)
+- [x] **抢占计数上界**(CHESS 式 context bounding):`ExploreBounded(f, maxSchedules, maxPreemptions)`
+      + `WEAVE_MAX_PREEMPTIONS`;bound 内完备(每条 ≤c 抢占的调度仍会被探到),且大幅剪枝
+      (示例:c=0 1 条、c=2 20 条、无界 67 条)
 
 **验收**(已达成):
 - [x] DPOR 调度数显著 < 穷举(丢更新 3 vs 12;channel 19 vs 35),无误报、complete
