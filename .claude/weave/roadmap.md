@@ -143,7 +143,8 @@ select 确定化 · RNG(map/maphash)确定化 · spawned goroutine panic 捕获 
   - [x] 源码行号(`weavePC` + `CallersFrames` → `file:line`)
   - [x] goroutine 创建位置图例(`gN` → `go` 语句处 + 函数名)
   - [ ] 合并冗余 wait/`run` 步
-  - [ ] 显示读写的值(目前只显示地址)
+  - [x] 显示读写的值:标量读显示 `= V`(读到的值),写显示 `(was V)`(被覆盖的旧值);
+        编译器给标量 `weaveread/weavewrite` 传 size,运行时在钩子处按类型读值(复合类型不显示)
 - 覆盖率/进度报告:
   - [x] 已探索 schedule 数(`Result.Runs` → `explored N schedule(s)`)
   - [x] **是否截断** —— `Result.Truncated`/`TruncatedReason`;预算超限与容量溢出(`outcome==2`)都标注;
