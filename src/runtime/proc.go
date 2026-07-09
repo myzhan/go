@@ -1131,11 +1131,15 @@ const (
 
 // Mark gp ready to run.
 func ready(gp *g, traceskip int, next bool) {
-	// In a controlled bubble, a participant woken by a synchronization operation
-	// is captured by the controller instead of being made OS-runnable; it stays
-	// parked until the controller grants it the run token. Controller grants use
-	// weaveGrant, which bypasses this path.
-	if weaveControlledParticipant(gp) {
+	// In a controlled bubble, a participant woken from a synchronization block
+	// (weaveBlocked, set in park_m) is captured by the controller instead of
+	// being made OS-runnable; it stays parked until granted the run token.
+	// Resumes that are not controller-managed sync wakeups (e.g. after async
+	// preemption or GC assist) have weaveBlocked==false and proceed normally, so
+	// the still-running token holder continues. Controller grants use weaveGrant,
+	// which bypasses this path entirely.
+	if weaveControlledParticipant(gp) && gp.weaveBlocked {
+		gp.weaveBlocked = false
 		weaveEnqueue(gp)
 		return
 	}
@@ -4329,6 +4333,7 @@ func park_m(gp *g) {
 	// synchronization operation (anything other than an explicit weave yield)
 	// hands the run token to the next runnable participant.
 	if bubble != nil && bubble.controlled && gp != bubble.root && gp.waitreason != waitReasonWeaveScheduled {
+		gp.weaveBlocked = true
 		weaveOnBlock(bubble)
 	}
 

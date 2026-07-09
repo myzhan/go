@@ -577,6 +577,12 @@ type g struct {
 	// schedule prefix). Used by the exploration engine to identify processes
 	// across runs. Only meaningful when bubble != nil && bubble.controlled.
 	weaveWid int32
+	// weaveBlocked is set while this participant is blocked on a real
+	// synchronization operation that the weave controller handed off (see
+	// park_m). It distinguishes a controller-managed sync wakeup (which must be
+	// captured by the controller in ready) from an internal resume such as after
+	// async preemption (which must proceed normally).
+	weaveBlocked bool
 
 	// xRegs stores the extended register state if this G has been
 	// asynchronously preempted.
