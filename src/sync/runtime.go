@@ -19,6 +19,11 @@ const (
 	weaveOpLock          = 3
 	weaveOpUnlock        = 4
 	weaveOpWaitGroupWait = 9
+	weaveOpWaitGroupAdd  = 13
+	weaveOpCondWait      = 14
+	weaveOpCondSignal    = 15
+	weaveOpCondBroadcast = 16
+	weaveOpOnce          = 17
 )
 
 //go:linkname runtime_weaveSchedPoint runtime.weaveSchedPoint

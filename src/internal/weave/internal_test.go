@@ -234,6 +234,63 @@ func TestPreemptionBound(t *testing.T) {
 		b0.Runs, b2.Runs, full.Runs)
 }
 
+// The newly recorded primitives (WaitGroup.Add/Done, sync.Once, sync.Cond) are
+// explorable end to end: correct uses of them are driven through every
+// interleaving without a spurious failure or deadlock.
+func TestSyncPrimitivesExplorable(t *testing.T) {
+	wg := Explore(func() {
+		var wg sync.WaitGroup
+		done := make(chan int, 2)
+		wg.Add(2)
+		go func() { done <- 1; wg.Done() }()
+		go func() { done <- 2; wg.Done() }()
+		wg.Wait()
+		<-done
+		<-done
+	})
+	if wg.Failed || wg.Deadlock {
+		t.Fatalf("WaitGroup model should be clean; got %+v", wg)
+	}
+
+	once := Explore(func() {
+		var once sync.Once
+		n := 0
+		f := func() { n++ }
+		done := make(chan bool, 2)
+		go func() { once.Do(f); done <- true }()
+		go func() { once.Do(f); done <- true }()
+		<-done
+		<-done
+		if n != 1 {
+			panic("Once ran f more than once")
+		}
+	})
+	if once.Failed || once.Deadlock {
+		t.Fatalf("Once model should be clean; got %+v", once)
+	}
+
+	cond := Explore(func() {
+		var mu sync.Mutex
+		c := sync.NewCond(&mu)
+		ready := false
+		go func() {
+			mu.Lock()
+			ready = true
+			c.Signal()
+			mu.Unlock()
+		}()
+		mu.Lock()
+		for !ready {
+			c.Wait()
+		}
+		mu.Unlock()
+	})
+	if cond.Failed || cond.Deadlock {
+		t.Fatalf("Cond model should be clean; got %+v", cond)
+	}
+	t.Logf("sync primitives explorable: wg=%d once=%d cond=%d schedules", wg.Runs, once.Runs, cond.Runs)
+}
+
 func sameSchedule(a, b []Step) bool {
 	if len(a) != len(b) {
 		return false

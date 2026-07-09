@@ -652,4 +652,9 @@ const (
 	weaveOpGoStart
 	weaveOpGoExit
 	weaveOpPreempt
+	weaveOpWaitGroupAdd
+	weaveOpCondWait
+	weaveOpCondSignal
+	weaveOpCondBroadcast
+	weaveOpOnce
 )

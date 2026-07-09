@@ -21,6 +21,11 @@ const (
 	opGoStart
 	opGoExit
 	opPreempt
+	opWaitGroupAdd
+	opCondWait
+	opCondSignal
+	opCondBroadcast
+	opOnce
 )
 
 // Step is one transition in a recorded interleaving.
@@ -122,7 +127,8 @@ func conflict(opi uint8, ai int64, opj uint8, aj int64) bool {
 
 func isSyncOp(op uint8) bool {
 	switch op {
-	case opLock, opUnlock, opChanSend, opChanRecv, opChanClose, opSelect, opWaitGroupWait:
+	case opLock, opUnlock, opChanSend, opChanRecv, opChanClose, opSelect, opWaitGroupWait,
+		opWaitGroupAdd, opCondWait, opCondSignal, opCondBroadcast, opOnce:
 		return true
 	}
 	return false
@@ -379,6 +385,16 @@ func opName(op uint8) string {
 		return "select"
 	case opWaitGroupWait:
 		return "wg wait"
+	case opWaitGroupAdd:
+		return "wg add"
+	case opCondWait:
+		return "cond wait"
+	case opCondSignal:
+		return "cond signal"
+	case opCondBroadcast:
+		return "cond broadcast"
+	case opOnce:
+		return "once"
 	}
 	return "run"
 }
