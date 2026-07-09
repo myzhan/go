@@ -349,6 +349,12 @@ func ParseFlags() {
 		log.Fatal("cannot use both -race and -asan")
 	case Flag.MSan && Flag.ASan:
 		log.Fatal("cannot use both -msan and -asan")
+	case Flag.Weave && Flag.Race:
+		log.Fatal("cannot use both -weave and -race")
+	case Flag.Weave && Flag.MSan:
+		log.Fatal("cannot use both -weave and -msan")
+	case Flag.Weave && Flag.ASan:
+		log.Fatal("cannot use both -weave and -asan")
 	}
 	if Flag.Race || Flag.MSan || Flag.ASan {
 		// -race, -msan and -asan imply -d=checkptr for now.

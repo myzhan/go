@@ -140,6 +140,13 @@ func weaveInit() {
 	if !cfg.BuildWeave {
 		return
 	}
+	// -weave shares the compiler's single memory-instrumentation pass with the
+	// sanitizers, so it cannot be combined with them.
+	if cfg.BuildRace || cfg.BuildMSan || cfg.BuildASan {
+		fmt.Fprintf(os.Stderr, "go: may not use -weave with -race, -msan, or -asan simultaneously\n")
+		base.SetExitStatus(2)
+		base.Exit()
+	}
 	if err := load.BuildGcflags.Set("-weave"); err != nil {
 		base.Fatalf("go: %v", err)
 	}
