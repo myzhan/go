@@ -83,6 +83,8 @@ type weaveControl struct {
 	traceEnabled []uint64
 	tracePC      []uint64 // caller PC of each step's operation (0 if unknown)
 	spawnPC      []uint64 // per-wid go-statement PC (creation site), indexed by wid
+	traceVal     []uint64 // scalar value observed at each memory op (see traceValSet)
+	traceValSet  []int32  // 1 if traceVal[step] holds a meaningful value, else 0
 	step         int
 	overflow     bool // ran out of recording space or too many participants for DPOR
 }
@@ -171,9 +173,22 @@ func weaveChoose(ctl *weaveControl) int {
 			// transitions (run/exit/chan/mutex) reuse the g and would show a
 			// stale PC.
 			if o := ctl.runnableOp[idx]; o == uint8(weaveOpRead) || o == uint8(weaveOpWrite) {
-				ctl.tracePC[ctl.step] = uint64(ctl.runnable[idx].ptr().weavePC)
+				gp := ctl.runnable[idx].ptr()
+				ctl.tracePC[ctl.step] = uint64(gp.weavePC)
+				if ctl.traceVal != nil {
+					ctl.traceVal[ctl.step] = gp.weaveVal
+					if gp.weaveValSet {
+						ctl.traceValSet[ctl.step] = 1
+					} else {
+						ctl.traceValSet[ctl.step] = 0
+					}
+				}
 			} else {
 				ctl.tracePC[ctl.step] = 0
+				if ctl.traceVal != nil {
+					ctl.traceVal[ctl.step] = 0
+					ctl.traceValSet[ctl.step] = 0
+				}
 			}
 		} else {
 			ctl.overflow = true
@@ -395,28 +410,53 @@ func weaveSchedPointSlow(op weaveOp, id unsafe.Pointer, pc uintptr) {
 // They are no-ops for non-participants (including the driver goroutine), so
 // there is no recursion through the runtime (which is never instrumented).
 
-func weaveread(addr uintptr) {
+func weaveread(addr, size uintptr) {
 	if weaveActive() {
+		gp := getg()
+		gp.weaveVal, gp.weaveValSet = weaveLoadVal(addr, size)
 		weaveSchedPointSlow(weaveOpRead, unsafe.Pointer(addr), sys.GetCallerPC())
 	}
 }
 
-func weavewrite(addr uintptr) {
+func weavewrite(addr, size uintptr) {
 	if weaveActive() {
+		// A write hook runs before the store, so the value read here is the value
+		// being overwritten (the location's prior contents).
+		gp := getg()
+		gp.weaveVal, gp.weaveValSet = weaveLoadVal(addr, size)
 		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC())
 	}
 }
 
 func weavereadrange(addr, size uintptr) {
 	if weaveActive() {
+		getg().weaveValSet = false // composite: no meaningful scalar value
 		weaveSchedPointSlow(weaveOpRead, unsafe.Pointer(addr), sys.GetCallerPC())
 	}
 }
 
 func weavewriterange(addr, size uintptr) {
 	if weaveActive() {
+		getg().weaveValSet = false // composite: no meaningful scalar value
 		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC())
 	}
+}
+
+// weaveLoadVal reads a scalar of the given size at addr into a uint64 for display
+// in a failing interleaving. It only handles the machine-word sizes; other sizes
+// (composites) report no value.
+func weaveLoadVal(addr, size uintptr) (uint64, bool) {
+	switch size {
+	case 1:
+		return uint64(*(*uint8)(unsafe.Pointer(addr))), true
+	case 2:
+		return uint64(*(*uint16)(unsafe.Pointer(addr))), true
+	case 4:
+		return uint64(*(*uint32)(unsafe.Pointer(addr))), true
+	case 8:
+		return *(*uint64)(unsafe.Pointer(addr)), true
+	}
+	return 0, false
 }
 
 // weaveHandoff is the gopark unlockf for an explicit yield: it grants the token
@@ -516,7 +556,7 @@ func weaveRunBubble(f func(), ctl *weaveControl) {
 // it calls once per schedule.
 //
 //go:linkname weaveRunSchedule internal/weave.runSchedule
-func weaveRunSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int64, traceEnabled, tracePC, spawnPC []uint64) (steps int, outcome int, failure any) {
+func weaveRunSchedule(f func(), plan, traceWid, traceOp, traceValSet []int32, traceAddr []int64, traceEnabled, tracePC, spawnPC, traceVal []uint64) (steps int, outcome int, failure any) {
 	ctl := new(weaveControl)
 	ctl.plan = plan
 	ctl.traceWid = traceWid
@@ -525,6 +565,8 @@ func weaveRunSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int
 	ctl.traceEnabled = traceEnabled
 	ctl.tracePC = tracePC
 	ctl.spawnPC = spawnPC
+	ctl.traceVal = traceVal
+	ctl.traceValSet = traceValSet
 	weaveRunBubble(f, ctl)
 	failure = ctl.panicValue
 	switch {

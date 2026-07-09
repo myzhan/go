@@ -1579,6 +1579,8 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 		}
 		needWidth = true
 	} else if base.Flag.Weave {
+		// Pass the width so the runtime can read the scalar value at the access
+		// for display in a failing interleaving.
 		switch kind {
 		case instrumentRead:
 			fn = ir.Syms.Weaveread
@@ -1587,6 +1589,7 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 		default:
 			panic("unreachable")
 		}
+		needWidth = true
 	} else {
 		panic("unreachable")
 	}

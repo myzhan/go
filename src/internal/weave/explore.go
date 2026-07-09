@@ -25,11 +25,13 @@ const (
 
 // Step is one transition in a recorded interleaving.
 type Step struct {
-	Wid  int    // participant id
-	Op   string // operation kind
-	Addr uint64 // object/variable address, or 0
-	File string // source file of the operation, or "" if unknown
-	Line int    // source line, or 0
+	Wid    int    // participant id
+	Op     string // operation kind
+	Addr   uint64 // object/variable address, or 0
+	File   string // source file of the operation, or "" if unknown
+	Line   int    // source line, or 0
+	Val    uint64 // scalar value read, or overwritten by a write (see HasVal)
+	HasVal bool   // whether Val holds a meaningful value for this step
 }
 
 // Goroutine describes a participant in the failing interleaving: its stable id
@@ -62,7 +64,7 @@ type Result struct {
 // Run executes f once in a controlled bubble (a single default schedule).
 // It panics if the run deadlocks.
 func Run(f func()) {
-	_, outcome, failure := runSchedule(f, nil, nil, nil, nil, nil, nil, nil)
+	_, outcome, failure := runSchedule(f, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if failure != nil {
 		panic(failure)
 	}
@@ -80,6 +82,8 @@ type explorer struct {
 	traceEnabled []uint64
 	tracePC      []uint64
 	spawnPC      []uint64 // per-wid creation-site PC, indexed by wid (max 64 participants + slot 0)
+	traceVal     []uint64 // scalar value at each memory op
+	traceValSet  []int32  // 1 if traceVal[i] is meaningful
 	res          Result
 	f            func() // the model; panics (main or spawned) are captured by the runtime wrapper
 }
@@ -92,6 +96,8 @@ func newExplorer(f func()) *explorer {
 		traceEnabled: make([]uint64, traceCap),
 		tracePC:      make([]uint64, traceCap),
 		spawnPC:      make([]uint64, 65),
+		traceVal:     make([]uint64, traceCap),
+		traceValSet:  make([]int32, traceCap),
 		f:            f,
 	}
 }
@@ -173,7 +179,7 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int) Result {
 	var plan []int32
 
 	for {
-		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC)
+		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
 		e.res.Runs++
 
 		wid := e.traceWid[:steps]
@@ -185,14 +191,14 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int) Result {
 			e.res.Failed = true
 			e.res.Value = failure
 			e.res.Seed = encodeSeed(wid)
-			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps])
+			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps], e.traceValSet[:steps], e.traceVal[:steps])
 			e.res.Goroutines = buildGoroutines(wid, e.spawnPC)
 			return e.res
 		}
 		if outcome == 1 {
 			e.res.Deadlock = true
 			e.res.Seed = encodeSeed(wid)
-			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps])
+			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps], e.traceValSet[:steps], e.traceVal[:steps])
 			e.res.Goroutines = buildGoroutines(wid, e.spawnPC)
 			return e.res
 		}
@@ -300,10 +306,10 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int) Result {
 func Replay(seed string, f func()) Result {
 	e := newExplorer(f)
 	plan := decodeSeed(seed)
-	steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC)
+	steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
 	e.res.Runs = 1
 	e.res.Seed = seed
-	e.res.Trace = buildTrace(e.traceWid[:steps], e.traceOp[:steps], e.traceAddr[:steps], e.tracePC[:steps])
+	e.res.Trace = buildTrace(e.traceWid[:steps], e.traceOp[:steps], e.traceAddr[:steps], e.tracePC[:steps], e.traceValSet[:steps], e.traceVal[:steps])
 	e.res.Goroutines = buildGoroutines(e.traceWid[:steps], e.spawnPC)
 	if failure != nil {
 		e.res.Failed = true
@@ -315,13 +321,16 @@ func Replay(seed string, f func()) Result {
 	return e.res
 }
 
-func buildTrace(wid, op []int32, addr []int64, pc []uint64) []Step {
+func buildTrace(wid, op []int32, addr []int64, pc []uint64, valSet []int32, val []uint64) []Step {
 	t := make([]Step, len(wid))
 	for i := range wid {
 		s := Step{Wid: int(wid[i]), Op: opName(uint8(op[i])), Addr: uint64(addr[i])}
 		if pc[i] != 0 {
 			fr, _ := runtime.CallersFrames([]uintptr{uintptr(pc[i])}).Next()
 			s.File, s.Line = fr.File, fr.Line
+		}
+		if valSet[i] != 0 {
+			s.Val, s.HasVal = val[i], true
 		}
 		t[i] = s
 	}
@@ -428,7 +437,7 @@ func exploreExhaustive(f func()) Result {
 	e := newExplorer(f)
 	var plan []int32
 	for {
-		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC)
+		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
 		e.res.Runs++
 		if failure != nil {
 			e.res.Failed = true

@@ -587,6 +587,11 @@ type g struct {
 	// source site of a memory access), used to report source locations in a
 	// failing interleaving. 0 if unknown.
 	weavePC uintptr
+	// weaveVal is the value observed at a pending scalar memory access (the value
+	// being read, or the value being overwritten by a write), for display in a
+	// failing interleaving. weaveValSet is false for non-scalar/non-memory ops.
+	weaveVal    uint64
+	weaveValSet bool
 	// weaveFn is the real function a wrapped weave participant should run. The
 	// participant starts in weaveGoWrapper, which recovers panics so a panic in a
 	// spawned goroutine becomes a reported failure instead of crashing.
