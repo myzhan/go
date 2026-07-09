@@ -50,6 +50,13 @@ type Result struct {
 	Seed       string      // reproducible seed for the failing/deadlocking schedule
 	Trace      []Step      // the failing/deadlocking interleaving
 	Goroutines []Goroutine // participants in the failing interleaving, by wid
+
+	// Truncated is set when exploration stopped before the state space was
+	// exhausted (schedule budget reached, or a capacity limit hit). A truncated
+	// run that found no failure is inconclusive, not a clean pass; callers must
+	// not report it as success. TruncatedReason gives a short explanation.
+	Truncated       bool
+	TruncatedReason string
 }
 
 // Run executes f once in a controlled bubble (a single default schedule).
@@ -125,7 +132,21 @@ func isSyncOp(op uint8) bool {
 // -gcflags=-weave every shared memory access is recorded, so data races are
 // explored soundly. (Recording of channel/mutex operations for DPOR is a
 // separate step; without it, sync-only conflicts are not yet reduced soundly.)
-func Explore(f func()) Result {
+//
+// Explore bounds itself with DefaultMaxSchedules so a huge state space cannot
+// run forever; use ExploreBudget for an explicit bound.
+func Explore(f func()) Result { return ExploreBudget(f, DefaultMaxSchedules) }
+
+// DefaultMaxSchedules is the fallback ceiling on how many schedules Explore will
+// run before giving up and marking the result Truncated. It is generous enough
+// not to trip on ordinary unit tests but bounds pathological state spaces.
+const DefaultMaxSchedules = 1_000_000
+
+// ExploreBudget is Explore with an explicit schedule budget (maxSchedules <= 0
+// means unlimited). When the budget is reached before the state space is
+// exhausted, exploration stops and Result.Truncated is set, so an incomplete
+// run is never mistaken for a clean pass.
+func ExploreBudget(f func(), maxSchedules int) Result {
 	e := newExplorer(f)
 
 	type frame struct {
@@ -160,7 +181,14 @@ func Explore(f func()) Result {
 			return e.res
 		}
 		if outcome == 2 {
-			return e.res // out of space / too many participants
+			e.res.Truncated = true
+			e.res.TruncatedReason = "capacity limit (too many participants or trace recording space)"
+			return e.res
+		}
+		if maxSchedules > 0 && e.res.Runs >= maxSchedules {
+			e.res.Truncated = true
+			e.res.TruncatedReason = "schedule budget reached"
+			return e.res
 		}
 
 		for len(stack) < steps {

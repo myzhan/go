@@ -47,6 +47,7 @@ import (
 	"internal/weave"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -59,6 +60,10 @@ import (
 // interleaving instead of exploring, e.g.
 //
 //	WEAVE_REPLAY=0.1.1.0 go test -run TestX
+//
+// Setting WEAVE_MAX_SCHEDULES=<n> bounds how many schedules are explored before
+// giving up; if the state space is not exhausted within the budget, Test reports
+// the result as incomplete rather than passing.
 func Test(t *testing.T, f func()) {
 	t.Helper()
 
@@ -73,12 +78,25 @@ func Test(t *testing.T, f func()) {
 		return
 	}
 
-	res := weave.Explore(f)
+	budget := weave.DefaultMaxSchedules
+	if v := os.Getenv("WEAVE_MAX_SCHEDULES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			budget = n
+		}
+	}
+
+	res := weave.ExploreBudget(f, budget)
 	switch {
 	case res.Failed, res.Deadlock:
 		t.Errorf("weave: found failing interleaving after %d schedule(s):\n%s%s%s\n"+
 			"reproduce with: WEAVE_REPLAY=%s go test -run %s",
 			res.Runs, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res), res.Seed, t.Name())
+	case res.Truncated:
+		// Exploration did not exhaust the state space, so "no failure found" is
+		// inconclusive; fail loudly rather than give an unreliable green light.
+		t.Errorf("weave: exploration INCOMPLETE after %d schedule(s): %s; "+
+			"no failure found in the explored subset. Reduce the model or raise "+
+			"the budget with WEAVE_MAX_SCHEDULES.", res.Runs, res.TruncatedReason)
 	default:
 		t.Logf("weave: ok, explored %d schedule(s)", res.Runs)
 	}

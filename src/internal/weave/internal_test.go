@@ -152,6 +152,43 @@ func TestMapIterationDeterministic(t *testing.T) {
 	t.Logf("map iteration deterministic across runs (failed=%v)", a.Failed)
 }
 
+// A correct model with a large state space is explored fully by default, but a
+// tiny budget stops early and marks the result Truncated instead of reporting a
+// clean pass.
+func TestBudgetTruncates(t *testing.T) {
+	model := func() {
+		ch := make(chan int, 2)
+		done := make(chan bool, 2)
+		go func() { ch <- 1; done <- true }()
+		go func() { ch <- 2; done <- true }()
+		<-done
+		<-done
+		a := <-ch
+		b := <-ch
+		if a+b != 3 { // always true: {1,2} in some order — a correct model
+			panic("impossible")
+		}
+	}
+	full := Explore(model)
+	if full.Truncated {
+		t.Fatalf("unbounded Explore should not truncate; got %+v", full)
+	}
+	if full.Runs <= 3 {
+		t.Fatalf("model too small to exercise budget: full run explored %d schedules", full.Runs)
+	}
+	res := ExploreBudget(model, 3)
+	if !res.Truncated {
+		t.Fatalf("expected truncation under budget 3; explored %d, truncated=%v", res.Runs, res.Truncated)
+	}
+	if res.Failed || res.Deadlock {
+		t.Fatalf("model is correct; unexpected failure: %+v", res)
+	}
+	if res.Runs > 3 {
+		t.Fatalf("budget 3 exceeded: ran %d schedules", res.Runs)
+	}
+	t.Logf("budget truncation: ran %d schedule(s), reason %q (full = %d)", res.Runs, res.TruncatedReason, full.Runs)
+}
+
 func sameSchedule(a, b []Step) bool {
 	if len(a) != len(b) {
 		return false
