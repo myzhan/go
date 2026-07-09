@@ -127,6 +127,9 @@ func TestCounter(t *testing.T) {
   异步抢占的参与者经 `ready()` 恢复,被控制器误当作同步唤醒截获而滞留 → 偶发 hang。修复:仅截获
   控制器真正阻塞过的参与者(`g.weaveBlocked`,在 `park_m` 阻塞路径设置;抢占不走 `park_m`)。
   另加 `weave.Wait()`(等其余参与者退出,替代 join channel)。
+- **2c `go test -weave` flag** ✅ — cmd/go 新增 `-weave`(`cfg.BuildWeave`),等价于对命令行包加
+  `-gcflags=-weave`(`weaveInit` → `load.BuildGcflags.Set("-weave")`),UX 与 `-race` 一致。
+  chan/mutex 测试 `go test` 即可;plain-内存竞争测试 `go test -weave`。普通构建零影响。
 - **2a 失败 trace 带源码行号** ✅ — 内存访问经 `sys.GetCallerPC` 记录 caller PC,driver 用
   `runtime.CallersFrames` 符号化为 `file:line`;`testing/weave` 打印。丢更新 trace 现在直接指到
   出问题的 `x = x + 1` 行(g1 `:28`、g2 `:29`)。

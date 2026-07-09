@@ -2,10 +2,11 @@
 // code — real `go func()`, real sync.Mutex, real channels, plain int — with no
 // special primitives. weave systematically explores the goroutine interleavings.
 //
-// Run with the built toolchain, enabling memory instrumentation so that ordinary
-// reads/writes become scheduling points:
+// Run with the built toolchain. The -weave flag enables memory instrumentation
+// so that ordinary reads/writes become scheduling points (needed only for
+// data-race tests like TestLostUpdate; channel/mutex tests work without it):
 //
-//	../bin/go test -gcflags=-weave -v
+//	../bin/go test -weave -v
 //
 // TestLostUpdate and TestDeadlock are EXPECTED TO FAIL: that failure is weave
 // reporting the bug, printing the exact interleaving and a seed to reproduce it

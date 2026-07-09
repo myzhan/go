@@ -11,6 +11,7 @@ import (
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/fsys"
+	"cmd/go/internal/load"
 	"cmd/go/internal/modload"
 	"cmd/internal/quoted"
 	"fmt"
@@ -59,6 +60,7 @@ func BuildInit(ld *modload.Loader) {
 
 	modload.Init(ld)
 	instrumentInit()
+	weaveInit()
 	buildModeInit()
 	initCompilerConcurrencyPool()
 	cfgChangedEnv = makeCfgChangedEnv()
@@ -127,6 +129,20 @@ func fuzzInstrumentFlags() []string {
 		return nil
 	}
 	return []string{"-d=libfuzzer"}
+}
+
+// weaveInit implements -weave: it instruments memory accesses in the
+// command-line packages (equivalent to -gcflags=-weave) so ordinary reads and
+// writes become weave scheduling points. Runtime hooks for channels and mutexes
+// are always present, so many weave tests need no flag; -weave is only required
+// to explore data races on plain variables.
+func weaveInit() {
+	if !cfg.BuildWeave {
+		return
+	}
+	if err := load.BuildGcflags.Set("-weave"); err != nil {
+		base.Fatalf("go: %v", err)
+	}
 }
 
 func instrumentInit() {

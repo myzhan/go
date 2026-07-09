@@ -30,9 +30,16 @@
 //		})
 //	}
 //
-// Note: until compiler instrumentation lands, ordinary memory accesses are not
-// scheduling points, so read-modify-write races are only explored if a [Yield]
-// is placed between the read and the write.
+// Channel and mutex operations are always scheduling points, so tests that
+// exercise those (deadlocks, lost signals, lock-ordering bugs) need no special
+// flag. To also explore data races on ordinary variables (for example a lost
+// update on a plain int), build with the -weave flag, which instruments memory
+// accesses:
+//
+//	go test -weave
+//
+// Without -weave, a read-modify-write race is only explored if a [Yield] is
+// placed between the read and the write.
 package weave
 
 import (
