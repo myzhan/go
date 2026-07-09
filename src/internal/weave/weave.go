@@ -38,4 +38,4 @@ func Wait()
 // and an outcome: 0 = finished, 1 = deadlock, 2 = out of space / too many procs.
 //
 //go:linkname runSchedule
-func runSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int64, traceEnabled, tracePC []uint64) (steps int, outcome int, failure any)
+func runSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int64, traceEnabled, tracePC, spawnPC []uint64) (steps int, outcome int, failure any)

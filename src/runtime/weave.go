@@ -61,8 +61,8 @@ type weaveControl struct {
 	runnableAddr [weaveMaxRunnable]uintptr
 	nrun         int // number of valid entries
 
-	nextWid    int32 // next participant id to assign
-	live       int   // participants enrolled and not yet exited
+	nextWid    int32  // next participant id to assign
+	live       int    // participants enrolled and not yet exited
 	done       bool   // all participants have exited
 	deadlock   bool   // some remain but none can run
 	rootParked bool   // root goroutine is parked in weaveRootWait
@@ -82,6 +82,7 @@ type weaveControl struct {
 	traceAddr    []int64
 	traceEnabled []uint64
 	tracePC      []uint64 // caller PC of each step's operation (0 if unknown)
+	spawnPC      []uint64 // per-wid go-statement PC (creation site), indexed by wid
 	step         int
 	overflow     bool // ran out of recording space or too many participants for DPOR
 }
@@ -225,12 +226,17 @@ func weaveStart(bubble *synctestBubble, main *g) {
 	weaveGrant(next)
 }
 
-// weaveAssignWid gives gp its stable participant id. Caller holds bubble.mu.
+// weaveAssignWid gives gp its stable participant id and records its creation
+// site (the go-statement PC) so the report can name goroutines by where they
+// were spawned. Caller holds bubble.mu.
 func weaveAssignWid(ctl *weaveControl, gp *g) {
 	gp.weaveWid = ctl.nextWid
 	ctl.nextWid++
 	if ctl.nextWid > 64 {
 		ctl.overflow = true // too many participants for DPOR's 64-bit enabled mask
+	}
+	if ctl.spawnPC != nil && int(gp.weaveWid) < len(ctl.spawnPC) {
+		ctl.spawnPC[gp.weaveWid] = uint64(gp.gopc)
 	}
 }
 
@@ -510,7 +516,7 @@ func weaveRunBubble(f func(), ctl *weaveControl) {
 // it calls once per schedule.
 //
 //go:linkname weaveRunSchedule internal/weave.runSchedule
-func weaveRunSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int64, traceEnabled, tracePC []uint64) (steps int, outcome int, failure any) {
+func weaveRunSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int64, traceEnabled, tracePC, spawnPC []uint64) (steps int, outcome int, failure any) {
 	ctl := new(weaveControl)
 	ctl.plan = plan
 	ctl.traceWid = traceWid
@@ -518,6 +524,7 @@ func weaveRunSchedule(f func(), plan, traceWid, traceOp []int32, traceAddr []int
 	ctl.traceAddr = traceAddr
 	ctl.traceEnabled = traceEnabled
 	ctl.tracePC = tracePC
+	ctl.spawnPC = spawnPC
 	weaveRunBubble(f, ctl)
 	failure = ctl.panicValue
 	switch {

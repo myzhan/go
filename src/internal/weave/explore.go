@@ -32,20 +32,30 @@ type Step struct {
 	Line int    // source line, or 0
 }
 
+// Goroutine describes a participant in the failing interleaving: its stable id
+// and the source site of the go statement that spawned it.
+type Goroutine struct {
+	Wid  int    // participant id (the "gN" in the trace)
+	File string // source file of the go statement, or "" if unknown/root
+	Line int    // source line of the go statement, or 0
+	Func string // enclosing function of the go statement, or "" if unknown
+}
+
 // Result summarizes an exploration.
 type Result struct {
-	Runs     int    // schedules explored
-	Deadlock bool   // a schedule deadlocked
-	Failed   bool   // a schedule panicked (Value holds the recovered value)
-	Value    any    // recovered panic value from the failing schedule
-	Seed     string // reproducible seed for the failing/deadlocking schedule
-	Trace    []Step // the failing/deadlocking interleaving
+	Runs       int         // schedules explored
+	Deadlock   bool        // a schedule deadlocked
+	Failed     bool        // a schedule panicked (Value holds the recovered value)
+	Value      any         // recovered panic value from the failing schedule
+	Seed       string      // reproducible seed for the failing/deadlocking schedule
+	Trace      []Step      // the failing/deadlocking interleaving
+	Goroutines []Goroutine // participants in the failing interleaving, by wid
 }
 
 // Run executes f once in a controlled bubble (a single default schedule).
 // It panics if the run deadlocks.
 func Run(f func()) {
-	_, outcome, failure := runSchedule(f, nil, nil, nil, nil, nil, nil)
+	_, outcome, failure := runSchedule(f, nil, nil, nil, nil, nil, nil, nil)
 	if failure != nil {
 		panic(failure)
 	}
@@ -62,6 +72,7 @@ type explorer struct {
 	traceAddr    []int64
 	traceEnabled []uint64
 	tracePC      []uint64
+	spawnPC      []uint64 // per-wid creation-site PC, indexed by wid (max 64 participants + slot 0)
 	res          Result
 	f            func() // the model; panics (main or spawned) are captured by the runtime wrapper
 }
@@ -73,6 +84,7 @@ func newExplorer(f func()) *explorer {
 		traceAddr:    make([]int64, traceCap),
 		traceEnabled: make([]uint64, traceCap),
 		tracePC:      make([]uint64, traceCap),
+		spawnPC:      make([]uint64, 65),
 		f:            f,
 	}
 }
@@ -124,7 +136,7 @@ func Explore(f func()) Result {
 	var plan []int32
 
 	for {
-		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
+		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC)
 		e.res.Runs++
 
 		wid := e.traceWid[:steps]
@@ -137,12 +149,14 @@ func Explore(f func()) Result {
 			e.res.Value = failure
 			e.res.Seed = encodeSeed(wid)
 			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps])
+			e.res.Goroutines = buildGoroutines(wid, e.spawnPC)
 			return e.res
 		}
 		if outcome == 1 {
 			e.res.Deadlock = true
 			e.res.Seed = encodeSeed(wid)
 			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps])
+			e.res.Goroutines = buildGoroutines(wid, e.spawnPC)
 			return e.res
 		}
 		if outcome == 2 {
@@ -213,10 +227,11 @@ func Explore(f func()) Result {
 func Replay(seed string, f func()) Result {
 	e := newExplorer(f)
 	plan := decodeSeed(seed)
-	steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
+	steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC)
 	e.res.Runs = 1
 	e.res.Seed = seed
 	e.res.Trace = buildTrace(e.traceWid[:steps], e.traceOp[:steps], e.traceAddr[:steps], e.tracePC[:steps])
+	e.res.Goroutines = buildGoroutines(e.traceWid[:steps], e.spawnPC)
 	if failure != nil {
 		e.res.Failed = true
 		e.res.Value = failure
@@ -238,6 +253,28 @@ func buildTrace(wid, op []int32, addr []int64, pc []uint64) []Step {
 		t[i] = s
 	}
 	return t
+}
+
+// buildGoroutines resolves the creation site of every participant that appears
+// in the interleaving. spawnPC is indexed by wid; slot 0 (the model root) has no
+// meaningful go statement and is reported with an empty location.
+func buildGoroutines(wid []int32, spawnPC []uint64) []Goroutine {
+	max := 0
+	for _, w := range wid {
+		if int(w) > max {
+			max = int(w)
+		}
+	}
+	gs := make([]Goroutine, 0, max+1)
+	for w := 0; w <= max; w++ {
+		g := Goroutine{Wid: w}
+		if w != 0 && w < len(spawnPC) && spawnPC[w] != 0 {
+			fr, _ := runtime.CallersFrames([]uintptr{uintptr(spawnPC[w])}).Next()
+			g.File, g.Line, g.Func = fr.File, fr.Line, fr.Function
+		}
+		gs = append(gs, g)
+	}
+	return gs
 }
 
 func opName(op uint8) string {
@@ -318,7 +355,7 @@ func exploreExhaustive(f func()) Result {
 	e := newExplorer(f)
 	var plan []int32
 	for {
-		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC)
+		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC)
 		e.res.Runs++
 		if failure != nil {
 			e.res.Failed = true

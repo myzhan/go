@@ -65,8 +65,8 @@ func Test(t *testing.T, f func()) {
 	if seed := os.Getenv("WEAVE_REPLAY"); seed != "" {
 		res := weave.Replay(seed, f)
 		if res.Failed || res.Deadlock {
-			t.Errorf("weave: replayed interleaving (seed %s):\n%s%s",
-				seed, formatTrace(res.Trace), outcomeMsg(res))
+			t.Errorf("weave: replayed interleaving (seed %s):\n%s%s%s",
+				seed, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res))
 		} else {
 			t.Logf("weave: replayed seed %s, no failure", seed)
 		}
@@ -76,9 +76,9 @@ func Test(t *testing.T, f func()) {
 	res := weave.Explore(f)
 	switch {
 	case res.Failed, res.Deadlock:
-		t.Errorf("weave: found failing interleaving after %d schedule(s):\n%s%s\n"+
+		t.Errorf("weave: found failing interleaving after %d schedule(s):\n%s%s%s\n"+
 			"reproduce with: WEAVE_REPLAY=%s go test -run %s",
-			res.Runs, formatTrace(res.Trace), outcomeMsg(res), res.Seed, t.Name())
+			res.Runs, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res), res.Seed, t.Name())
 	default:
 		t.Logf("weave: ok, explored %d schedule(s)", res.Runs)
 	}
@@ -92,6 +92,40 @@ func outcomeMsg(res weave.Result) string {
 		return "deadlock: all goroutines blocked"
 	}
 	return ""
+}
+
+// formatGoroutines renders the legend mapping each gN in the trace to the source
+// site of the go statement that spawned it, so the numbered trace below is
+// readable. g0 is the model root (no spawning go statement).
+func formatGoroutines(gs []weave.Goroutine) string {
+	if len(gs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("  goroutines:\n")
+	for _, g := range gs {
+		switch {
+		case g.Wid == 0:
+			fmt.Fprintf(&b, "    g0: model root\n")
+		case g.File != "":
+			fmt.Fprintf(&b, "    g%d: %s (%s:%d)\n", g.Wid, funcName(g.Func), filepath.Base(g.File), g.Line)
+		default:
+			fmt.Fprintf(&b, "    g%d: (creation site unknown)\n", g.Wid)
+		}
+	}
+	return b.String()
+}
+
+// funcName trims the package path from a fully-qualified function name, keeping
+// the last path segment (e.g. "weavedemo.TestX.func1").
+func funcName(fn string) string {
+	if fn == "" {
+		return "?"
+	}
+	if i := strings.LastIndexByte(fn, '/'); i >= 0 {
+		return fn[i+1:]
+	}
+	return fn
 }
 
 func formatTrace(steps []weave.Step) string {
