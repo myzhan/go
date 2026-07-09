@@ -189,6 +189,51 @@ func TestBudgetTruncates(t *testing.T) {
 	t.Logf("budget truncation: ran %d schedule(s), reason %q (full = %d)", res.Runs, res.TruncatedReason, full.Runs)
 }
 
+// Context bounding: the lost update needs a preemption in the middle of a
+// read-modify-write (switch away from a goroutine that is still runnable at its
+// Yield). With 0 preemptions allowed, goroutines run to completion in turn and
+// the bug is unreachable; allowing preemptions surfaces it. The bound also cuts
+// the number of schedules explored.
+func TestPreemptionBound(t *testing.T) {
+	model := func() {
+		x := 0
+		done := make(chan bool, 2)
+		inc := func() {
+			tmp := x
+			Yield() // split the read-modify-write with a scheduling point
+			x = tmp + 1
+			done <- true
+		}
+		go inc()
+		go inc()
+		<-done
+		<-done
+		if x != 2 {
+			panic("lost update")
+		}
+	}
+
+	b0 := ExploreBounded(model, DefaultMaxSchedules, 0)
+	if b0.Failed || b0.Deadlock {
+		t.Fatalf("with 0 preemptions the lost update is unreachable; got %+v", b0)
+	}
+	if b0.Truncated {
+		t.Fatalf("a preemption bound should not mark the result truncated; got %+v", b0)
+	}
+
+	b2 := ExploreBounded(model, DefaultMaxSchedules, 2)
+	if !b2.Failed {
+		t.Fatalf("with preemptions allowed, expected to find the lost update; got %+v", b2)
+	}
+
+	full := Explore(model)
+	if !full.Failed {
+		t.Fatalf("unbounded exploration should also find the lost update")
+	}
+	t.Logf("preemption bound: c=0 clean (%d schedules), c=2 found bug (%d), unbounded (%d)",
+		b0.Runs, b2.Runs, full.Runs)
+}
+
 func sameSchedule(a, b []Step) bool {
 	if len(a) != len(b) {
 		return false

@@ -134,8 +134,8 @@ func isSyncOp(op uint8) bool {
 // separate step; without it, sync-only conflicts are not yet reduced soundly.)
 //
 // Explore bounds itself with DefaultMaxSchedules so a huge state space cannot
-// run forever; use ExploreBudget for an explicit bound.
-func Explore(f func()) Result { return ExploreBudget(f, DefaultMaxSchedules) }
+// run forever; use ExploreBudget or ExploreBounded for explicit bounds.
+func Explore(f func()) Result { return ExploreBounded(f, DefaultMaxSchedules, -1) }
 
 // DefaultMaxSchedules is the fallback ceiling on how many schedules Explore will
 // run before giving up and marking the result Truncated. It is generous enough
@@ -147,6 +147,22 @@ const DefaultMaxSchedules = 1_000_000
 // exhausted, exploration stops and Result.Truncated is set, so an incomplete
 // run is never mistaken for a clean pass.
 func ExploreBudget(f func(), maxSchedules int) Result {
+	return ExploreBounded(f, maxSchedules, -1)
+}
+
+// ExploreBounded is ExploreBudget with context bounding: when maxPreemptions >= 0
+// the search is restricted to schedules with at most that many preemptions
+// (non-forced context switches — the scheduler leaving a goroutine that was
+// still runnable). This is the CHESS insight that most concurrency bugs surface
+// with very few preemptions, so bounding finds them while exploring far fewer
+// schedules. maxPreemptions < 0 disables the bound.
+//
+// The bound is complete within itself: every schedule with <= maxPreemptions
+// preemptions is still explored (a backtrack is skipped only when its forced
+// prefix already exceeds the bound, and every prefix of an in-bound schedule is
+// itself in bound). It is not marked Truncated, since "no failure within c
+// preemptions" is a real guarantee, not an incomplete search.
+func ExploreBounded(f func(), maxSchedules, maxPreemptions int) Result {
 	e := newExplorer(f)
 
 	type frame struct {
@@ -199,6 +215,35 @@ func ExploreBudget(f func(), maxSchedules int) Result {
 			stack[i].done[wid[i]] = true
 		}
 
+		// Context bounding: cum[i] counts the preemptions (non-forced context
+		// switches) among steps 1..i of this run. Forcing participant w at step i
+		// yields a schedule whose prefix has cum[i-1] preemptions plus one more if
+		// switching to w there is itself a preemption; allow the backtrack only if
+		// that stays within maxPreemptions.
+		var cum []int
+		if maxPreemptions >= 0 {
+			cum = make([]int, steps)
+			for i := 1; i < steps; i++ {
+				cum[i] = cum[i-1]
+				if wid[i] != wid[i-1] && en[i]&(1<<uint(wid[i-1])) != 0 {
+					cum[i]++
+				}
+			}
+		}
+		allow := func(i int, w int32) bool {
+			if maxPreemptions < 0 {
+				return true
+			}
+			cost := 0
+			if i >= 1 {
+				cost = cum[i-1]
+				if w != wid[i-1] && en[i]&(1<<uint(wid[i-1])) != 0 {
+					cost++
+				}
+			}
+			return cost <= maxPreemptions
+		}
+
 		// Backward analysis: for each transition j, find the nearest earlier
 		// concurrent transition i it conflicts with, and schedule the reversal
 		// (run j's participant at state i) in a future run.
@@ -210,14 +255,14 @@ func ExploreBudget(f func(), maxSchedules int) Result {
 				if conflict(uint8(op[i]), addr[i], uint8(op[j]), addr[j]) {
 					wj := wid[j]
 					if en[i]&(1<<uint(wj)) != 0 {
-						if !stack[i].done[wj] {
+						if !stack[i].done[wj] && allow(i, wj) {
 							stack[i].backtrack[wj] = true
 						}
 					} else {
 						// j's participant was not runnable at state i; explore all
 						// runnable participants there to reach the reversal.
 						for w := int32(0); w < 64; w++ {
-							if en[i]&(1<<uint(w)) != 0 && !stack[i].done[w] {
+							if en[i]&(1<<uint(w)) != 0 && !stack[i].done[w] && allow(i, w) {
 								stack[i].backtrack[w] = true
 							}
 						}

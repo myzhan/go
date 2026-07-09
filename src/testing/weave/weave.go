@@ -64,6 +64,10 @@ import (
 // Setting WEAVE_MAX_SCHEDULES=<n> bounds how many schedules are explored before
 // giving up; if the state space is not exhausted within the budget, Test reports
 // the result as incomplete rather than passing.
+//
+// Setting WEAVE_MAX_PREEMPTIONS=<c> restricts the search to schedules with at
+// most c preemptions (context bounding); most concurrency bugs surface with very
+// few, so a small c finds them while exploring far fewer schedules.
 func Test(t *testing.T, f func()) {
 	t.Helper()
 
@@ -84,8 +88,14 @@ func Test(t *testing.T, f func()) {
 			budget = n
 		}
 	}
+	maxPreempt := -1
+	if v := os.Getenv("WEAVE_MAX_PREEMPTIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			maxPreempt = n
+		}
+	}
 
-	res := weave.ExploreBudget(f, budget)
+	res := weave.ExploreBounded(f, budget, maxPreempt)
 	switch {
 	case res.Failed, res.Deadlock:
 		t.Errorf("weave: found failing interleaving after %d schedule(s):\n%s%s%s\n"+
@@ -97,6 +107,8 @@ func Test(t *testing.T, f func()) {
 		t.Errorf("weave: exploration INCOMPLETE after %d schedule(s): %s; "+
 			"no failure found in the explored subset. Reduce the model or raise "+
 			"the budget with WEAVE_MAX_SCHEDULES.", res.Runs, res.TruncatedReason)
+	case maxPreempt >= 0:
+		t.Logf("weave: ok, explored %d schedule(s) within %d preemption(s)", res.Runs, maxPreempt)
 	default:
 		t.Logf("weave: ok, explored %d schedule(s)", res.Runs)
 	}
