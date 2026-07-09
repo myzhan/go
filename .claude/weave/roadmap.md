@@ -12,22 +12,22 @@
 
 ## 实际进度速览(以代码为准)
 
-**已落地**:DPOR(含差分健全性验证)· runtime 接入真实 `chan`/`select`/`sync.Mutex`/`RWMutex`/
-`WaitGroup.Wait`(零改写,`func()` 契约)· `-weave` 内存读写插桩(继承 race 逃逸剪枝)·
-`go test -weave` flag · 失败 seed 重放 · 源码行号 trace · **goroutine 创建位置图例** ·
+**已落地**:DPOR(含差分健全性验证 + **抢占计数上界 context bounding**)· runtime 接入真实
+`chan`/`select`/`sync.Mutex`/`RWMutex`/`WaitGroup`(Wait+Add/Done)/`Cond`/`Once`(零改写,`func()` 契约)·
+`-weave` 内存读写插桩(继承 race 逃逸剪枝)· `go test -weave` flag · 失败 seed 重放 ·
+源码行号 trace · **goroutine 创建位置图例** · **读写值显示** · 探索预算 + 截断显式上报 ·
 select 确定化 · RNG(map/maphash)确定化 · spawned goroutine panic 捕获 ·
 **`-weave` 与 `-race`/`-msan`/`-asan` 互斥保护**。
 
 **真正未做(剩余工作,已对代码核实)**:
 1. **atomic 插桩**(最大缺口):`sync/atomic` 目前既非调度点也不记录 → 用 atomic 的无锁代码探索不了。
    正解仿 `-race` 用 instrumented std 重建,工程量大,为免拖累全体 Go 程序 atomic 性能未草率合入。
-2. **剩余同步原语记录**:`sync.Cond`(Wait/Signal/Broadcast)、`Once.Do`、`WaitGroup.Add/Done`
-   (目前只有 `.Wait` 有钩子)。
-3. **弱内存模型**(M5):atomic C11 重排 / read-from 枚举。
-4. **DPOR-over-select-cases**:select 已确定化,但未枚举多个就绪 case。
-5. **(D9)泡泡外并发显式检测** `uncontrolled concurrency detected` + **undo-log 跨 run 自动重置**。
-6. **抢占看门狗**(死循环兜底)。
-7. **UX**:显示读写值、覆盖率/截断/状态空间估计、超时预算、并行探索、context/http 示例。
+2. **弱内存模型**(M5):atomic C11 重排 / read-from 枚举(依赖 1)。
+3. **DPOR-over-select-cases**:select 已确定化,但未枚举多个就绪 case。
+4. **(D9)泡泡外并发显式检测** `uncontrolled concurrency detected` + **undo-log 跨 run 自动重置**。
+5. **optimal-DPOR**(wakeup tree)进一步剪枝。
+6. **写入的新值显示**(需编译器把 store 的右值传给 `weavewrite`);抢占看门狗(死循环兜底)。
+7. **UX**:合并冗余 run 步、状态空间估计、wall-clock 超时、并行探索、context/http 示例。
 8. **死锁泄漏清理**:未做(已知限制,与 synctest 一致,可接受)。
 
 ---
