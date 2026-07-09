@@ -2,14 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build weaveinstr
+//go:build weave
 
-// These tests require compiler instrumentation: build with
+// These tests require the -weave build (memory instrumentation):
 //
-//	go test -tags weaveinstr -gcflags=-weave internal/weave
+//	go test -weave internal/weave
 //
 // so that ordinary memory accesses in the model become scheduling points and no
-// explicit weave.Yield is needed.
+// explicit weave.Yield is needed. The -weave flag defines the "weave" build tag.
 package weave
 
 import (

@@ -143,6 +143,9 @@ func weaveInit() {
 	if err := load.BuildGcflags.Set("-weave"); err != nil {
 		base.Fatalf("go: %v", err)
 	}
+	// Define the "weave" build tag (like -race defines "race"), so tests can
+	// gate weave-only code with //go:build weave.
+	cfg.BuildContext.BuildTags = append(cfg.BuildContext.BuildTags, "weave")
 }
 
 func instrumentInit() {
