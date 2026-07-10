@@ -55,11 +55,14 @@ var weaveGloballyActive uint32
 // operation that participant is about to perform (its pending transition), or
 // weaveOpNone/0 if not yet known (freshly spawned or just woken).
 type weaveControl struct {
-	runnable     [weaveMaxRunnable]guintptr
-	runnableWid  [weaveMaxRunnable]int32
-	runnableOp   [weaveMaxRunnable]uint8
-	runnableAddr [weaveMaxRunnable]uintptr
-	nrun         int // number of valid entries
+	runnable       [weaveMaxRunnable]guintptr
+	runnableWid    [weaveMaxRunnable]int32
+	runnableOp     [weaveMaxRunnable]uint8
+	runnableAddr   [weaveMaxRunnable]uintptr
+	runnablePC     [weaveMaxRunnable]uintptr // pending memory op's source PC
+	runnableVal    [weaveMaxRunnable]uint64  // pending memory op's scalar value
+	runnableValSet [weaveMaxRunnable]bool    // whether runnableVal is meaningful
+	nrun           int                       // number of valid entries
 
 	nextWid    int32  // next participant id to assign
 	live       int    // participants enrolled and not yet exited
@@ -137,8 +140,9 @@ func weaveControlledParticipant(gp *g) bool {
 }
 
 // weavePush appends a participant to the runnable set with its pending
-// operation. Caller holds bubble.mu.
-func weavePush(ctl *weaveControl, gp *g, op weaveOp, addr uintptr) {
+// operation, and for a memory op its source PC and observed scalar value.
+// Caller holds bubble.mu.
+func weavePush(ctl *weaveControl, gp *g, op weaveOp, addr, pc uintptr, val uint64, valSet bool) {
 	if ctl.nrun >= weaveMaxRunnable {
 		throw("weave: too many runnable goroutines")
 	}
@@ -147,6 +151,9 @@ func weavePush(ctl *weaveControl, gp *g, op weaveOp, addr uintptr) {
 	ctl.runnableWid[i] = gp.weaveWid
 	ctl.runnableOp[i] = uint8(op)
 	ctl.runnableAddr[i] = addr
+	ctl.runnablePC[i] = pc
+	ctl.runnableVal[i] = val
+	ctl.runnableValSet[i] = valSet
 	ctl.nrun++
 }
 
@@ -189,11 +196,10 @@ func weaveChoose(ctl *weaveControl) int {
 			// transitions (run/exit/chan/mutex) reuse the g and would show a
 			// stale PC.
 			if o := ctl.runnableOp[idx]; o == uint8(weaveOpRead) || o == uint8(weaveOpWrite) {
-				gp := ctl.runnable[idx].ptr()
-				ctl.tracePC[ctl.step] = uint64(gp.weavePC)
+				ctl.tracePC[ctl.step] = uint64(ctl.runnablePC[idx])
 				if ctl.traceVal != nil {
-					ctl.traceVal[ctl.step] = gp.weaveVal
-					if gp.weaveValSet {
+					ctl.traceVal[ctl.step] = ctl.runnableVal[idx]
+					if ctl.runnableValSet[idx] {
 						ctl.traceValSet[ctl.step] = 1
 					} else {
 						ctl.traceValSet[ctl.step] = 0
@@ -238,6 +244,9 @@ func weaveTake(ctl *weaveControl) *g {
 		ctl.runnableWid[i] = ctl.runnableWid[i+1]
 		ctl.runnableOp[i] = ctl.runnableOp[i+1]
 		ctl.runnableAddr[i] = ctl.runnableAddr[i+1]
+		ctl.runnablePC[i] = ctl.runnablePC[i+1]
+		ctl.runnableVal[i] = ctl.runnableVal[i+1]
+		ctl.runnableValSet[i] = ctl.runnableValSet[i+1]
 	}
 	ctl.nrun--
 	ctl.runnable[ctl.nrun] = 0
@@ -251,7 +260,7 @@ func weaveStart(bubble *synctestBubble, main *g) {
 	lock(&bubble.mu)
 	ctl.live++
 	weaveAssignWid(ctl, main)
-	weavePush(ctl, main, weaveOpNone, 0)
+	weavePush(ctl, main, weaveOpNone, 0, 0, 0, false)
 	next := weaveTake(ctl)
 	unlock(&bubble.mu)
 	weaveGrant(next)
@@ -278,7 +287,7 @@ func weaveRegisterChild(bubble *synctestBubble, newg *g) {
 	ctl := bubble.weaveCtl
 	ctl.live++
 	weaveAssignWid(ctl, newg)
-	weavePush(ctl, newg, weaveOpNone, 0)
+	weavePush(ctl, newg, weaveOpNone, 0, 0, 0, false)
 	unlock(&bubble.mu)
 }
 
@@ -326,7 +335,7 @@ func weaveEnqueue(gp *g) {
 	b := gp.bubble
 	lock(&b.mu)
 	// Woken from a block; its next operation is not yet known.
-	weavePush(b.weaveCtl, gp, weaveOpNone, 0)
+	weavePush(b.weaveCtl, gp, weaveOpNone, 0, 0, 0, false)
 	unlock(&b.mu)
 }
 
@@ -361,7 +370,7 @@ func weaveOnGoexit(bubble *synctestBubble) {
 	// A participant parked in weave.Wait must re-check now that one fewer
 	// participant is live: re-enqueue it so the controller can resume it.
 	if ctl.waiter != nil {
-		weavePush(ctl, ctl.waiter, weaveOpNone, 0)
+		weavePush(ctl, ctl.waiter, weaveOpNone, 0, 0, 0, false)
 		ctl.waiter = nil
 	}
 	next := weaveTake(ctl)
@@ -394,19 +403,18 @@ func weaveSchedPoint(op weaveOp, id unsafe.Pointer) {
 	if !weaveActive() {
 		return
 	}
-	weaveSchedPointSlow(op, id, 0)
+	weaveSchedPointSlow(op, id, 0, 0, false)
 }
 
-func weaveSchedPointSlow(op weaveOp, id unsafe.Pointer, pc uintptr) {
+func weaveSchedPointSlow(op weaveOp, id unsafe.Pointer, pc uintptr, val uint64, valSet bool) {
 	gp := getg()
-	gp.weavePC = pc
 	bubble := gp.bubble
 	ctl := bubble.weaveCtl
 	lock(&bubble.mu)
 	// gp holds the token; offer to yield by joining the runnable set with its
-	// pending operation and taking the chosen one. If gp is chosen, it keeps
-	// running.
-	weavePush(ctl, gp, op, uintptr(id))
+	// pending operation (and, for a memory op, its PC/value) and taking the
+	// chosen one. If gp is chosen, it keeps running.
+	weavePush(ctl, gp, op, uintptr(id), pc, val, valSet)
 	next := weaveTake(ctl)
 	if next == gp {
 		unlock(&bubble.mu)
@@ -428,9 +436,8 @@ func weaveSchedPointSlow(op weaveOp, id unsafe.Pointer, pc uintptr) {
 
 func weaveread(addr, size uintptr) {
 	if weaveActive() {
-		gp := getg()
-		gp.weaveVal, gp.weaveValSet = weaveLoadVal(addr, size)
-		weaveSchedPointSlow(weaveOpRead, unsafe.Pointer(addr), sys.GetCallerPC())
+		val, valSet := weaveLoadVal(addr, size)
+		weaveSchedPointSlow(weaveOpRead, unsafe.Pointer(addr), sys.GetCallerPC(), val, valSet)
 	}
 }
 
@@ -438,8 +445,7 @@ func weavewrite(addr, size uintptr) {
 	if weaveActive() {
 		// Used for scalar stores whose value the compiler could not supply (float,
 		// pointer, ...); record the write as a scheduling point but no value.
-		getg().weaveValSet = false
-		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC())
+		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC(), 0, false)
 	}
 }
 
@@ -447,23 +453,19 @@ func weavewrite(addr, size uintptr) {
 // passes the value being written so the trace can show the new value.
 func weavewriteval(addr, size uintptr, val uint64) {
 	if weaveActive() {
-		gp := getg()
-		gp.weaveVal, gp.weaveValSet = val, true
-		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC())
+		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC(), val, true)
 	}
 }
 
 func weavereadrange(addr, size uintptr) {
 	if weaveActive() {
-		getg().weaveValSet = false // composite: no meaningful scalar value
-		weaveSchedPointSlow(weaveOpRead, unsafe.Pointer(addr), sys.GetCallerPC())
+		weaveSchedPointSlow(weaveOpRead, unsafe.Pointer(addr), sys.GetCallerPC(), 0, false)
 	}
 }
 
 func weavewriterange(addr, size uintptr) {
 	if weaveActive() {
-		getg().weaveValSet = false // composite: no meaningful scalar value
-		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC())
+		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC(), 0, false)
 	}
 }
 
