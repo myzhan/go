@@ -27,7 +27,7 @@ select 确定化 · RNG(map/maphash)确定化 · spawned goroutine panic 捕获 
 4. **(D9)泡泡外并发显式检测** `uncontrolled concurrency detected` + **undo-log 跨 run 自动重置**。
 5. **optimal-DPOR**(wakeup tree)进一步剪枝。
 6. **写入的新值显示**(需编译器把 store 的右值传给 `weavewrite`);抢占看门狗(死循环兜底)。
-7. **UX**:合并冗余 run 步、状态空间估计、wall-clock 超时、并行探索、context/http 示例。
+7. **UX**:状态空间估计、并行探索、context/http 示例。
 8. **死锁泄漏清理**:未做(已知限制,与 synctest 一致,可接受)。
 
 ---
@@ -142,7 +142,7 @@ select 确定化 · RNG(map/maphash)确定化 · spawned goroutine panic 捕获 
 - trace 可读性:
   - [x] 源码行号(`weavePC` + `CallersFrames` → `file:line`)
   - [x] goroutine 创建位置图例(`gN` → `go` 语句处 + 函数名)
-  - [ ] 合并冗余 wait/`run` 步
+  - [x] 合并冗余 `run` 步(紧跟同 goroutine 真实操作的裸 `run` 步在显示时省略)
   - [x] 显示读写的值:标量读显示 `= V`(读到的值),写显示 `(was V)`(被覆盖的旧值);
         编译器给标量 `weaveread/weavewrite` 传 size,运行时在钩子处按类型读值(复合类型不显示)
 - 覆盖率/进度报告:
@@ -152,7 +152,7 @@ select 确定化 · RNG(map/maphash)确定化 · spawned goroutine panic 捕获 
   - [ ] 状态空间估计
 - 超时/预算控制、并行探索:
   - [x] 调度数预算(`DefaultMaxSchedules` + `ExploreBudget` + `WEAVE_MAX_SCHEDULES` 环境变量覆盖)
-  - [ ] wall-clock 超时
+  - [x] wall-clock 超时(`ExploreBounded` 的 `maxDuration` + `WEAVE_TIMEOUT`,超时标 `Truncated`)
   - [ ] 并行探索(多 worker 跑不同子树)
 - 文档 + 示例:
   - [x] 介绍性博客(`blog.md`)
