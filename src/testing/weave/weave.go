@@ -187,12 +187,8 @@ func formatTrace(steps []weave.Step) string {
 		}
 		val := ""
 		if s.HasVal {
-			switch s.Op {
-			case "read":
-				val = fmt.Sprintf(" = %d", s.Val) // value read
-			case "write":
-				val = fmt.Sprintf(" (was %d)", s.Val) // value being overwritten
-			}
+			// The value read (read) or the value written (write).
+			val = fmt.Sprintf(" = %d", s.Val)
 		}
 		n++
 		fmt.Fprintf(&b, "  %2d: g%d %s%s%s\n", n, s.Wid, s.Op, val, loc)

@@ -38,7 +38,7 @@ type Step struct {
 	Addr   uint64 // object/variable address, or 0
 	File   string // source file of the operation, or "" if unknown
 	Line   int    // source line, or 0
-	Val    uint64 // scalar value read, or overwritten by a write (see HasVal)
+	Val    uint64 // scalar value read, or value written (see HasVal)
 	HasVal bool   // whether Val holds a meaningful value for this step
 }
 

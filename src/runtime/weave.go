@@ -420,10 +420,19 @@ func weaveread(addr, size uintptr) {
 
 func weavewrite(addr, size uintptr) {
 	if weaveActive() {
-		// A write hook runs before the store, so the value read here is the value
-		// being overwritten (the location's prior contents).
+		// Used for scalar stores whose value the compiler could not supply (float,
+		// pointer, ...); record the write as a scheduling point but no value.
+		getg().weaveValSet = false
+		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC())
+	}
+}
+
+// weavewriteval is the store hook for integer/bool scalars, where the compiler
+// passes the value being written so the trace can show the new value.
+func weavewriteval(addr, size uintptr, val uint64) {
+	if weaveActive() {
 		gp := getg()
-		gp.weaveVal, gp.weaveValSet = weaveLoadVal(addr, size)
+		gp.weaveVal, gp.weaveValSet = val, true
 		weaveSchedPointSlow(weaveOpWrite, unsafe.Pointer(addr), sys.GetCallerPC())
 	}
 }
