@@ -128,6 +128,67 @@ func conflict(opi uint8, ai int64, opj uint8, aj int64) bool {
 	return opi == opWrite || opj == opWrite
 }
 
+// channelHB returns a happens-before predicate for one recorded schedule,
+// capturing the ordering that channel operations establish: the k-th send on a
+// channel happens-before the k-th receive (Go channels are FIFO), and a close
+// happens-before a later receive on the (drained) channel. Program order is
+// included via per-participant vector clocks.
+//
+// Only channel edges are modeled; every other synchronization (mutex, cond,
+// waitgroup, ...) is treated as unordered. That is sound for DPOR: a missing
+// happens-before edge can only make the search consider more reorderings, never
+// skip a needed one. Mutex/RWMutex are deliberately excluded because a single
+// acquire/release chain cannot express reader concurrency without risking a
+// false ordering (which would drop a real reversal).
+func channelHB(wid, op []int32, addr []int64, steps int) func(i, j int) bool {
+	P := 0
+	for i := 0; i < steps; i++ {
+		if int(wid[i])+1 > P {
+			P = int(wid[i]) + 1
+		}
+	}
+	clone := func(c []int32) []int32 { d := make([]int32, P); copy(d, c); return d }
+	join := func(dst, src []int32) {
+		for k := range dst {
+			if src[k] > dst[k] {
+				dst[k] = src[k]
+			}
+		}
+	}
+	cur := make([][]int32, P)
+	for p := range cur {
+		cur[p] = make([]int32, P)
+	}
+	sendq := map[int64][][]int32{} // FIFO of sender clocks per channel
+	closed := map[int64][]int32{}  // clock published by close, per channel
+	vc := make([][]int32, steps)
+	ts := make([]int32, steps)
+	for i := 0; i < steps; i++ {
+		p := int(wid[i])
+		switch uint8(op[i]) {
+		case opChanRecv:
+			if q := sendq[addr[i]]; len(q) > 0 {
+				join(cur[p], q[0])
+				sendq[addr[i]] = q[1:]
+			} else if rc, ok := closed[addr[i]]; ok {
+				join(cur[p], rc)
+			}
+		}
+		cur[p][p]++
+		vc[i] = clone(cur[p])
+		ts[i] = cur[p][p]
+		switch uint8(op[i]) {
+		case opChanSend:
+			sendq[addr[i]] = append(sendq[addr[i]], clone(cur[p]))
+		case opChanClose:
+			closed[addr[i]] = clone(cur[p])
+		}
+	}
+	return func(i, j int) bool {
+		return i != j && vc[j][wid[i]] >= ts[i]
+	}
+}
+
 func isSyncOp(op uint8) bool {
 	switch op {
 	case opLock, opUnlock, opChanSend, opChanRecv, opChanClose, opSelect, opWaitGroupWait,
@@ -269,6 +330,8 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 			return cost <= maxPreemptions
 		}
 
+		hb := channelHB(wid, op, addr, steps)
+
 		// Backward analysis: for each transition j, find the nearest earlier
 		// concurrent transition i it conflicts with, and schedule the reversal
 		// (run j's participant at state i) in a future run.
@@ -278,6 +341,12 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 					continue // program-order predecessor of j (happens-before j)
 				}
 				if conflict(uint8(op[i]), addr[i], uint8(op[j]), addr[j]) {
+					if hb(i, j) {
+						// i happens-before j (e.g. ordered through a channel), so the
+						// pair is not a reversible race; keep scanning for an earlier
+						// concurrent conflict rather than stopping here.
+						continue
+					}
 					wj := wid[j]
 					if en[i]&(1<<uint(wj)) != 0 {
 						if !stack[i].done[wj] && allow(i, wj) {

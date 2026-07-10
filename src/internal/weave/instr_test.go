@@ -68,6 +68,44 @@ func TestAutoStructField(t *testing.T) {
 	t.Logf("struct field: found lost update after %d schedules", res.Runs)
 }
 
+// Context bounding: with memory instrumentation the read and write of x are
+// separate scheduling points, so the lost update needs a preemption between them
+// (a switch away from a still-runnable goroutine mid read-modify-write). With 0
+// preemptions each goroutine runs its read+write atomically and x is always 2;
+// allowing preemptions surfaces the bug. Requires -weave so x is observable.
+func TestPreemptionBound(t *testing.T) {
+	model := func() {
+		x := 0
+		inc := func() { x = x + 1 }
+		go inc()
+		go inc()
+		Wait()
+		if x != 2 {
+			panic("lost update")
+		}
+	}
+
+	b0 := ExploreBounded(model, DefaultMaxSchedules, 0, 0)
+	if b0.Failed || b0.Deadlock {
+		t.Fatalf("with 0 preemptions the lost update is unreachable; got %+v", b0)
+	}
+	if b0.Truncated {
+		t.Fatalf("a preemption bound should not mark the result truncated; got %+v", b0)
+	}
+
+	b1 := ExploreBounded(model, DefaultMaxSchedules, 1, 0)
+	if !b1.Failed {
+		t.Fatalf("with a preemption allowed, expected to find the lost update; got %+v", b1)
+	}
+
+	full := Explore(model)
+	if !full.Failed {
+		t.Fatalf("unbounded exploration should also find the lost update")
+	}
+	t.Logf("preemption bound: c=0 clean (%d schedules), c=1 found bug (%d), unbounded (%d)",
+		b0.Runs, b1.Runs, full.Runs)
+}
+
 // Soundness + reduction: on an instrumented model, DPOR must reach the same
 // outcome as exhaustive exploration while running no more schedules.
 func TestDPOREquivalence(t *testing.T) {
@@ -201,6 +239,19 @@ func TestDPORSoundnessSuite(t *testing.T) {
 			seen = x
 			Wait()
 			return fmt.Sprint(x, seen)
+		}, nil},
+		{"chan-producer-consumer", func() string {
+			// Two producers race to send; the buffered channel is FIFO so the two
+			// receive values reflect the send order. x,y are each written before a
+			// send, so the channel orders them ahead of nothing shared here.
+			ch := make(chan int, 2)
+			x, y := 0, 0
+			go func() { x = 1; ch <- 1 }()
+			go func() { y = 2; ch <- 2 }()
+			a := <-ch
+			b := <-ch
+			Wait()
+			return fmt.Sprint(x, y, a, b)
 		}, nil},
 		{"waitgroup-race", func() string {
 			var wg sync.WaitGroup
