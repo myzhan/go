@@ -26,7 +26,7 @@ select 确定化 · RNG(map/maphash)确定化 · spawned goroutine panic 捕获 
 3. **DPOR-over-select-cases**:select 已确定化,但未枚举多个就绪 case。
 4. **(D9)泡泡外并发显式检测** `uncontrolled concurrency detected` + **undo-log 跨 run 自动重置**。
 5. **optimal-DPOR**(wakeup tree)进一步剪枝。
-6. **写入的新值显示**(需编译器把 store 的右值传给 `weavewrite`);抢占看门狗(死循环兜底)。
+6. **抢占看门狗**(死循环兜底)。
 7. **UX**:状态空间估计、并行探索、context/http 示例。
 8. **死锁泄漏清理**:未做(已知限制,与 synctest 一致,可接受)。
 
@@ -143,8 +143,9 @@ select 确定化 · RNG(map/maphash)确定化 · spawned goroutine panic 捕获 
   - [x] 源码行号(`weavePC` + `CallersFrames` → `file:line`)
   - [x] goroutine 创建位置图例(`gN` → `go` 语句处 + 函数名)
   - [x] 合并冗余 `run` 步(紧跟同 goroutine 真实操作的裸 `run` 步在显示时省略)
-  - [x] 显示读写的值:标量读显示 `= V`(读到的值),写显示 `(was V)`(被覆盖的旧值);
-        编译器给标量 `weaveread/weavewrite` 传 size,运行时在钩子处按类型读值(复合类型不显示)
+  - [x] 显示读写的值:读显示 `= V`(读到的值),写显示 `= V`(**写入的新值**)。读:编译器传 size,
+        运行时按类型读内存;写:编译器把 store 的右值(整型/bool,排除 uintptr)零扩展后传给
+        `weavewriteval`;其余标量/复合类型不显示值
 - 覆盖率/进度报告:
   - [x] 已探索 schedule 数(`Result.Runs` → `explored N schedule(s)`)
   - [x] **是否截断** —— `Result.Truncated`/`TruncatedReason`;预算超限与容量溢出(`outcome==2`)都标注;
