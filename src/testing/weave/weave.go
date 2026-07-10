@@ -50,6 +50,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Test explores interleavings of the model f and fails t on the first schedule
@@ -68,6 +69,9 @@ import (
 // Setting WEAVE_MAX_PREEMPTIONS=<c> restricts the search to schedules with at
 // most c preemptions (context bounding); most concurrency bugs surface with very
 // few, so a small c finds them while exploring far fewer schedules.
+//
+// Setting WEAVE_TIMEOUT=<dur> (e.g. 2s) stops exploration after that much
+// wall-clock time, reporting the result as incomplete rather than passing.
 func Test(t *testing.T, f func()) {
 	t.Helper()
 
@@ -94,8 +98,14 @@ func Test(t *testing.T, f func()) {
 			maxPreempt = n
 		}
 	}
+	var timeout time.Duration
+	if v := os.Getenv("WEAVE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			timeout = d
+		}
+	}
 
-	res := weave.ExploreBounded(f, budget, maxPreempt)
+	res := weave.ExploreBounded(f, budget, maxPreempt, timeout)
 	switch {
 	case res.Failed, res.Deadlock:
 		t.Errorf("weave: found failing interleaving after %d schedule(s):\n%s%s%s\n"+
@@ -160,7 +170,14 @@ func funcName(fn string) string {
 
 func formatTrace(steps []weave.Step) string {
 	var b strings.Builder
+	n := 0
 	for i, s := range steps {
+		// Drop a bare "run" scheduling step when it is immediately followed by a
+		// real operation from the same goroutine: the "g1 run / g1 read" pair is
+		// redundant, the operation line already shows g1 was scheduled.
+		if s.Op == "run" && i+1 < len(steps) && steps[i+1].Wid == s.Wid {
+			continue
+		}
 		loc := ""
 		switch {
 		case s.File != "":
@@ -177,7 +194,8 @@ func formatTrace(steps []weave.Step) string {
 				val = fmt.Sprintf(" (was %d)", s.Val) // value being overwritten
 			}
 		}
-		fmt.Fprintf(&b, "  %2d: g%d %s%s%s\n", i+1, s.Wid, s.Op, val, loc)
+		n++
+		fmt.Fprintf(&b, "  %2d: g%d %s%s%s\n", n, s.Wid, s.Op, val, loc)
 	}
 	return b.String()
 }

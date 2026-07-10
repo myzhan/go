@@ -213,7 +213,7 @@ func TestPreemptionBound(t *testing.T) {
 		}
 	}
 
-	b0 := ExploreBounded(model, DefaultMaxSchedules, 0)
+	b0 := ExploreBounded(model, DefaultMaxSchedules, 0, 0)
 	if b0.Failed || b0.Deadlock {
 		t.Fatalf("with 0 preemptions the lost update is unreachable; got %+v", b0)
 	}
@@ -221,7 +221,7 @@ func TestPreemptionBound(t *testing.T) {
 		t.Fatalf("a preemption bound should not mark the result truncated; got %+v", b0)
 	}
 
-	b2 := ExploreBounded(model, DefaultMaxSchedules, 2)
+	b2 := ExploreBounded(model, DefaultMaxSchedules, 2, 0)
 	if !b2.Failed {
 		t.Fatalf("with preemptions allowed, expected to find the lost update; got %+v", b2)
 	}

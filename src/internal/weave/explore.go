@@ -4,7 +4,10 @@
 
 package weave
 
-import "runtime"
+import (
+	"runtime"
+	"time"
+)
 
 // Operation codes, kept in sync with runtime weaveOp.
 const (
@@ -147,7 +150,7 @@ func isSyncOp(op uint8) bool {
 //
 // Explore bounds itself with DefaultMaxSchedules so a huge state space cannot
 // run forever; use ExploreBudget or ExploreBounded for explicit bounds.
-func Explore(f func()) Result { return ExploreBounded(f, DefaultMaxSchedules, -1) }
+func Explore(f func()) Result { return ExploreBounded(f, DefaultMaxSchedules, -1, 0) }
 
 // DefaultMaxSchedules is the fallback ceiling on how many schedules Explore will
 // run before giving up and marking the result Truncated. It is generous enough
@@ -159,7 +162,7 @@ const DefaultMaxSchedules = 1_000_000
 // exhausted, exploration stops and Result.Truncated is set, so an incomplete
 // run is never mistaken for a clean pass.
 func ExploreBudget(f func(), maxSchedules int) Result {
-	return ExploreBounded(f, maxSchedules, -1)
+	return ExploreBounded(f, maxSchedules, -1, 0)
 }
 
 // ExploreBounded is ExploreBudget with context bounding: when maxPreemptions >= 0
@@ -174,7 +177,11 @@ func ExploreBudget(f func(), maxSchedules int) Result {
 // prefix already exceeds the bound, and every prefix of an in-bound schedule is
 // itself in bound). It is not marked Truncated, since "no failure within c
 // preemptions" is a real guarantee, not an incomplete search.
-func ExploreBounded(f func(), maxSchedules, maxPreemptions int) Result {
+//
+// maxDuration > 0 additionally stops exploration once that much wall-clock time
+// has elapsed, marking the result Truncated (a different axis from the schedule
+// budget: some models have few schedules but each is slow).
+func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time.Duration) Result {
 	e := newExplorer(f)
 
 	type frame struct {
@@ -183,6 +190,7 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int) Result {
 	}
 	var stack []*frame
 	var plan []int32
+	start := time.Now()
 
 	for {
 		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
@@ -216,6 +224,11 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int) Result {
 		if maxSchedules > 0 && e.res.Runs >= maxSchedules {
 			e.res.Truncated = true
 			e.res.TruncatedReason = "schedule budget reached"
+			return e.res
+		}
+		if maxDuration > 0 && time.Since(start) >= maxDuration {
+			e.res.Truncated = true
+			e.res.TruncatedReason = "time budget reached"
 			return e.res
 		}
 
