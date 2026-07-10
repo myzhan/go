@@ -190,6 +190,37 @@ func TestDPORSoundnessSuite(t *testing.T) {
 			Wait()
 			return fmt.Sprint(x, seen)
 		}, nil},
+		{"chan-handoff", func() string {
+			// The write to x happens-before the read via the channel, so the read
+			// always sees 1: a single terminal state, no race across the handoff.
+			x := 0
+			seen := -1
+			ch := make(chan bool)
+			go func() { x = 1; ch <- true }()
+			<-ch
+			seen = x
+			Wait()
+			return fmt.Sprint(x, seen)
+		}, nil},
+		{"waitgroup-race", func() string {
+			var wg sync.WaitGroup
+			x := 0
+			wg.Add(2)
+			go func() { x = 1; wg.Done() }()
+			go func() { x = 2; wg.Done() }()
+			wg.Wait()
+			return fmt.Sprint(x)
+		}, nil},
+		{"three-mutex-inc", func() string {
+			var mu sync.Mutex
+			x := 0
+			inc := func() { mu.Lock(); x = x + 1; mu.Unlock() }
+			go inc()
+			go inc()
+			go inc()
+			Wait()
+			return fmt.Sprint(x)
+		}, nil},
 		{"rwmutex", func() string {
 			var mu sync.RWMutex
 			x := 0
