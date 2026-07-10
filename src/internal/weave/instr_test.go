@@ -240,6 +240,22 @@ func TestDPORSoundnessSuite(t *testing.T) {
 			Wait()
 			return fmt.Sprint(x, seen)
 		}, nil},
+		{"select-two-ready", func() string {
+			// Both cases are ready; enumerating the select must reach both outcomes.
+			// (Exhaustive does not enumerate select cases, so check against a known
+			// set rather than exploreExhaustive.)
+			a := make(chan int, 1)
+			b := make(chan int, 1)
+			a <- 1
+			b <- 2
+			var got int
+			select {
+			case got = <-a:
+			case got = <-b:
+			}
+			Wait()
+			return fmt.Sprint(got)
+		}, []string{"1", "2"}},
 		{"chan-producer-consumer", func() string {
 			// Two producers race to send; the buffered channel is FIFO so the two
 			// receive values reflect the send order. x,y are each written before a

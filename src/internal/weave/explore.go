@@ -72,7 +72,7 @@ type Result struct {
 // Run executes f once in a controlled bubble (a single default schedule).
 // It panics if the run deadlocks.
 func Run(f func()) {
-	_, outcome, failure := runSchedule(f, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	_, _, outcome, failure := runSchedule(f, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if failure != nil {
 		panic(failure)
 	}
@@ -92,6 +92,9 @@ type explorer struct {
 	spawnPC      []uint64 // per-wid creation-site PC, indexed by wid (max 64 participants + slot 0)
 	traceVal     []uint64 // scalar value at each memory op
 	traceValSet  []int32  // 1 if traceVal[i] is meaningful
+	selTrace     []int32  // chosen case index per select event
+	selBranch    []int32  // number of ready cases per select event
+	selStepIdx   []int32  // scheduling-step index of each select event
 	res          Result
 	f            func() // the model; panics (main or spawned) are captured by the runtime wrapper
 }
@@ -106,6 +109,9 @@ func newExplorer(f func()) *explorer {
 		spawnPC:      make([]uint64, 65),
 		traceVal:     make([]uint64, traceCap),
 		traceValSet:  make([]int32, traceCap),
+		selTrace:     make([]int32, traceCap),
+		selBranch:    make([]int32, traceCap),
+		selStepIdx:   make([]int32, traceCap),
 		f:            f,
 	}
 }
@@ -248,31 +254,38 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 	type frame struct {
 		backtrack map[int32]bool
 		done      map[int32]bool
+		selWid    int32          // selecting participant if this step is a select event
+		selBranch int            // number of ready cases (>1 ⇒ enumerable)
+		selEvent  int            // this select's event index
+		selDone   map[int32]bool // select cases already explored at this step
 	}
 	var stack []*frame
-	var plan []int32
+	var plan, selPlan []int32
 	start := time.Now()
 
 	for {
-		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
+		steps, nsel, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
 		e.res.Runs++
 
 		wid := e.traceWid[:steps]
 		op := e.traceOp[:steps]
 		addr := e.traceAddr[:steps]
 		en := e.traceEnabled[:steps]
+		selTrace := e.selTrace[:nsel]
+		selBranch := e.selBranch[:nsel]
+		selStepIdx := e.selStepIdx[:nsel]
 
 		if failure != nil {
 			e.res.Failed = true
 			e.res.Value = failure
-			e.res.Seed = encodeSeed(wid)
+			e.res.Seed = encodeSeed(wid, selTrace)
 			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps], e.traceValSet[:steps], e.traceVal[:steps])
 			e.res.Goroutines = buildGoroutines(wid, e.spawnPC)
 			return e.res
 		}
 		if outcome == 1 {
 			e.res.Deadlock = true
-			e.res.Seed = encodeSeed(wid)
+			e.res.Seed = encodeSeed(wid, selTrace)
 			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps], e.traceValSet[:steps], e.traceVal[:steps])
 			e.res.Goroutines = buildGoroutines(wid, e.spawnPC)
 			return e.res
@@ -299,6 +312,22 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 		for i := 0; i < steps; i++ {
 			stack[i].backtrack[wid[i]] = true
 			stack[i].done[wid[i]] = true
+		}
+		// Mark select events at their steps so the search can enumerate the other
+		// ready cases (a second choice dimension; see the deepest-frame pick below).
+		for e2 := 0; e2 < nsel; e2++ {
+			d2 := int(selStepIdx[e2])
+			if d2 < 0 || d2 >= steps {
+				continue
+			}
+			fr := stack[d2]
+			fr.selWid = wid[d2]
+			fr.selBranch = int(selBranch[e2])
+			fr.selEvent = e2
+			if fr.selDone == nil {
+				fr.selDone = map[int32]bool{}
+			}
+			fr.selDone[selTrace[e2]] = true
 		}
 
 		// Context bounding: cum[i] counts the preemptions (non-forced context
@@ -366,8 +395,12 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 			}
 		}
 
-		// Pick the deepest frame with an unexplored backtrack entry.
+		// Pick the deepest frame with an unexplored alternative: either a different
+		// participant to run (wid backtrack) or, at a select event, a different
+		// ready case to fire (select-case backtrack). Case enumeration is exhaustive
+		// and composes with the wid-level DPOR.
 		d, pick := -1, int32(-1)
+		selD, selCase := -1, int32(-1)
 		for i := len(stack) - 1; i >= 0; i-- {
 			for w := range stack[i].backtrack {
 				if !stack[i].done[w] && (pick == -1 || w < pick) {
@@ -378,14 +411,46 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 				d = i
 				break
 			}
+			if stack[i].selBranch > 1 {
+				for c := int32(0); c < int32(stack[i].selBranch); c++ {
+					if !stack[i].selDone[c] {
+						selCase = c
+						break
+					}
+				}
+				if selCase != -1 {
+					selD = i
+					break
+				}
+			}
 		}
-		if d < 0 {
+		switch {
+		case d >= 0:
+			// wid backtrack: rerun with a different participant at step d. Force the
+			// select choices for events strictly before step d so the prefix repeats.
+			stack[d].done[pick] = true
+			plan = append(plan[:0], wid[:d]...)
+			plan = append(plan, pick)
+			cnt := 0
+			for cnt < len(selStepIdx) && int(selStepIdx[cnt]) < d {
+				cnt++
+			}
+			selPlan = append(selPlan[:0], selTrace[:cnt]...)
+			stack = stack[:d+1] // discard the now-stale subtree below d
+		case selD >= 0:
+			// select-case backtrack: rerun the same prefix but fire a different ready
+			// case at this select. Force the same participant at step selD and the
+			// recorded case choices up to this select, then the new case.
+			fr := stack[selD]
+			fr.selDone[selCase] = true
+			plan = append(plan[:0], wid[:selD]...)
+			plan = append(plan, fr.selWid)
+			selPlan = append(selPlan[:0], selTrace[:fr.selEvent]...)
+			selPlan = append(selPlan, selCase)
+			stack = stack[:selD+1]
+		default:
 			return e.res
 		}
-		stack[d].done[pick] = true
-		plan = append(plan[:0], wid[:d]...)
-		plan = append(plan, pick)
-		stack = stack[:d+1] // discard the now-stale subtree below d
 	}
 }
 
@@ -393,8 +458,8 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 // produced in Result.Seed), so a discovered failure can be reproduced.
 func Replay(seed string, f func()) Result {
 	e := newExplorer(f)
-	plan := decodeSeed(seed)
-	steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
+	plan, selPlan := decodeSeed(seed)
+	steps, _, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
 	e.res.Runs = 1
 	e.res.Seed = seed
 	e.res.Trace = buildTrace(e.traceWid[:steps], e.traceOp[:steps], e.traceAddr[:steps], e.tracePC[:steps], e.traceValSet[:steps], e.traceVal[:steps])
@@ -481,29 +546,51 @@ func opName(op uint8) string {
 	return "run"
 }
 
-func encodeSeed(wid []int32) string {
-	if len(wid) == 0 {
+// encodeSeed encodes the wid schedule and, after a '|', the select-case choices,
+// so Replay can reproduce a select-dependent failure. The select part is omitted
+// when there were no select events.
+func encodeSeed(wid, sel []int32) string {
+	s := encodeInts(wid)
+	if len(sel) > 0 {
+		s += "|" + encodeInts(sel)
+	}
+	return s
+}
+
+func encodeInts(xs []int32) string {
+	if len(xs) == 0 {
 		return ""
 	}
-	b := make([]byte, 0, len(wid)*3)
-	for i, w := range wid {
+	b := make([]byte, 0, len(xs)*3)
+	for i, x := range xs {
 		if i > 0 {
 			b = append(b, '.')
 		}
-		b = appendInt(b, int(w))
+		b = appendInt(b, int(x))
 	}
 	return string(b)
 }
 
-func decodeSeed(seed string) []int32 {
-	if seed == "" {
+func decodeSeed(seed string) (wid, sel []int32) {
+	widPart, selPart := seed, ""
+	for i := 0; i < len(seed); i++ {
+		if seed[i] == '|' {
+			widPart, selPart = seed[:i], seed[i+1:]
+			break
+		}
+	}
+	return decodeInts(widPart), decodeInts(selPart)
+}
+
+func decodeInts(s string) []int32 {
+	if s == "" {
 		return nil
 	}
 	var out []int32
 	n, has := 0, false
-	for i := 0; i <= len(seed); i++ {
-		if i < len(seed) && seed[i] >= '0' && seed[i] <= '9' {
-			n = n*10 + int(seed[i]-'0')
+	for i := 0; i <= len(s); i++ {
+		if i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			n = n*10 + int(s[i]-'0')
 			has = true
 		} else {
 			if has {
@@ -535,7 +622,7 @@ func exploreExhaustive(f func()) Result {
 	e := newExplorer(f)
 	var plan []int32
 	for {
-		steps, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
+		steps, _, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, nil, nil, nil, nil, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
 		e.res.Runs++
 		if failure != nil {
 			e.res.Failed = true

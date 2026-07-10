@@ -254,6 +254,13 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		}
 	}
 
+	if weaveControlled {
+		// Make the select a weave scheduling point before locking any channel, so
+		// other goroutines may run first (possibly changing which cases are ready).
+		// Parking here is safe because no channel lock is held yet.
+		weaveSchedPoint(weaveOpSelect, nil)
+	}
+
 	// lock all the channels involved in the select
 	sellock(scases, lockorder)
 
@@ -273,35 +280,87 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	var caseSuccess bool
 	var caseReleaseTime int64 = -1
 	var recvOK bool
-	for _, casei := range pollorder {
-		casi = int(casei)
-		cas = &scases[casi]
-		c = cas.c
+	if weaveControlled {
+		// Collect the ready cases without committing (non-destructive peek), then
+		// let the explorer choose which one fires so alternatives are enumerated.
+		// The channels are locked and no yield happens between peek and commit, so
+		// readiness is stable.
+		var ready []int
+		for _, casei := range pollorder {
+			i := int(casei)
+			cc := scases[i].c
+			var ok bool
+			if i >= nsends { // receive
+				ok = cc.sendq.first != nil || cc.qcount > 0 || cc.closed != 0
+			} else { // send
+				ok = cc.closed != 0 || cc.recvq.first != nil || cc.qcount < cc.dataqsiz
+			}
+			if ok {
+				ready = append(ready, i)
+			}
+		}
+		if len(ready) > 0 {
+			casi = ready[weaveSelectChoose(int32(len(ready)))]
+			cas = &scases[casi]
+			c = cas.c
+			if casi >= nsends {
+				sg = c.sendq.dequeue()
+				if sg != nil {
+					goto recv
+				}
+				if c.qcount > 0 {
+					goto bufrecv
+				}
+				if c.closed != 0 {
+					goto rclose
+				}
+			} else {
+				if raceenabled {
+					racereadpc(c.raceaddr(), casePC(casi), chansendpc)
+				}
+				if c.closed != 0 {
+					goto sclose
+				}
+				sg = c.recvq.dequeue()
+				if sg != nil {
+					goto send
+				}
+				if c.qcount < c.dataqsiz {
+					goto bufsend
+				}
+			}
+		}
+	} else {
+		for _, casei := range pollorder {
+			casi = int(casei)
+			cas = &scases[casi]
+			c = cas.c
 
-		if casi >= nsends {
-			sg = c.sendq.dequeue()
-			if sg != nil {
-				goto recv
-			}
-			if c.qcount > 0 {
-				goto bufrecv
-			}
-			if c.closed != 0 {
-				goto rclose
-			}
-		} else {
-			if raceenabled {
-				racereadpc(c.raceaddr(), casePC(casi), chansendpc)
-			}
-			if c.closed != 0 {
-				goto sclose
-			}
-			sg = c.recvq.dequeue()
-			if sg != nil {
-				goto send
-			}
-			if c.qcount < c.dataqsiz {
-				goto bufsend
+			if casi >= nsends {
+				sg = c.sendq.dequeue()
+				if sg != nil {
+					goto recv
+				}
+				if c.qcount > 0 {
+					goto bufrecv
+				}
+				if c.closed != 0 {
+					goto rclose
+				}
+			} else {
+				if raceenabled {
+					racereadpc(c.raceaddr(), casePC(casi), chansendpc)
+				}
+				if c.closed != 0 {
+					goto sclose
+				}
+				sg = c.recvq.dequeue()
+				if sg != nil {
+					goto send
+				}
+				if c.qcount < c.dataqsiz {
+					goto bufsend
+				}
 			}
 		}
 	}

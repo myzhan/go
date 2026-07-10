@@ -87,6 +87,17 @@ type weaveControl struct {
 	traceValSet  []int32  // 1 if traceVal[step] holds a meaningful value, else 0
 	step         int
 	overflow     bool // ran out of recording space or too many participants for DPOR
+
+	// Select-case exploration. A controlled select with several ready cases is a
+	// second choice dimension on top of "which participant runs": selPlan forces,
+	// at the k-th select event, which ready case fires (beyond len(selPlan) the
+	// first ready case is chosen). selTrace/selBranch record, per select event,
+	// the case chosen and how many were ready, so the driver can enumerate them.
+	selPlan    []int32
+	selTrace   []int32
+	selBranch  []int32
+	selStepIdx []int32 // scheduling-step index of each select event
+	selStep    int
 }
 
 // weaveRand returns a deterministic pseudo-random value (splitmix64) for a
@@ -104,6 +115,11 @@ func weaveRand(b *synctestBubble) uint64 {
 
 // weaveActive reports whether the current goroutine is a participant in a
 // controlled bubble.
+//
+// The weaveGloballyActive short-circuit keeps the cost on hot paths that call
+// this in every program (chan.go, select.go) to a single global load when no
+// weave bubble exists anywhere — no getg, no per-goroutine field access — so
+// non-weave programs pay essentially nothing.
 //
 //go:nosplit
 func weaveActive() bool {
@@ -565,7 +581,7 @@ func weaveRunBubble(f func(), ctl *weaveControl) {
 // it calls once per schedule.
 //
 //go:linkname weaveRunSchedule internal/weave.runSchedule
-func weaveRunSchedule(f func(), plan, traceWid, traceOp, traceValSet []int32, traceAddr []int64, traceEnabled, tracePC, spawnPC, traceVal []uint64) (steps int, outcome int, failure any) {
+func weaveRunSchedule(f func(), plan, traceWid, traceOp, traceValSet, selPlan, selTrace, selBranch, selStepIdx []int32, traceAddr []int64, traceEnabled, tracePC, spawnPC, traceVal []uint64) (steps, nsel, outcome int, failure any) {
 	ctl := new(weaveControl)
 	ctl.plan = plan
 	ctl.traceWid = traceWid
@@ -576,6 +592,10 @@ func weaveRunSchedule(f func(), plan, traceWid, traceOp, traceValSet []int32, tr
 	ctl.spawnPC = spawnPC
 	ctl.traceVal = traceVal
 	ctl.traceValSet = traceValSet
+	ctl.selPlan = selPlan
+	ctl.selTrace = selTrace
+	ctl.selBranch = selBranch
+	ctl.selStepIdx = selStepIdx
 	weaveRunBubble(f, ctl)
 	failure = ctl.panicValue
 	switch {
@@ -584,7 +604,38 @@ func weaveRunSchedule(f func(), plan, traceWid, traceOp, traceValSet []int32, tr
 	case ctl.overflow:
 		outcome = 2
 	}
-	return ctl.step, outcome, failure
+	return ctl.step, ctl.selStep, outcome, failure
+}
+
+// weaveSelectChoose picks which of the nready ready cases of a controlled select
+// fires, recording the choice as a select event so the driver can enumerate the
+// alternatives. It does not hand off the run token: the choice is internal to the
+// running participant (made while it holds the token, so the select commits
+// atomically). Returns the chosen index in [0, nready). Called from select.go.
+func weaveSelectChoose(nready int32) int32 {
+	gp := getg()
+	b := gp.bubble
+	if b == nil || !b.controlled {
+		return 0
+	}
+	ctl := b.weaveCtl
+	choice := int32(0)
+	if ctl.selStep < len(ctl.selPlan) {
+		if c := ctl.selPlan[ctl.selStep]; c >= 0 && c < nready {
+			choice = c
+		}
+	}
+	if ctl.selTrace != nil {
+		if ctl.selStep < len(ctl.selTrace) {
+			ctl.selTrace[ctl.selStep] = choice
+			ctl.selBranch[ctl.selStep] = nready
+			ctl.selStepIdx[ctl.selStep] = int32(ctl.step - 1)
+		} else {
+			ctl.overflow = true
+		}
+	}
+	ctl.selStep++
+	return choice
 }
 
 // weaveYield is an explicit scheduling point: it offers to hand the run token to

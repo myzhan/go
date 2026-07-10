@@ -246,6 +246,36 @@ func TestSyncPrimitivesExplorable(t *testing.T) {
 	t.Logf("sync primitives explorable: wg=%d once=%d cond=%d schedules", wg.Runs, once.Runs, cond.Runs)
 }
 
+// Select-case enumeration: with both cases of a select ready, the explorer must
+// try each one. The model panics only when the second case fires, so a working
+// enumeration finds the failure, and the seed (which encodes the select choice)
+// reproduces it. Channel ops are recorded without -weave, so this needs no flag.
+func TestSelectEnumeration(t *testing.T) {
+	model := func() {
+		a := make(chan int, 1)
+		b := make(chan int, 1)
+		a <- 1
+		b <- 2
+		var got int
+		select {
+		case got = <-a:
+		case got = <-b:
+		}
+		if got == 2 {
+			panic("selected b")
+		}
+	}
+	res := Explore(model)
+	if !res.Failed {
+		t.Fatalf("expected enumeration to reach the b case (panic); got %+v", res)
+	}
+	rep := Replay(res.Seed, model)
+	if !rep.Failed {
+		t.Fatalf("replay of seed %q did not reproduce the select-dependent failure", res.Seed)
+	}
+	t.Logf("select enumeration reached the b case; seed %q reproduces", res.Seed)
+}
+
 func sameSchedule(a, b []Step) bool {
 	if len(a) != len(b) {
 		return false
