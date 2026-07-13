@@ -6,9 +6,11 @@ package weave_test
 
 import (
 	"internal/weave"
+	"runtime"
 	"slices"
 	"sync"
 	"testing"
+	"time"
 )
 
 // The controller serializes participants: only one runs at a time, so appending
@@ -136,6 +138,82 @@ func TestExploreIndependent(t *testing.T) {
 		t.Fatalf("unexpected failure: %+v", res)
 	}
 	t.Logf("independent ops: DPOR explored %d schedule(s)", res.Runs)
+}
+
+// TestGCPreemptNoSpuriousDeadlock guards the park_m block/wake fix: a
+// participant must be marked weaveBlocked *before* its park becomes observable
+// to a waker, so a concurrent out-of-bubble GC that preempts and resumes a
+// blocking/waking participant can never make it OS-runnable behind the
+// controller's back (which used to surface as a spurious deadlock). We hammer
+// runtime.GC() from outside the bubble while repeatedly exploring a model that
+// exercises the real mutex and channel block/wake paths. The result must always
+// be clean, and because DPOR is deterministic the schedule count must be
+// identical every iteration — a leaked block/wake race shows up as either a
+// spurious deadlock or a varying schedule count.
+func TestGCPreemptNoSpuriousDeadlock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("GC-preempt stress; skipped in -short")
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					runtime.GC()
+				}
+			}
+		}()
+	}
+	time.Sleep(2 * time.Millisecond) // let the GC hammer threads spin up
+
+	model := func() {
+		var mu sync.Mutex
+		x := 0
+		done := make(chan int, 2)
+		inc := func() {
+			mu.Lock()
+			x++
+			mu.Unlock()
+			done <- 1
+		}
+		go inc()
+		go inc()
+		<-done
+		<-done
+		if x != 2 {
+			panic("lost update")
+		}
+	}
+
+	first := weave.Explore(model)
+	if first.Deadlock || first.Failed {
+		close(stop)
+		wg.Wait()
+		t.Fatalf("iter 0: spurious failure under GC pressure: %+v", first)
+	}
+	for iter := 1; iter < 20; iter++ {
+		res := weave.Explore(model)
+		if res.Deadlock || res.Failed {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("iter %d: spurious failure under GC pressure: %+v", iter, res)
+		}
+		if res.Runs != first.Runs {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("iter %d: nondeterministic schedule count %d (want %d) — block/wake race leaked",
+				iter, res.Runs, first.Runs)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	t.Logf("no spurious deadlock across 20 explorations under GC hammer; %d schedules each", first.Runs)
 }
 
 // The AB/BA mutex deadlock is exercised in internal_test.go via exhaustive

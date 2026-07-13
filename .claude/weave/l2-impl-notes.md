@@ -103,7 +103,10 @@ testing/weave → internal/weave:驱动跨 run 循环、失败重放
 
 ### B. goroutine 离开受控世界(I/O / syscall / 真实时间)——会丢确定性
 
-1. **真实时间**:已由 bubble 解决——假时钟,仅全组 durably blocked 时推进(synctest 现成)。非特例。
+1. **真实时间**:bubble 有假时钟,但**受控 bubble 内假时钟推进被禁用**(`synctestRun1` 走
+   `weaveRootWait`,跳过 synctest 的时钟推进循环)——故 `time.Sleep`/`time.After`/`NewTimer`/
+   `context.WithTimeout` 在 `weave.Test` 内会永久 park、**误报死锁**。用内存接缝替代(channel/select/
+   `net.Pipe`/`context.WithCancel`)。见 [[decisions]] D11、`weaveproto/asyncio_test.go`。
 2. **真实网络/文件 I/O**:策略禁止,须用内存 fake(`net.Pipe`/假 clock),继承 synctest 规矩。
    **主动检测**:controlled bubble 内 `entersyscall`(`proc.go` `entersyscall`/`exitsyscall`)——
    - 良性短 syscall(alloc/栈增长/GC)容忍,`exitsyscall` 作为恢复进控制器的边界;
@@ -123,7 +126,7 @@ testing/weave → internal/weave:驱动跨 run 循环、失败重放
 | `select` 多就绪 case | 走控制器决策(枚举+可重放),挂 selectgo `allSynctest` 分支 | task #8 |
 | `runtime.Gosched`/手动让出 | 天然是调度点 | 自动 |
 | map 迭代序 / `math/rand`(v2) / `hash/maphash` / 内部 `cheaprand` | controlled bubble 内按 run 确定化播种 cheaprand,一并变确定可复现 | task #9 |
-| 真实时间 / timer | 假时钟(bubble 现成) | 已解决 |
+| 真实时间 / timer | 假时钟(bubble 现成);**受控 bubble 内推进被禁用** → `time.Sleep`/timer 误报死锁,须用内存接缝(见 D11) | ⚠️ 受控内禁用 |
 | I/O / syscall | fake + entersyscall 检测 | 见边界情况 |
 | atomic / 内存弱序重排 | 弱内存建模 | M5(未来) |
 
@@ -140,4 +143,6 @@ testing/weave → internal/weave:驱动跨 run 循环、失败重放
 - 快速路径钩子要极轻:非 controlled bubble 时必须是一次 `getg().bubble` 判空即返回(nosplit 友好)。
 - 控制器自身用的锁/channel 不能又触发 weaveSchedPoint(递归);控制器代码需标记为"不受控"。
 - GC/finalizer/系统 goroutine 不入 bubble(`proc.go:5397`),天然不受影响。
-- timer/假时钟与 controlled 调度的交互:先禁用 controlled bubble 内的假时钟推进,后续再融合。
+- timer/假时钟与 controlled 调度的交互:**已禁用**受控 bubble 内的假时钟推进(`weaveRootWait` 跳过
+  推进循环),`time.Sleep`/定时器会误报死锁,用户须用内存接缝(channel/`net.Pipe`/`context.WithCancel`)。
+  已实证并文档化(见 [[decisions]] D11、`weaveproto/asyncio_test.go`);后续再考虑融合。

@@ -140,6 +140,19 @@ func TestCounter(t *testing.T) {
 - **1c 死锁泄漏清理**:未实现。Go 无法干净地杀死 park 在真实同步点的用户 goroutine;且这与
   synctest 自身一致(死锁时同样保留 blocked goroutine)。仅 Explore 的最后一条失败调度会泄漏少量
   parked goroutine,进程退出即回收,影响可忽略。列为已知限制。
+- **1d block-wake 竞态残余修复** ✅(见 [[decisions]] D10)— 1a 的 `weaveBlocked` 一族还有残余:`park_m`
+  里 `weaveBlocked` 原在 `waitunlockf` **之后**才置位,而 `waitunlockf` 一旦释放 chan/mutex 锁,g 即
+  对另一 M 上的 waker 可见;竞态 waker 在 `ready()` 读到 `weaveBlocked=false` → 走普通路径把参与者变
+  OS-runnable、绕过控制器 → 两个并发运行者 → 误报死锁。修复:把 `weaveBlocked=true` 移到 `waitunlockf`
+  **之前**(park 对 waker 可见之前),中止分支回退。仅改 `proc.go`,对非受控 bubble 零影响。实证:
+  `TestSyncPrimitivesExplorable` 由 ~1/20 flaky → 60/60;GC 压力死锁 seed 重放 0/40(运行时时序竞态
+  非模型死锁)。是 fdf04b0/GC-抢占家族的最后残余。
+- **异步 IO / 超时用例 + `time.Sleep` 边界** ✅(见 [[decisions]] D11)— **受控 bubble 内禁用假时钟推进**
+  (`weaveRootWait` 跳过 synctest 时钟推进循环),故 `time.Sleep`/`time.After`/`NewTimer`/
+  `context.WithTimeout` 会永久 park、**误报死锁**(已实证)。用户须用**内存接缝**建模时间/IO:channel、
+  select、`net.Pipe`、`context.WithCancel`(channel/mutex 实现,可用)。`weaveproto/asyncio_test.go`
+  演示了异步请求/响应、`net.Pipe` 交换、context 取消传播,以及**超时 goroutine 泄漏 bug + 缓冲修复**
+  配对(weave 抓到无缓冲 result chan 在超时分支下的泄漏并给复现种子)。
 
 详细进度见 [roadmap.md](roadmap.md);L2 落地细节见 [l2-impl-notes.md](l2-impl-notes.md)。
 

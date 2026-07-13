@@ -246,6 +246,42 @@ func TestSyncPrimitivesExplorable(t *testing.T) {
 	t.Logf("sync primitives explorable: wg=%d once=%d cond=%d schedules", wg.Runs, once.Runs, cond.Runs)
 }
 
+// Cond.Broadcast wakes every waiter, not just one. Two goroutines Wait on the
+// cond; the main participant sets the predicate and Broadcasts. Every
+// interleaving must wake both waiters (woke == 2) with no lost wakeup and no
+// spurious deadlock. (Cond ops are recorded without -weave, so this needs no
+// build flag; joining via weave.Wait keeps the state space small.)
+func TestCondBroadcast(t *testing.T) {
+	res := Explore(func() {
+		var mu sync.Mutex
+		c := sync.NewCond(&mu)
+		ready := false
+		woke := 0
+		waiter := func() {
+			mu.Lock()
+			for !ready {
+				c.Wait()
+			}
+			woke++
+			mu.Unlock()
+		}
+		go waiter()
+		go waiter()
+		mu.Lock()
+		ready = true
+		c.Broadcast()
+		mu.Unlock()
+		Wait()
+		if woke != 2 {
+			panic("Broadcast did not wake both waiters")
+		}
+	})
+	if res.Failed || res.Deadlock {
+		t.Fatalf("Cond.Broadcast model should be clean; got %+v", res)
+	}
+	t.Logf("Cond.Broadcast wakes all waiters cleanly across %d schedule(s)", res.Runs)
+}
+
 // Select-case enumeration: with both cases of a select ready, the explorer must
 // try each one. The model panics only when the second case fires, so a working
 // enumeration finds the failure, and the seed (which encodes the select choice)

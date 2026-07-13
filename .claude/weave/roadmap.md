@@ -29,6 +29,9 @@ select 确定化 · RNG(map/maphash)确定化 · spawned goroutine panic 捕获 
 6. **抢占看门狗**(死循环兜底)。
 7. **UX**:状态空间估计、并行探索、context/http 示例。
 8. **死锁泄漏清理**:未做(已知限制,与 synctest 一致,可接受)。
+9. **受控 bubble 内假时钟推进**(已知限制):`time.Sleep`/`time.After`/`NewTimer`/
+   `context.WithTimeout` 在 `weave.Test` 内会误报死锁(受控 bubble 跳过假时钟推进循环)。
+   已实证并文档化(D11),用户用内存接缝替代;后续可考虑在控制器里集成时钟推进。
 
 ---
 
@@ -157,7 +160,9 @@ select 确定化 · RNG(map/maphash)确定化 · spawned goroutine panic 捕获 
   - [ ] 并行探索(多 worker 跑不同子树)
 - 文档 + 示例:
   - [x] 介绍性博客(`blog.md`)
-  - [ ] context/http 等可运行 example(参考 testing/synctest 的 example)
+  - [x] 异步 IO / 超时 / 取消示例(`weaveproto/asyncio_test.go`:异步请求响应、`net.Pipe`、
+        `context.WithCancel`、超时 goroutine 泄漏 bug + 修复;并文档化 `time.Sleep` 不可用的边界)
+  - [ ] context/http 等基于假时钟的 example(依赖受控 bubble 假时钟推进,见上限制 9)
 - [x] 与 `go test` 集成:`-weave` flag + 失败输出/`WEAVE_REPLAY` 复现格式
 
 ---

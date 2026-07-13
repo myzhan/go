@@ -4315,11 +4315,30 @@ func park_m(gp *g) {
 
 	dropg()
 
+	// In a controlled bubble, a participant blocking on a real synchronization
+	// operation (anything other than an explicit weave yield) hands the run
+	// token to the next runnable participant (weaveOnBlock, below). Mark it
+	// weaveBlocked *before* waitunlockf makes it reachable by a waker: once the
+	// unlock function runs (releasing e.g. a channel or mutex), another M can
+	// dequeue and ready() this g concurrently. ready() uses weaveBlocked to
+	// decide whether to capture the g into the controller's runnable set rather
+	// than make it OS-runnable; if the flag were set only after waitunlockf, a
+	// racing wake would miss it, make the g OS-runnable behind the controller's
+	// back, and break the single-token invariant (spurious deadlock).
+	weaveWillBlock := bubble != nil && bubble.controlled && gp != bubble.root && gp.waitreason != waitReasonWeaveScheduled
+	if weaveWillBlock {
+		gp.weaveBlocked = true
+	}
+
 	if fn := mp.waitunlockf; fn != nil {
 		ok := fn(gp, mp.waitlock)
 		mp.waitunlockf = nil
 		mp.waitlock = nil
 		if !ok {
+			if weaveWillBlock {
+				// Park aborted; the g keeps running, so it is not blocked.
+				gp.weaveBlocked = false
+			}
 			trace := traceAcquire()
 			casgstatus(gp, _Gwaiting, _Grunnable)
 			if bubble != nil {
@@ -4337,11 +4356,9 @@ func park_m(gp *g) {
 		bubble.decActive()
 	}
 
-	// In a controlled bubble, a participant that blocked on a real
-	// synchronization operation (anything other than an explicit weave yield)
-	// hands the run token to the next runnable participant.
-	if bubble != nil && bubble.controlled && gp != bubble.root && gp.waitreason != waitReasonWeaveScheduled {
-		gp.weaveBlocked = true
+	// Hand the run token to the next runnable participant now that this one has
+	// blocked (weaveBlocked was set above, before the park became observable).
+	if weaveWillBlock {
 		weaveOnBlock(bubble)
 	}
 

@@ -137,6 +137,49 @@ sched/synctest/goroutine)零回归。
 
 ---
 
+## D10 — 受控 bubble 内在 `waitunlockf` 之前置 `weaveBlocked`(关闭 block-wake 竞态)
+
+**背景**:D-1a(见 README「可信度加固」)已让 `ready` 只截获控制器真正阻塞过的参与者
+(`g.weaveBlocked`,在 `park_m` 阻塞路径设置),并加 `waitreason != waitReasonPreempted`
+防 GC 抢占恢复丢令牌。但这一族还有**残余竞态**:`park_m` 里 `weaveBlocked` 原来是在
+`waitunlockf` **之后**才置位。
+
+**根因**:`park_m` 调 `waitunlockf`(如 chanparkcommit 释放 `c.lock`)会让该 g **对另一个 M 上的
+waker 可见** —— waker 可并发 dequeue 并 `ready()` 它。若此刻 `weaveBlocked` 尚未置位,竞态 waker
+在 `ready()` 读到 `weaveBlocked=false` → 走**普通 ready 路径**把参与者变 OS-runnable,**绕过控制器**
+→ 出现两个并发运行者 → `weaveTake` 取到空集 → **误报死锁**。这正是受控 bubble 抛弃 synctest
+`incActive/decActive` 空闲计数(那套本就是为处理「park 与 wake 竞态」而设)后暴露的架构性缺口。
+
+**决策**:在 `park_m` 中把 `weaveBlocked=true` **移到 `waitunlockf` 之前**(park 对 waker 可见之前);
+park 中止分支(`waitunlockf` 返回 false)回退 `weaveBlocked=false`。仅改 `src/runtime/proc.go`。
+
+**影响**:对非受控 bubble(`bubble==nil || !controlled`)`weaveWillBlock=false`,三处均跳过 →
+与改动前逐字节等价,普通程序/普通 synctest **零影响**。**实证**:`TestSyncPrimitivesExplorable`
+由 ~1/20 flaky → 60/60 稳定;GC 压力下抓到的死锁 seed 重放 40 次 **0/40 复现** → 证明是运行时
+时序竞态而非模型死锁。只在 GC 抢占压力下触发,是 fdf04b0/`weaveBlocked` 家族的最后残余。
+
+---
+
+## D11 — 受控 bubble 内禁用假时钟推进:`time.Sleep`/定时器不可用,须用内存接缝
+
+**背景**:受控 bubble 由 run-token 调度器完全驱动 —— `synctestRun1` 在 `controlled` 分支直接走
+`weaveRootWait` 并 return,**跳过 synctest 的假时钟推进循环**(那段循环才会调 `timers.check()`
+并推进 `bubble.now`)。且 `incActive/decActive` 对受控 bubble 早退。
+
+**后果(已实证)**:在 `weave.Test` 内调 `time.Sleep(d)`(或 `time.After`/`NewTimer`/`Tick`/
+`context.WithTimeout`)会注册一个假定时器到 `bubble.timers`,但 `bubble.now` 永不推进 → 定时器
+永不触发 → 参与者永久 park → 全组阻塞 → weave **误报** `deadlock: all goroutines blocked`。
+
+**决策**:**暂不**在受控 bubble 内融合假时钟推进(与调度枚举的交互复杂,见 l2-impl-notes 已知坑),
+保持「先禁用」。这不是缺陷而是**明确边界**,与 loom/Coyote/synctest 同源:时间/IO 用**可被 weave
+探索的内存接缝**建模 —— channel、select、sync 原语、`net.Pipe`、`context.WithCancel`(channel/mutex
+实现,可用;`context.WithTimeout` 走定时器,不可用)。**实证**见 `weaveproto/asyncio_test.go`。
+
+**未来**:可在控制器里集成假时钟推进 —— 当所有参与者 durably blocked 且仅剩定时器可推进时,
+由控制器推进 `bubble.now` 并把到期定时器作为调度点纳入枚举。列为 roadmap 候选。
+
+---
+
 ## 待定 / 开放问题
 
 - L4 API 的 `t` 参数:目标形态 `func(t *testing.T)`,原型暂用无参 + `Assert`。M2 接入时统一。
