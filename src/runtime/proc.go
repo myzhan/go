@@ -1138,7 +1138,15 @@ func ready(gp *g, traceskip int, next bool) {
 	// preemption or GC assist) have weaveBlocked==false and proceed normally, so
 	// the still-running token holder continues. Controller grants use weaveGrant,
 	// which bypasses this path entirely.
-	if weaveControlledParticipant(gp) && gp.weaveBlocked {
+	//
+	// A GC stack scan can synchronously preempt the running token holder into
+	// _Gpreempted; suspendG then flips it to _Gwaiting with waitReasonPreempted
+	// and resumeG reschedules it through ready. That is not a sync wakeup: the
+	// participant still logically holds the run token and must resume in place,
+	// never be captured into the runnable set (doing so loses the token and
+	// hangs the run). waitReasonPreempted is the reliable fingerprint of such a
+	// GC resume, so exclude it here regardless of the racy weaveBlocked flag.
+	if weaveControlledParticipant(gp) && gp.weaveBlocked && gp.waitreason != waitReasonPreempted {
 		gp.weaveBlocked = false
 		weaveEnqueue(gp)
 		return
