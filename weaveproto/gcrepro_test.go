@@ -30,6 +30,13 @@ var spinSink uint64
 // _Grunning and drive it through _Gpreempted -> ready. If weave loses the token
 // on that resume, the run hangs.
 func TestGCPreemptHolder(t *testing.T) {
+	if builtWithWeave {
+		t.Skip("prohibitively slow under -weave memory instrumentation; this stress test exercises the run token under GC preemption, not data races, so run it without -weave")
+	}
+	iters := 200
+	if testing.Short() {
+		iters = 20
+	}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
@@ -49,7 +56,7 @@ func TestGCPreemptHolder(t *testing.T) {
 	// Give the GC hammer threads a head start.
 	time.Sleep(2 * time.Millisecond)
 
-	for iter := 0; iter < 200; iter++ {
+	for iter := 0; iter < iters; iter++ {
 		weave.Test(t, func() {
 			var mu sync.Mutex
 			x := 0
