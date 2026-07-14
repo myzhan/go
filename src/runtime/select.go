@@ -291,9 +291,13 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 			cc := scases[i].c
 			var ok bool
 			if i >= nsends { // receive
-				ok = cc.sendq.first != nil || cc.qcount > 0 || cc.closed != 0
+				// weaveHasClaimable (not a bare first != nil) so a stale, already-woken
+				// select sudog still lingering on the queue is not mistaken for a ready
+				// sender: dequeue would skip it, and treating it as ready makes the
+				// commit fail and can spuriously report a deadlock.
+				ok = cc.sendq.weaveHasClaimable() || cc.qcount > 0 || cc.closed != 0
 			} else { // send
-				ok = cc.closed != 0 || cc.recvq.first != nil || cc.qcount < cc.dataqsiz
+				ok = cc.closed != 0 || cc.recvq.weaveHasClaimable() || cc.qcount < cc.dataqsiz
 			}
 			if ok {
 				ready = append(ready, i)

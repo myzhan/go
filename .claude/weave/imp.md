@@ -66,13 +66,15 @@
   `ChanSend/Recv/Close`;非阻塞(block==false)用 `ChanSendNB/RecvNB`,且**调度点移到非阻塞快速
   失败路径之前**(否则失败的非阻塞 op 直接返回、根本不 yield)。
 - select:受控 bubble 内 poll order **确定化**(跳过 `cheaprandn` 洗牌);`weaveSchedPoint(Select)`
-  在锁任何 channel 之前;就绪 case **非破坏性 peek** 后由 `weaveSelectChoose` 选,alternatives
-  经 selPlan/selTrace 枚举。
+  在锁任何 channel 之前;就绪 case **非破坏性 peek**(用 `waitq.weaveHasClaimable` 与 `dequeue` 同一
+  有效性判定,**排除已被别的 case 唤醒的 stale sudog**,否则会误报死锁)后由 `weaveSelectChoose`
+  选,alternatives 经 selPlan/selTrace 枚举。
 
 ### sync 原语 —— `src/sync/*` / `src/internal/sync/*`
-- `internal/sync.Mutex.Lock/Unlock`、`sync.RWMutex`、`WaitGroup.Wait/Add`、`Cond.Wait/Signal/
-  Broadcast`、`Once.Do` 入口经 linkname 调 `runtime.weaveSchedPoint`(op 对应),用
-  `weaveGloballyActive` 做**单次全局 load** 门控 → 非 weave 程序几乎零成本。
+- `internal/sync.Mutex.Lock/Unlock/TryLock`、`sync.RWMutex.Lock/RLock/Unlock/RUnlock/TryLock/
+  TryRLock`、`WaitGroup.Wait/Add`、`Cond.Wait/Signal/Broadcast`、`Once.Do` 入口经 linkname 调
+  `runtime.weaveSchedPoint`(op 对应;Try 系列复用 lock transition),用 `weaveGloballyActive` 做
+  **单次全局 load** 门控 → 非 weave 程序几乎零成本。
 
 ### 编译器 / cmd/go —— `cmd/compile` / `cmd/go`
 - `base.Flag.Weave`;`ir.Syms.Weaveread/Weavewrite/Weavewriteval/Weavereadrange/Weavewriterange`。
@@ -212,3 +214,45 @@ cd src && ../bin/go test -weave internal/weave/                # 含内存插桩
 cd src && ../bin/go test runtime sync internal/synctest testing/synctest   # 回归
 ```
 工具链按需重编改动的 std 包,纯 Go 编辑无需 `make.bash`。
+
+---
+
+## 9. 评审驱动的修复(2026-07)
+
+一轮针对 head 的代码评审(PR #1)报出并已修复的一组健全性/正确性/健壮性缺口,每条都配了回归测试:
+
+**健全性(漏状态/假死锁)**
+- **内存冲突按区间重叠 + 记录 width**:range 钩子曾丢 `size`、`conflict` 只比地址相等 → 整struct写
+  vs 字段读被判独立而漏状态。size 现贯穿 hook→trace→`runSchedule`,`conflict` 按 `[addr,addr+size)`
+  重叠判定。回归 `TestStructWholeWriteVsFieldRead`。
+- **channelHB 不产生假边**:成功的 NB recv / select-recv 消费值但 FIFO 不 pop,后续普通 recv 会
+  pop 到过期 send clock → 假 HB 剪掉真实反转。现 taint NB 触及的 channel、含 select 的 run 禁用
+  channel HB。回归 `TestChannelHBNoStaleEdge`。
+- **select 就绪 peek 排除 stale sudog**:`waitq.weaveHasClaimable` 与 `dequeue` 同一有效性判定,
+  不再把已被别的 case 唤醒的 sudog 当就绪 → 不再误报死锁。回归 `TestSelectStaleSudogNoFalseDeadlock`。
+
+**正确性/保证**
+- **抢占上界约束实际执行的 schedule**:bounded 模式默认后缀 sticky(`weaveControl.stickyDefault`),
+  非强制后缀零抢占,故不会执行/上报越界后缀产生的 failure。回归 `TestPreemptionBoundConstrainsExecuted`。
+- **溢出先判 outcome==2 再切片 + clamp**:65536+ 调度点不再 `slice out of range` panic,如实报
+  `Truncated`。回归 `TestTraceOverflowTruncates`。
+- **预算恰好覆盖全空间不误标 Truncated**:仅当确有下一条 schedule 时才判预算。回归
+  `TestBudgetExactCoverageNotTruncated`。
+- **TryLock 系列补调度点**:`Mutex.TryLock`、`RWMutex.TryLock/TryRLock` 现为调度点(复用 lock
+  transition),兑现"mutex 操作皆调度点"。回归 `TestTryLockExplored`。
+
+**健壮性/工程**
+- **容量耗尽优雅截断**:`weavePush` 超 `weaveMaxRunnable` 改为设 overflow + 返回 outcome 2(优先于
+  deadlock 判定),不再 `throw` 杀进程。回归 `TestTooManyGoroutinesTruncates`。
+- **读值在授予令牌时采样**:`weaveChoose` 对 read op 重新 `weaveLoadVal`,trace 显示参与者真正读到的
+  值(而非 park 前的旧值)。回归 `TestReadValueReflectsGrantTime`。
+- **`-weave` 不覆盖用户 `-gcflags`**:改用 `forcedGcflags`(附加、不 shadow 用户规则)。回归
+  `cmd/go` script `build_weave.txt`。
+- **replay 命令 shell-quote + 保留构建模式**:seed 单引号包裹(select seed 含 `|`)、`-run` 锚定、
+  仅在 `-weave` 构建下带 `-weave`。回归 `testing/weave.TestReplayCommandFormat`。
+- **wall-clock timeout 明确为 runs 之间的 soft limit**(单条卡死 schedule 需外部 `-timeout`;
+  抢占看门狗仍是已知缺口,见 §5.A.2)。
+
+**Go 仓库集成门禁**
+- `testing/weave` 登记进 `api/next/weave.txt` 与 `go/build/deps_test.go`;`cmd/api TestCheck` 与
+  `go/build.TestDependencies` 通过。

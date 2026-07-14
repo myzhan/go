@@ -37,5 +37,10 @@ func Wait()
 // participants (traceEnabled). It returns the number of scheduling points reached
 // and an outcome: 0 = finished, 1 = deadlock, 2 = out of space / too many procs.
 //
+// The final sticky argument selects a preemption-free default policy (continue
+// the previous participant while it is runnable) so a context-bounded search
+// never executes a schedule exceeding its preemption bound; only the bounded
+// exploration path sets it.
+//
 //go:linkname runSchedule
-func runSchedule(f func(), plan, traceWid, traceOp, traceValSet, selPlan, selTrace, selBranch, selStepIdx []int32, traceAddr []int64, traceEnabled, tracePC, spawnPC, traceVal []uint64) (steps, nsel, outcome int, failure any)
+func runSchedule(f func(), plan, traceWid, traceOp, traceValSet, selPlan, selTrace, selBranch, selStepIdx []int32, traceAddr, traceSize []int64, traceEnabled, tracePC, spawnPC, traceVal []uint64, sticky bool) (steps, nsel, outcome int, failure any)

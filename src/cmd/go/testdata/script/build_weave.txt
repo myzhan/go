@@ -1,0 +1,33 @@
+[short] skip
+[!compiler:gc] skip '-weave instruments via the gc compiler'
+
+# -weave instruments memory accesses in the built packages, but must not shadow
+# a user-supplied -gcflags: the command-line package must be compiled with both
+# -weave (forced) and the user's -N.
+go build -n -weave -gcflags=-N .
+stderr 'compile.* -weave .*main\.go'
+stderr 'compile.* -N .*main\.go'
+
+# -weave defines the "weave" build tag.
+go list -weave -f '{{.GoFiles}}' .
+stdout 'weave_only.go'
+
+-- go.mod --
+module m
+
+go 1.25
+
+-- main.go --
+package main
+
+func main() {
+	x := 0
+	_ = x
+}
+
+-- weave_only.go --
+//go:build weave
+
+package main
+
+var underWeave = true

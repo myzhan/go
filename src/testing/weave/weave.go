@@ -109,8 +109,8 @@ func Test(t *testing.T, f func()) {
 	switch {
 	case res.Failed, res.Deadlock:
 		t.Errorf("weave: found failing interleaving after %d schedule(s):\n%s%s%s\n"+
-			"reproduce with: WEAVE_REPLAY=%s go test -run %s",
-			res.Runs, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res), res.Seed, t.Name())
+			"reproduce with: %s",
+			res.Runs, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res), replayCommand(res.Seed, t.Name()))
 	case res.Truncated:
 		// Exploration did not exhaust the state space, so "no failure found" is
 		// inconclusive; fail loudly rather than give an unreliable green light.
@@ -122,6 +122,27 @@ func Test(t *testing.T, f func()) {
 	default:
 		t.Logf("weave: ok, explored %d schedule(s)", res.Runs)
 	}
+}
+
+// replayCommand formats the shell command that reproduces a discovered failure.
+// The seed is single-quoted because a select seed contains '|', which the shell
+// would otherwise treat as a pipe. The build mode is preserved: a failure found
+// under -weave (where memory accesses are extra scheduling points) is only
+// reproducible under -weave, so the flag is included exactly when this binary was
+// built with it — running the plain command would explore a different schedule
+// space and could spuriously pass.
+func replayCommand(seed, name string) string {
+	flag := ""
+	if builtWithWeave {
+		flag = " -weave"
+	}
+	return fmt.Sprintf("WEAVE_REPLAY=%s go test%s -run %s", shellSingleQuote(seed), flag, shellSingleQuote("^"+name+"$"))
+}
+
+// shellSingleQuote wraps s in single quotes, escaping embedded single quotes, so
+// it is a single safe shell word regardless of characters like '|' or '$'.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func outcomeMsg(res weave.Result) string {

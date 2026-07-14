@@ -11,7 +11,6 @@ import (
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/fsys"
-	"cmd/go/internal/load"
 	"cmd/go/internal/modload"
 	"cmd/internal/quoted"
 	"fmt"
@@ -147,9 +146,13 @@ func weaveInit() {
 		base.SetExitStatus(2)
 		base.Exit()
 	}
-	if err := load.BuildGcflags.Set("-weave"); err != nil {
-		base.Fatalf("go: %v", err)
-	}
+	// Instrument memory accesses in the packages being built (the compiler skips
+	// NoInstrument packages such as the runtime). Use forcedGcflags rather than
+	// mutating the user's -gcflags: forcedGcflags are applied *in addition to* the
+	// per-package -gcflags, so a bare "-weave" rule can no longer shadow a user
+	// rule like -gcflags=-N (which the last-match PerPackageFlag semantics would
+	// otherwise drop).
+	forcedGcflags = append(forcedGcflags, "-weave")
 	// Define the "weave" build tag (like -race defines "race"), so tests can
 	// gate weave-only code with //go:build weave.
 	cfg.BuildContext.BuildTags = append(cfg.BuildContext.BuildTags, "weave")

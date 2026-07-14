@@ -930,6 +930,22 @@ func (q *waitq) dequeue() *sudog {
 	}
 }
 
+// weaveHasClaimable reports whether the queue holds a waiter that dequeue would
+// actually return: any non-select sudog, or a select sudog whose goroutine has
+// not already been claimed by another of its cases. It does not modify the queue
+// or claim anyone, so weave's select-readiness peek matches what the subsequent
+// commit (dequeue) will find, avoiding treating a stale, already-woken select
+// sudog as a ready partner (which would make the select commit fail and spuriously
+// report a deadlock).
+func (q *waitq) weaveHasClaimable() bool {
+	for sgp := q.first; sgp != nil; sgp = sgp.next {
+		if !sgp.isSelect || sgp.g.selectDone.Load() == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *hchan) raceaddr() unsafe.Pointer {
 	// Treat read-like and write-like operations on the channel to
 	// happen at this address. Avoid using the address of qcount

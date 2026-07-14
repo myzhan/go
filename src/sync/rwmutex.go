@@ -86,6 +86,7 @@ func (rw *RWMutex) RLock() {
 // and use of TryRLock is often a sign of a deeper problem
 // in a particular use of mutexes.
 func (rw *RWMutex) TryRLock() bool {
+	weaveSchedPoint(weaveOpLock, unsafe.Pointer(rw))
 	if race.Enabled {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()
@@ -170,6 +171,7 @@ func (rw *RWMutex) Lock() {
 // and use of TryLock is often a sign of a deeper problem
 // in a particular use of mutexes.
 func (rw *RWMutex) TryLock() bool {
+	weaveSchedPoint(weaveOpLock, unsafe.Pointer(rw))
 	if race.Enabled {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()

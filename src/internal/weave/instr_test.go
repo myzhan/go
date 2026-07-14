@@ -106,6 +106,47 @@ func TestPreemptionBound(t *testing.T) {
 		b0.Runs, b1.Runs, full.Runs)
 }
 
+// The preemption bound must constrain the schedule actually executed, not just
+// future backtracks. Here g1 blocks then wakes, and the lowest-wid default would
+// preempt the running g2 to run the just-woken g1 between g2's read and write —
+// producing a lost update that requires a preemption. With the bound correctly
+// enforced on the executed schedule (preemption-free default suffix), c=0 must be
+// clean; the bug only appears once a preemption is allowed. Regression for the
+// bound only filtering backtracks. Requires -weave so the reads/writes of x are
+// scheduling points.
+func TestPreemptionBoundConstrainsExecuted(t *testing.T) {
+	model := func() {
+		x := 0
+		ch := make(chan int)
+		go func() { // g1 (lower wid): blocks, then read-modify-write
+			<-ch
+			t := x
+			x = t + 1
+		}()
+		go func() { // g2 (higher wid): read, wake g1, then write
+			t := x
+			ch <- 1
+			x = t + 1
+		}()
+		Wait()
+		if x != 2 {
+			panic("lost update")
+		}
+	}
+	b0 := ExploreBounded(model, DefaultMaxSchedules, 0, 0)
+	if b0.Failed || b0.Deadlock {
+		t.Fatalf("c=0 executed a schedule with a preemption and reported its failure; got %+v", b0)
+	}
+	if b0.Truncated {
+		t.Fatalf("preemption bound should not truncate; got %+v", b0)
+	}
+	b1 := ExploreBounded(model, DefaultMaxSchedules, 1, 0)
+	if !b1.Failed {
+		t.Fatalf("with one preemption allowed the lost update should be found; got %+v", b1)
+	}
+	t.Logf("bound constrains executed schedule: c=0 clean (%d), c=1 found bug (%d)", b0.Runs, b1.Runs)
+}
+
 // Soundness + reduction: on an instrumented model, DPOR must reach the same
 // outcome as exhaustive exploration while running no more schedules.
 func TestDPOREquivalence(t *testing.T) {
@@ -318,6 +359,101 @@ func TestDPORSoundnessSuite(t *testing.T) {
 			t.Logf("DPOR states=%v == exhaustive (sound)", got)
 		})
 	}
+}
+
+// A whole-struct write (a composite store, instrumented as a range access that
+// records its full width) races with a read of one field. DPOR must treat them
+// as conflicting via byte-range overlap, not bare address equality, so both the
+// pre-write (0) and post-write (1) outcomes are explored. Regression for the
+// range hook dropping the access width. Requires -weave.
+func TestStructWholeWriteVsFieldRead(t *testing.T) {
+	type pair struct{ a, b int }
+	model := func() string {
+		var p pair
+		seen := -1
+		go func() { p = pair{a: 7, b: 1} }() // whole-struct write (range hook)
+		go func() { seen = p.b }()           // single-field read
+		Wait()
+		return fmt.Sprint(seen)
+	}
+	dpor := statesOf(Explore, model)
+	exh := statesOf(exploreExhaustive, model)
+	if !sameStateSet(dpor, exh) {
+		t.Fatalf("DPOR states %v != exhaustive %v (whole-struct write vs field read not detected as conflicting)",
+			sortedKeys(dpor), sortedKeys(exh))
+	}
+	if !dpor["0"] || !dpor["1"] {
+		t.Fatalf("expected both pre-write (0) and post-write (1) outcomes, got %v", sortedKeys(dpor))
+	}
+	t.Logf("struct write vs field read: DPOR states=%v == exhaustive (sound)", sortedKeys(dpor))
+}
+
+// When a reader parks at its read and another participant writes the location
+// before the reader is resumed, the trace must record the value the reader
+// actually observes (the written one), not the stale value present when it first
+// reached the read. DPOR reverses the racing read/write, so the failing schedule
+// is exactly "writer runs, then reader reads 1"; the recorded read value must be
+// 1. Regression for sampling the read value before the scheduling point.
+// Requires -weave.
+func TestReadValueReflectsGrantTime(t *testing.T) {
+	model := func() {
+		x := 0
+		go func() { x = 1 }()
+		go func() {
+			if x == 1 {
+				panic("read observed the write")
+			}
+		}()
+		Wait()
+	}
+	res := Explore(model)
+	if !res.Failed {
+		t.Fatalf("expected to find the interleaving where the read observes 1; got %+v", res)
+	}
+	foundRead1 := false
+	for _, s := range res.Trace {
+		if s.Op == "read" && s.HasVal && s.Val == 1 {
+			foundRead1 = true
+		}
+	}
+	if !foundRead1 {
+		t.Fatalf("failing trace records no read with the observed value 1 (stale sampling?); trace=%+v", res.Trace)
+	}
+	t.Logf("read value reflects grant-time state: observed 1 in the failing interleaving")
+}
+
+// A non-blocking recv consumes the oldest buffered value (from g0, which also
+// wrote x), so main's later plain recv actually receives a *different* sender's
+// value and is NOT ordered after g0's write. The naive channel-HB model does not
+// pop the send queue for the non-blocking recv, so main's plain recv would pop
+// g0's stale clock and be wrongly ordered after g0's write — pruning the racy
+// read that observes x==0. Tainting the channel touched by a non-blocking op
+// suppresses that false edge, so both x outcomes are explored. Regression for
+// the consumed-but-not-popped send clock. Requires -weave.
+func TestChannelHBNoStaleEdge(t *testing.T) {
+	model := func() string {
+		ch := make(chan int, 2)
+		x := 0
+		go func() { x = 1; ch <- 1 }() // g0: writes x, then sends (oldest)
+		go func() { ch <- 2 }()        // g1: sends second
+		go func() {                    // gA: non-blocking recv consumes the oldest (g0's) value
+			select {
+			case <-ch:
+			default:
+			}
+		}()
+		<-ch   // main: plain recv (may get g1's value, racing g0's write)
+		b := x // racy read of x
+		Wait()
+		return fmt.Sprint(b)
+	}
+	dpor := statesOf(Explore, model)
+	exh := statesOf(exploreExhaustive, model)
+	if !sameStateSet(dpor, exh) {
+		t.Fatalf("DPOR states %v != exhaustive %v (stale send-clock produced a false happens-before edge)",
+			sortedKeys(dpor), sortedKeys(exh))
+	}
+	t.Logf("channel HB with non-blocking consumer: DPOR states=%v == exhaustive (sound)", sortedKeys(dpor))
 }
 
 func equalStrings(a, b []string) bool {

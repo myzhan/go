@@ -380,6 +380,114 @@ func TestNonBlockingSelectVsSend(t *testing.T) {
 	t.Logf("non-blocking select-vs-send: DPOR reached both orderings %v", states)
 }
 
+// Mutex.TryLock's success depends on whether another goroutine already holds the
+// lock, which is schedule-dependent. Both outcomes must be explored, which
+// requires TryLock to be a scheduling point (regression for the missing TryLock
+// hook). Mutex ops are recorded without -weave, so this needs no flag.
+func TestTryLockExplored(t *testing.T) {
+	model := func(record func(bool)) func() {
+		return func() {
+			var mu sync.Mutex
+			go func() { mu.Lock(); Yield(); mu.Unlock() }()
+			ok := mu.TryLock()
+			if ok {
+				mu.Unlock()
+			}
+			Wait()
+			record(ok)
+		}
+	}
+	states := map[bool]bool{}
+	Explore(model(func(ok bool) { states[ok] = true }))
+	if !states[true] || !states[false] {
+		t.Fatalf("TryLock: DPOR reached %v, want both success and failure", states)
+	}
+	t.Logf("TryLock: DPOR reached both outcomes %v", states)
+}
+
+// A model with exactly one schedule, explored under a budget of 1, is fully
+// covered and must not be reported Truncated (regression for the budget
+// off-by-one that truncated before checking whether a next schedule remained).
+func TestBudgetExactCoverageNotTruncated(t *testing.T) {
+	model := func() { x := 0; _ = x }
+	res := ExploreBudget(model, 1)
+	if res.Truncated {
+		t.Fatalf("single-schedule model under budget 1 wrongly Truncated: %+v", res)
+	}
+	if res.Runs != 1 {
+		t.Fatalf("expected exactly 1 run, got %d", res.Runs)
+	}
+	t.Logf("single-schedule model under budget 1: complete, not truncated")
+}
+
+// A single schedule with more scheduling points than the trace buffer must be
+// reported Truncated, not panic with slice-out-of-range (regression for slicing
+// the trace by steps before checking the capacity outcome).
+func TestTraceOverflowTruncates(t *testing.T) {
+	model := func() {
+		for i := 0; i < traceCap+2; i++ {
+			Yield()
+		}
+	}
+	res := ExploreBudget(model, 10)
+	if !res.Truncated {
+		t.Fatalf("expected Truncated on trace overflow, got %+v", res)
+	}
+	t.Logf("trace overflow correctly Truncated: %s", res.TruncatedReason)
+}
+
+// Spawning more goroutines than the controller's runnable capacity must abort
+// the schedule as Truncated (capacity), not crash the whole test process with a
+// runtime fatal error (regression for the throw in weavePush).
+func TestTooManyGoroutinesTruncates(t *testing.T) {
+	model := func() {
+		for i := 0; i < 300; i++ {
+			go func() {}()
+		}
+		Wait()
+	}
+	res := Explore(model)
+	if !res.Truncated {
+		t.Fatalf("expected Truncated on runnable-capacity overflow, got %+v", res)
+	}
+	t.Logf("capacity overflow correctly Truncated: %s", res.TruncatedReason)
+}
+
+// A select waiter (G) is woken through one case (chB), leaving a stale, already
+// claimed sudog on the other channel (chA). When another participant then runs a
+// select whose chA case would pair with that stale sudog, the readiness peek must
+// not treat it as ready: the real, buffered chC case is available, so the model
+// always completes. Without excluding stale sudogs the select commits to chA,
+// fails, parks, and spuriously reports a deadlock. No -weave needed.
+func TestSelectStaleSudogNoFalseDeadlock(t *testing.T) {
+	model := func() {
+		chA := make(chan int)
+		chB := make(chan int)
+		chC := make(chan int, 1)
+		go func() {
+			select {
+			case <-chA:
+			case <-chB:
+			}
+		}()
+		chC <- 7 // make the chC case genuinely ready
+		chB <- 1 // wake G via chB (its only sender); G's chA sudog goes stale
+		select {
+		case chA <- 2: // a stale G receiver may still linger on chA.recvq
+		case <-chC: // really ready (buffered)
+		}
+		Wait()
+	}
+	res := Explore(model)
+	if res.Deadlock {
+		t.Fatalf("spurious deadlock from a stale select sudog; seed %q trace=%+v", res.Seed, res.Trace)
+	}
+	if res.Truncated {
+		t.Fatalf("unexpected truncation: %s", res.TruncatedReason)
+	}
+	t.Logf("select stale sudog: no false deadlock across %d schedules", res.Runs)
+}
+
 func sameSchedule(a, b []Step) bool {
 	if len(a) != len(b) {
 		return false

@@ -80,6 +80,12 @@ func (m *Mutex) Lock() {
 //
 // See package [sync.Mutex] documentation.
 func (m *Mutex) TryLock() bool {
+	// weave: TryLock observes the contended state, so its success/failure is
+	// schedule-dependent; record it as a scheduling point (conservatively reusing
+	// the lock transition). No-op outside a weave controlled bubble.
+	if weaveGloballyActive != 0 {
+		runtime_weaveSchedPoint(weaveOpLock, unsafe.Pointer(m))
+	}
 	old := m.state
 	if old&(mutexLocked|mutexStarving) != 0 {
 		return false

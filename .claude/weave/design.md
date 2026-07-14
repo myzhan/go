@@ -112,8 +112,11 @@ bubble 归属在创建时继承,跨 package 自动生效,对被测代码透明�
     close HB 其后 recv。用 per-participant 向量钟实现。
   - **只建模 channel 边,其余同步(mutex/rwmutex/cond/waitgroup)一律视为无序**。这是**有意的**:
     单条 acquire/release 链无法表达读者并发,强行加序可能引入**假 HB 边**而漏掉真实反转。
-- **conflict 判定**:两个不同参与者的 transition 依赖 ⟺ 同地址、至少一写、或涉及同步对象。
-  - 读/读同址:independent。任一写、或同址的同步操作:conflict。
+- **conflict 判定**:两个不同参与者的 transition 依赖 ⟺ 触及重叠内存/同一同步对象、且至少一写。
+  - **内存读写按字节区间重叠判定**(`[addr, addr+size)`),而非裸地址相等:复合对象(结构体/数组)
+    的整体写走 range 钩子并记录**完整 width**,故能与任一子字段的读判为冲突(否则整struct写 vs
+    字段读会被误判独立而漏状态)。读/读重叠:independent;任一写重叠:conflict。
+  - **同步对象**(chan/mutex/…)按对象身份(同地址)判冲突。
   - **select 特判**:select 事件在 trace 里以 `addr=0` 记录(它检查的 channel 集合表达不了),
     故保守地视 select 与任意 channel 操作及另一个 select 冲突(忽略地址)。
   - **非阻塞 channel 操作**(select+default 编成 `selectnbrecv`/`selectnbsend`)用独立 op 码
@@ -153,14 +156,23 @@ weave 的健全性目标:**不漏报**——凡是存在于合法交错空间里
   操作已定序而跳过必要反转 → 不健全。因此所有近似都朝"宁可少建边"的方向:
   - mutex/rwmutex 排除出 channelHB(避免假读者序)。
   - select 以 addr=0 记录,用**忽略地址**的 conflict 换取"绝不漏 select 与并发 chan 的反转"。
-  - 非阻塞 channel 操作**不建立 HB**:落空的 poll 绝不与某个 send 匹配;成功的 poll 少一条 HB
-    边 = 保守多探。
+  - **channelHB 对被"消费但未出队"的 send clock 保守处理**:成功的非阻塞 recv / select-recv 会
+    收走一个值但 FIFO 模型不 pop 发送队列,若放任,后续普通 recv 会 pop 到过期 send clock → 假边。
+    故 **NB 触及的 channel 一律 taint、含 select 的 run 直接禁用 channel HB**(其消费的 channel 无从
+    辨识),这些 channel 只保留程序序。少边=多探=健全。
+- **内存冲突用区间重叠 + 记录 width**:避免整struct写与字段读被误判独立(见 §3.3)。
+- **抢占上界约束的是"实际执行的 schedule"**:bounded 模式下默认后缀 sticky(仍可运行就继续当前
+  参与者),使非强制后缀零抢占;加上只添加 ≤c 的 backtrack,执行出的每条 schedule 都 ≤c 抢占,故
+  "≤c 抢占内无 bug"是真保证,不会误报越界后缀产生的 failure。
 - **程序序保守近似**替代逐对象向量钟:保守但健全。
 - **逃逸剪枝是 sound 的**:被剪掉的栈局部变量不可能被别的 goroutine 观察,重排它天然 independent。
 
 **验证方式**:差分健全性对拍——`TestDPORSoundnessSuite` 对每个模型断言 "DPOR 探索到的终态集合
-== 穷举终态集合";select/非阻塞的反转各有专门回归(`TestSelectVsConcurrentSend`/
-`TestNonBlockingSelectVsSend`)。差分对拍历史上真的抓出过一个 GC 抢占恢复丢令牌的竞态(见 D10)。
+== 穷举终态集合"。针对性回归:`TestSelectVsConcurrentSend`/`TestNonBlockingSelectVsSend`(select
+与并发 send 的反转)、`TestChannelHBNoStaleEdge`(NB 消费不产生假边)、`TestStructWholeWriteVsFieldRead`
+(整struct写 vs 字段读)、`TestPreemptionBoundConstrainsExecuted`(c=0 不报越界 failure)、
+`TestSelectStaleSudogNoFalseDeadlock`(stale sudog 不误报死锁)。差分对拍历史上真的抓出过一个
+GC 抢占恢复丢令牌的竞态(见 D10),以及一轮代码评审报出的一组健全性/正确性缺口(见 imp.md §9)。
 
 ---
 

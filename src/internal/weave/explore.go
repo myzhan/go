@@ -74,7 +74,7 @@ type Result struct {
 // Run executes f once in a controlled bubble (a single default schedule).
 // It panics if the run deadlocks.
 func Run(f func()) {
-	_, _, outcome, failure := runSchedule(f, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	_, _, outcome, failure := runSchedule(f, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
 	if failure != nil {
 		panic(failure)
 	}
@@ -89,6 +89,7 @@ type explorer struct {
 	traceWid     []int32
 	traceOp      []int32
 	traceAddr    []int64
+	traceSize    []int64 // memory op access width (bytes); 0 for non-memory ops
 	traceEnabled []uint64
 	tracePC      []uint64
 	spawnPC      []uint64 // per-wid creation-site PC, indexed by wid (max 64 participants + slot 0)
@@ -106,6 +107,7 @@ func newExplorer(f func()) *explorer {
 		traceWid:     make([]int32, traceCap),
 		traceOp:      make([]int32, traceCap),
 		traceAddr:    make([]int64, traceCap),
+		traceSize:    make([]int64, traceCap),
 		traceEnabled: make([]uint64, traceCap),
 		tracePC:      make([]uint64, traceCap),
 		spawnPC:      make([]uint64, 65),
@@ -123,7 +125,7 @@ func newExplorer(f func()) *explorer {
 // Unknown ops (opNone, from a freshly spawned or just-woken participant) and
 // distinct addresses are independent. Read/read on the same address is
 // independent; any write, or any synchronization-object operation, conflicts.
-func conflict(opi uint8, ai int64, opj uint8, aj int64) bool {
+func conflict(opi uint8, ai, si int64, opj uint8, aj, sj int64) bool {
 	// A select's outcome (which case fires, or default) depends on the readiness
 	// of every channel it examines, but its transition records only a single
 	// address (0), so that dependency cannot be matched by address. Conservatively
@@ -139,7 +141,25 @@ func conflict(opi uint8, ai int64, opj uint8, aj int64) bool {
 		}
 		return other == opSelect || isChanOp(other)
 	}
-	if ai == 0 || aj == 0 || ai != aj {
+	if ai == 0 || aj == 0 {
+		return false
+	}
+	// Memory read/write: conflict when the accessed byte ranges overlap and at
+	// least one is a write. Using width (not just the base address) is essential
+	// for composite accesses: a whole-object write (range hook) records its full
+	// size, so it correctly conflicts with a read of any sub-field, which a bare
+	// address-equality test would miss.
+	if isMemOp(opi) && isMemOp(opj) {
+		if !overlap(ai, si, aj, sj) {
+			return false
+		}
+		if opi == opRead && opj == opRead {
+			return false
+		}
+		return opi == opWrite || opj == opWrite
+	}
+	// Synchronization objects use identity: the same object address conflicts.
+	if ai != aj {
 		return false
 	}
 	if isSyncOp(opi) || isSyncOp(opj) {
@@ -149,6 +169,21 @@ func conflict(opi uint8, ai int64, opj uint8, aj int64) bool {
 		return false
 	}
 	return opi == opWrite || opj == opWrite
+}
+
+func isMemOp(op uint8) bool { return op == opRead || op == opWrite }
+
+// overlap reports whether the byte ranges [a, a+sa) and [b, b+sb) intersect.
+// A zero/unknown width is treated as a single byte so an unsized access still
+// conflicts with anything touching its address.
+func overlap(a, sa, b, sb int64) bool {
+	if sa <= 0 {
+		sa = 1
+	}
+	if sb <= 0 {
+		sb = 1
+	}
+	return a < b+sb && b < a+sa
 }
 
 // channelHB returns a happens-before predicate for one recorded schedule,
@@ -164,6 +199,25 @@ func conflict(opi uint8, ai int64, opj uint8, aj int64) bool {
 // acquire/release chain cannot express reader concurrency without risking a
 // false ordering (which would drop a real reversal).
 func channelHB(wid, op []int32, addr []int64, steps int) func(i, j int) bool {
+	// A channel whose FIFO order we cannot trust for happens-before: a
+	// non-blocking op (opChanSendNB/RecvNB) may consume a value that our FIFO
+	// model does not account for (it does not pop the send queue), and a select
+	// consumes from one of several channels we cannot identify (its transition
+	// records address 0). Either can leave a stale sender clock that a later plain
+	// recv would then pop and be wrongly ordered against — a spurious edge that
+	// could prune a needed reversal (unsound). So we suppress channel HB for a
+	// tainted channel, and for every channel in a run that contains a select.
+	// Program order still applies; fewer edges only widens the search.
+	tainted := map[int64]bool{}
+	hasSelect := false
+	for i := 0; i < steps; i++ {
+		switch uint8(op[i]) {
+		case opChanSendNB, opChanRecvNB:
+			tainted[addr[i]] = true
+		case opSelect:
+			hasSelect = true
+		}
+	}
 	P := 0
 	for i := 0; i < steps; i++ {
 		if int(wid[i])+1 > P {
@@ -188,8 +242,8 @@ func channelHB(wid, op []int32, addr []int64, steps int) func(i, j int) bool {
 	ts := make([]int32, steps)
 	for i := 0; i < steps; i++ {
 		p := int(wid[i])
-		switch uint8(op[i]) {
-		case opChanRecv:
+		skip := hasSelect || tainted[addr[i]]
+		if !skip && uint8(op[i]) == opChanRecv {
 			if q := sendq[addr[i]]; len(q) > 0 {
 				join(cur[p], q[0])
 				sendq[addr[i]] = q[1:]
@@ -200,11 +254,13 @@ func channelHB(wid, op []int32, addr []int64, steps int) func(i, j int) bool {
 		cur[p][p]++
 		vc[i] = clone(cur[p])
 		ts[i] = cur[p][p]
-		switch uint8(op[i]) {
-		case opChanSend:
-			sendq[addr[i]] = append(sendq[addr[i]], clone(cur[p]))
-		case opChanClose:
-			closed[addr[i]] = clone(cur[p])
+		if !skip {
+			switch uint8(op[i]) {
+			case opChanSend:
+				sendq[addr[i]] = append(sendq[addr[i]], clone(cur[p]))
+			case opChanClose:
+				closed[addr[i]] = clone(cur[p])
+			}
 		}
 	}
 	return func(i, j int) bool {
@@ -267,9 +323,14 @@ func ExploreBudget(f func(), maxSchedules int) Result {
 // itself in bound). It is not marked Truncated, since "no failure within c
 // preemptions" is a real guarantee, not an incomplete search.
 //
-// maxDuration > 0 additionally stops exploration once that much wall-clock time
-// has elapsed, marking the result Truncated (a different axis from the schedule
-// budget: some models have few schedules but each is slow).
+// maxDuration > 0 stops exploration once that much wall-clock time has elapsed,
+// marking the result Truncated. It is a SOFT limit checked between schedules,
+// not a hard per-schedule deadline: a single schedule that hangs — an
+// uninstrumented pure-compute infinite loop, or a block the controller cannot
+// observe — is not interrupted by it (that would require a preemption watchdog
+// inside the controller, which is not yet implemented; use an external
+// `go test -timeout` as the backstop). It bounds total exploration time for
+// models whose individual schedules all terminate.
 func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time.Duration) Result {
 	e := newExplorer(f)
 
@@ -286,12 +347,24 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 	start := time.Now()
 
 	for {
-		steps, nsel, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
+		steps, nsel, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceSize, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal, maxPreemptions >= 0)
 		e.res.Runs++
+
+		// The runtime keeps counting scheduling points after the trace buffers
+		// overflow (reported as outcome==2 below), so steps/nsel can exceed the
+		// buffer length; clamp before any slicing so diagnostics never read out of
+		// range and an overflow becomes Truncated rather than a panic.
+		if steps > traceCap {
+			steps = traceCap
+		}
+		if nsel > traceCap {
+			nsel = traceCap
+		}
 
 		wid := e.traceWid[:steps]
 		op := e.traceOp[:steps]
 		addr := e.traceAddr[:steps]
+		size := e.traceSize[:steps]
 		en := e.traceEnabled[:steps]
 		selTrace := e.selTrace[:nsel]
 		selBranch := e.selBranch[:nsel]
@@ -315,16 +388,6 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 		if outcome == 2 {
 			e.res.Truncated = true
 			e.res.TruncatedReason = "capacity limit (too many participants or trace recording space)"
-			return e.res
-		}
-		if maxSchedules > 0 && e.res.Runs >= maxSchedules {
-			e.res.Truncated = true
-			e.res.TruncatedReason = "schedule budget reached"
-			return e.res
-		}
-		if maxDuration > 0 && time.Since(start) >= maxDuration {
-			e.res.Truncated = true
-			e.res.TruncatedReason = "time budget reached"
 			return e.res
 		}
 
@@ -391,7 +454,7 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 				if wid[i] == wid[j] {
 					continue // program-order predecessor of j (happens-before j)
 				}
-				if conflict(uint8(op[i]), addr[i], uint8(op[j]), addr[j]) {
+				if conflict(uint8(op[i]), addr[i], size[i], uint8(op[j]), addr[j], size[j]) {
 					if hb(i, j) {
 						// i happens-before j (e.g. ordered through a channel), so the
 						// pair is not a reversible race; keep scanning for an earlier
@@ -446,6 +509,21 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 				}
 			}
 		}
+		// Apply the schedule/time budgets only once we know another schedule
+		// actually remains to run; otherwise a budget that exactly covers the whole
+		// state space would falsely mark a fully-explored model as Truncated.
+		if d >= 0 || selD >= 0 {
+			if maxSchedules > 0 && e.res.Runs >= maxSchedules {
+				e.res.Truncated = true
+				e.res.TruncatedReason = "schedule budget reached"
+				return e.res
+			}
+			if maxDuration > 0 && time.Since(start) >= maxDuration {
+				e.res.Truncated = true
+				e.res.TruncatedReason = "time budget reached"
+				return e.res
+			}
+		}
 		switch {
 		case d >= 0:
 			// wid backtrack: rerun with a different participant at step d. Force the
@@ -481,7 +559,7 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 func Replay(seed string, f func()) Result {
 	e := newExplorer(f)
 	plan, selPlan := decodeSeed(seed)
-	steps, _, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
+	steps, _, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceSize, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal, false)
 	e.res.Runs = 1
 	e.res.Seed = seed
 	e.res.Trace = buildTrace(e.traceWid[:steps], e.traceOp[:steps], e.traceAddr[:steps], e.tracePC[:steps], e.traceValSet[:steps], e.traceVal[:steps])
@@ -648,7 +726,7 @@ func exploreExhaustive(f func()) Result {
 	e := newExplorer(f)
 	var plan []int32
 	for {
-		steps, _, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, nil, nil, nil, nil, e.traceAddr, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal)
+		steps, _, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, nil, nil, nil, nil, e.traceAddr, e.traceSize, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal, false)
 		e.res.Runs++
 		if failure != nil {
 			e.res.Failed = true
