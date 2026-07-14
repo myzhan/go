@@ -562,6 +562,17 @@ func Replay(seed string, f func()) Result {
 	steps, _, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceSize, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal, false)
 	e.res.Runs = 1
 	e.res.Seed = seed
+	// Same clamp/outcome ordering as ExploreBounded: the runtime keeps counting
+	// scheduling points after the trace buffers overflow, so clamp before slicing
+	// (never read out of range) and report Truncated for a capacity overflow
+	// rather than panicking.
+	if steps > traceCap {
+		steps = traceCap
+	}
+	if outcome == 2 {
+		e.res.Truncated = true
+		e.res.TruncatedReason = "capacity limit (too many participants or trace recording space)"
+	}
 	e.res.Trace = buildTrace(e.traceWid[:steps], e.traceOp[:steps], e.traceAddr[:steps], e.tracePC[:steps], e.traceValSet[:steps], e.traceVal[:steps])
 	e.res.Goroutines = buildGoroutines(e.traceWid[:steps], e.spawnPC)
 	if failure != nil {

@@ -433,7 +433,14 @@ func TestTraceOverflowTruncates(t *testing.T) {
 	if !res.Truncated {
 		t.Fatalf("expected Truncated on trace overflow, got %+v", res)
 	}
-	t.Logf("trace overflow correctly Truncated: %s", res.TruncatedReason)
+	// Replay builds the trace with the same slicing and must not panic on an
+	// overflowing run either; an empty seed replays under the default policy,
+	// which overflows the same way.
+	rep := Replay("", model)
+	if !rep.Truncated {
+		t.Fatalf("expected Replay to report Truncated on trace overflow, got %+v", rep)
+	}
+	t.Logf("trace overflow correctly Truncated (Explore + Replay): %s", res.TruncatedReason)
 }
 
 // Spawning more goroutines than the controller's runnable capacity must abort
