@@ -312,6 +312,74 @@ func TestSelectEnumeration(t *testing.T) {
 	t.Logf("select enumeration reached the b case; seed %q reproduces", res.Seed)
 }
 
+// A two-case blocking select competes with a concurrent send on one of its
+// channels. The "other" case is always ready (pre-buffered), while the "ch" case
+// is ready only once the concurrent sender has run. If the select is ordered
+// before the send it can only take "other" (99); if the sender is ordered first,
+// ch becomes ready and the select may take it (1). Both outcomes must be
+// explored, which requires DPOR to treat the select transition as dependent on
+// the concurrent send (the select records addr 0, so this dependency is matched
+// address-agnostically in conflict). A single-case select with a default is
+// compiled to a non-blocking selectnbrecv and would not exercise selectgo, so
+// two real cases with no default are used. Channel ops are recorded without
+// -weave, so this needs no flag.
+func TestSelectVsConcurrentSend(t *testing.T) {
+	model := func(record func(int)) func() {
+		return func() {
+			ch := make(chan int, 1)
+			other := make(chan int, 1)
+			go func() { ch <- 1 }() // buffered: never blocks
+			other <- 99             // "other" case is always ready
+			var result int
+			select {
+			case v := <-ch:
+				result = v
+			case v := <-other:
+				result = v
+			}
+			Wait()
+			record(result)
+		}
+	}
+	states := map[int]bool{}
+	Explore(model(func(r int) { states[r] = true }))
+	if !states[1] || !states[99] {
+		t.Fatalf("select-vs-send: DPOR reached %v, want both outcomes {1, 99}", states)
+	}
+	t.Logf("select-vs-send: DPOR reached both orderings %v", states)
+}
+
+// A non-blocking select (single case with a default, compiled to selectnbrecv →
+// chanrecv with block=false) competes with a concurrent send: whether the
+// receive case or the default fires depends on the order of the poll relative to
+// the send. Both outcomes must be explored, which requires the non-blocking
+// channel operation to be a scheduling point (recorded as opChanRecvNB, ordered
+// before the fast-path check in chanrecv). Channel ops are recorded without
+// -weave, so this needs no flag.
+func TestNonBlockingSelectVsSend(t *testing.T) {
+	model := func(record func(int)) func() {
+		return func() {
+			ch := make(chan int, 1)
+			go func() { ch <- 1 }() // buffered: never blocks
+			var result int
+			select {
+			case v := <-ch:
+				result = v // the send was ordered before the poll
+			default:
+				result = -1 // the poll ran first; channel still empty
+			}
+			Wait()
+			record(result)
+		}
+	}
+	states := map[int]bool{}
+	Explore(model(func(r int) { states[r] = true }))
+	if !states[1] || !states[-1] {
+		t.Fatalf("non-blocking select-vs-send: DPOR reached %v, want both outcomes {1, -1}", states)
+	}
+	t.Logf("non-blocking select-vs-send: DPOR reached both orderings %v", states)
+}
+
 func sameSchedule(a, b []Step) bool {
 	if len(a) != len(b) {
 		return false

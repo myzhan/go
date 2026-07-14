@@ -97,7 +97,8 @@ func TestCounter(t *testing.T) {
     `TestReplayReproduces`:seed 确定性复现同一交错。
 - **M9 select 确定化 + RNG 确定化:已完成** ✅
   - **select**(#8):`runtime/select.go` 在受控 bubble 内跳过 `cheaprandn` 洗牌,poll order 用确定顺序
-    → select 多就绪 case 的选择**可复现**(完整的 DPOR-over-select-cases 枚举留作增强)。
+    → select 多就绪 case 的选择**可复现**。**多就绪 case 的穷举枚举已实现**
+    (`explore.go` `selD`/`selCase`,与 wid-DPOR 组合;`TestSelectEnumeration` 覆盖)。
   - **RNG**(#9):`runtime/rand.go` 的 `rand()` 在受控 bubble 内(排除 root、全局门控)返回确定
     splitmix64 序列(`weaveRand`)→ **map 迭代序 / maphash 种子**等可复现。`TestMapIterationDeterministic`
     验证跨 run 一致。runtime select 测试 + sync/synctest 零回归。

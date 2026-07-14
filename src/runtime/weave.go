@@ -719,4 +719,10 @@ const (
 	weaveOpCondSignal
 	weaveOpCondBroadcast
 	weaveOpOnce
+	// Non-blocking channel ops (from a select with a default). They are
+	// scheduling points so their success/failure reflects the interleaving, but
+	// they establish no happens-before (channelHB ignores them): a poll that
+	// receives nothing must not be matched against a sender.
+	weaveOpChanSendNB
+	weaveOpChanRecvNB
 )

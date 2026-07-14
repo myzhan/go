@@ -29,6 +29,8 @@ const (
 	opCondSignal
 	opCondBroadcast
 	opOnce
+	opChanSendNB // non-blocking send (select default); scheduling point, no HB
+	opChanRecvNB // non-blocking recv (select default); scheduling point, no HB
 )
 
 // Step is one transition in a recorded interleaving.
@@ -122,6 +124,21 @@ func newExplorer(f func()) *explorer {
 // distinct addresses are independent. Read/read on the same address is
 // independent; any write, or any synchronization-object operation, conflicts.
 func conflict(opi uint8, ai int64, opj uint8, aj int64) bool {
+	// A select's outcome (which case fires, or default) depends on the readiness
+	// of every channel it examines, but its transition records only a single
+	// address (0), so that dependency cannot be matched by address. Conservatively
+	// treat a select as conflicting with any channel operation and with any other
+	// select, address-agnostically, so the reordering of a select against a
+	// competing send/recv/close is explored. Sound: this over-approximates
+	// dependency (never drops a needed reversal). A select does not touch plain
+	// memory or locks, so it is independent of those.
+	if opi == opSelect || opj == opSelect {
+		other := opi
+		if opi == opSelect {
+			other = opj
+		}
+		return other == opSelect || isChanOp(other)
+	}
 	if ai == 0 || aj == 0 || ai != aj {
 		return false
 	}
@@ -195,10 +212,15 @@ func channelHB(wid, op []int32, addr []int64, steps int) func(i, j int) bool {
 	}
 }
 
+func isChanOp(op uint8) bool {
+	return op == opChanSend || op == opChanRecv || op == opChanClose ||
+		op == opChanSendNB || op == opChanRecvNB
+}
+
 func isSyncOp(op uint8) bool {
 	switch op {
-	case opLock, opUnlock, opChanSend, opChanRecv, opChanClose, opSelect, opWaitGroupWait,
-		opWaitGroupAdd, opCondWait, opCondSignal, opCondBroadcast, opOnce:
+	case opLock, opUnlock, opChanSend, opChanRecv, opChanClose, opChanSendNB, opChanRecvNB,
+		opSelect, opWaitGroupWait, opWaitGroupAdd, opCondWait, opCondSignal, opCondBroadcast, opOnce:
 		return true
 	}
 	return false
@@ -528,6 +550,10 @@ func opName(op uint8) string {
 		return "chan recv"
 	case opChanClose:
 		return "chan close"
+	case opChanSendNB:
+		return "chan send (nb)"
+	case opChanRecvNB:
+		return "chan recv (nb)"
 	case opSelect:
 		return "select"
 	case opWaitGroupWait:

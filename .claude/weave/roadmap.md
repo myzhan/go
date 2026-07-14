@@ -23,7 +23,21 @@ select 确定化 · RNG(map/maphash)确定化 · spawned goroutine panic 捕获 
 1. **atomic 插桩**(最大缺口):`sync/atomic` 目前既非调度点也不记录 → 用 atomic 的无锁代码探索不了。
    正解仿 `-race` 用 instrumented std 重建,工程量大,为免拖累全体 Go 程序 atomic 性能未草率合入。
 2. **弱内存模型**(M5):atomic C11 重排 / read-from 枚举(依赖 1)。
-3. **DPOR-over-select-cases**:select 已确定化,但未枚举多个就绪 case。
+3. **optimal-DPOR(wakeup tree)**:进一步剪枝(见下 M1 可选项)。
+   注:多就绪 case 的 **select-case 枚举已实现**(`explore.go` 的 `selD`/`selCase` 穷举,
+   与 wid-DPOR 组合;测试 `TestSelectEnumeration`),不再是缺口。**已修复(本轮)**:select
+   事件在 trace 里以 addr=0 记录,原来其底层 channel 效果不参与 `conflict` 判定 → select 与
+   并发 chan 操作之间的 wid 级冲突约简会**欠探索**(实证:"select vs 并发 send"只探到一个结果)。
+   修复:`conflict` 把 select 保守地视为与任意 channel 操作(及另一个 select)冲突(忽略地址,
+   over-approximate=健全);回归防护 `TestSelectVsConcurrentSend`。
+10. **非阻塞 channel 操作作为调度点 —— 已修复(本轮)**:`select { case ...; default: }`
+    被编译器优化成 `selectnbrecv`/`selectnbsend`(不走 `selectgo`),最终落到 `chan.go` 的
+    `chansend`/`chanrecv` 且 `block==false`。原来 weave 只在 `block==true` 时插调度点,且非阻塞
+    **快速失败路径在调度点之前**返回 → 非阻塞收发不是调度点,其"成功/落空"两种时序结果不被枚举
+    (实证:单 case + default 只探到一个结果)。修复:把调度点**移到快速路径之前**,非阻塞用独立
+    op 码 `weaveOpChanSendNB`/`RecvNB` —— 是调度点(参与 `conflict`,可被 DPOR 重排),但
+    **不建立 happens-before**(`channelHB` 忽略之:落空的 poll 不能与 send 匹配;成功的 poll 少一条
+    HB 边=保守多探,健全)。回归防护 `TestNonBlockingSelectVsSend`。runtime/sync/synctest 零回归。
 4. **(D9)泡泡外并发显式检测** `uncontrolled concurrency detected` + **undo-log 跨 run 自动重置**。
 5. **optimal-DPOR**(wakeup tree)进一步剪枝。
 6. **抢占看门狗**(死循环兜底)。

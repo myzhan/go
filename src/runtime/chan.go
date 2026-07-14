@@ -194,6 +194,17 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		fatal("send on synctest channel from outside bubble")
 	}
 
+	// Record the send as a weave scheduling point/transition (no-op outside a
+	// controlled bubble). Must be before the non-blocking fast path below, so that
+	// a non-blocking send (a select with a default) also yields; whether it then
+	// succeeds or fails reflects the explored interleaving. Must be before
+	// acquiring c.lock.
+	if block {
+		weaveSchedPoint(weaveOpChanSend, unsafe.Pointer(c))
+	} else {
+		weaveSchedPoint(weaveOpChanSendNB, unsafe.Pointer(c))
+	}
+
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
 	//
 	// After observing that the channel is not closed, we observe that the channel is
@@ -217,12 +228,6 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	var t0 int64
 	if blockprofilerate > 0 {
 		t0 = cputicks()
-	}
-
-	// Record the send as a weave scheduling point/transition (no-op outside a
-	// controlled bubble). Must be before acquiring c.lock.
-	if block {
-		weaveSchedPoint(weaveOpChanSend, unsafe.Pointer(c))
 	}
 
 	lock(&c.lock)
@@ -555,6 +560,17 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		c.timer.maybeRunChan(c)
 	}
 
+	// Record the receive as a weave scheduling point/transition (no-op outside a
+	// controlled bubble). Must be before the non-blocking fast path below, so that
+	// a non-blocking receive (a select with a default) also yields; whether it
+	// then succeeds or fails reflects the explored interleaving. Must be before
+	// acquiring c.lock.
+	if block {
+		weaveSchedPoint(weaveOpChanRecv, unsafe.Pointer(c))
+	} else {
+		weaveSchedPoint(weaveOpChanRecvNB, unsafe.Pointer(c))
+	}
+
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
 	if !block && empty(c) {
 		// After observing that the channel is not ready for receiving, we observe whether the
@@ -591,12 +607,6 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	var t0 int64
 	if blockprofilerate > 0 {
 		t0 = cputicks()
-	}
-
-	// Record the receive as a weave scheduling point/transition (no-op outside a
-	// controlled bubble). Must be before acquiring c.lock.
-	if block {
-		weaveSchedPoint(weaveOpChanRecv, unsafe.Pointer(c))
 	}
 
 	lock(&c.lock)
