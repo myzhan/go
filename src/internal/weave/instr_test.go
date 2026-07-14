@@ -422,14 +422,15 @@ func TestReadValueReflectsGrantTime(t *testing.T) {
 	t.Logf("read value reflects grant-time state: observed 1 in the failing interleaving")
 }
 
-// A non-blocking recv consumes the oldest buffered value (from g0, which also
-// wrote x), so main's later plain recv actually receives a *different* sender's
-// value and is NOT ordered after g0's write. The naive channel-HB model does not
-// pop the send queue for the non-blocking recv, so main's plain recv would pop
-// g0's stale clock and be wrongly ordered after g0's write — pruning the racy
-// read that observes x==0. Tainting the channel touched by a non-blocking op
-// suppresses that false edge, so both x outcomes are explored. Regression for
-// the consumed-but-not-popped send clock. Requires -weave.
+// Soundness invariant: with a non-blocking recv consuming a buffered value while
+// a plain recv and a racy read run concurrently, DPOR must reach the same
+// terminal states as an exhaustive search. This exercises the channelHB path
+// where a non-blocking recv consumes without popping the FIFO (the taint fix
+// suppresses the potential stale-clock edge). NOTE: this is a soundness-invariant
+// guard, not a proven load-bearing regression — the fix is conservatively sound
+// (it only removes happens-before edges), and this specific model does not by
+// itself demonstrate a missed state without it (see the discussion of the
+// stale-clock temporal coupling). Requires -weave.
 func TestChannelHBNoStaleEdge(t *testing.T) {
 	model := func() string {
 		ch := make(chan int, 2)
