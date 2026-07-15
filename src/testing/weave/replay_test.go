@@ -7,7 +7,29 @@ package weave
 import (
 	"strings"
 	"testing"
+	"time"
 )
+
+// The per-test wall-clock backstop: WEAVE_TIMEOUT unset uses the default; a
+// valid duration overrides it; 0 disables the limit; garbage falls back to the
+// default.
+func TestResolveTimeout(t *testing.T) {
+	cases := []struct {
+		env  string
+		want time.Duration
+	}{
+		{"", defaultTimeout},
+		{"5s", 5 * time.Second},
+		{"2m", 2 * time.Minute},
+		{"0", 0},
+		{"not-a-duration", defaultTimeout},
+	}
+	for _, c := range cases {
+		if got := resolveTimeout(c.env); got != c.want {
+			t.Errorf("resolveTimeout(%q) = %v, want %v", c.env, got, c.want)
+		}
+	}
+}
 
 // The reproduce command must be a single safe shell line: a select seed contains
 // '|', which must be quoted so the shell does not treat it as a pipe, and the

@@ -53,6 +53,27 @@ import (
 	"time"
 )
 
+// defaultTimeout is the wall-clock backstop applied to a single [Test] when
+// WEAVE_TIMEOUT is not set, so a state-space explosion reports INCOMPLETE
+// instead of running up to the schedule budget. It is a soft limit checked
+// between schedules; interrupting a single hung schedule still requires
+// `go test -timeout`.
+const defaultTimeout = 60 * time.Second
+
+// resolveTimeout returns the per-test wall-clock budget from the WEAVE_TIMEOUT
+// value: unset uses defaultTimeout; a valid duration is used as-is (0 or
+// negative disables the limit); an unparseable value falls back to the default.
+func resolveTimeout(env string) time.Duration {
+	if env == "" {
+		return defaultTimeout
+	}
+	d, err := time.ParseDuration(env)
+	if err != nil {
+		return defaultTimeout
+	}
+	return d
+}
+
 // Test explores interleavings of the model f and fails t on the first schedule
 // that deadlocks or panics, printing the interleaving and a seed to reproduce
 // it. On success it logs how many schedules were explored.
@@ -70,8 +91,12 @@ import (
 // most c preemptions (context bounding); most concurrency bugs surface with very
 // few, so a small c finds them while exploring far fewer schedules.
 //
-// Setting WEAVE_TIMEOUT=<dur> (e.g. 2s) stops exploration after that much
-// wall-clock time, reporting the result as incomplete rather than passing.
+// A per-test wall-clock backstop is applied by default (see defaultTimeout) so a
+// runaway state space reports incomplete instead of running for a long time.
+// Setting WEAVE_TIMEOUT=<dur> (e.g. 2s) overrides it; WEAVE_TIMEOUT=0 disables
+// it. The limit is checked between schedules, so a single schedule that hangs
+// (e.g. a non-terminating pure-compute loop) is not interrupted by it — use
+// `go test -timeout` as the hard backstop for that.
 func Test(t *testing.T, f func()) {
 	t.Helper()
 
@@ -98,12 +123,7 @@ func Test(t *testing.T, f func()) {
 			maxPreempt = n
 		}
 	}
-	var timeout time.Duration
-	if v := os.Getenv("WEAVE_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			timeout = d
-		}
-	}
+	timeout := resolveTimeout(os.Getenv("WEAVE_TIMEOUT"))
 
 	res := weave.ExploreBounded(f, budget, maxPreempt, timeout)
 	switch {
@@ -115,8 +135,9 @@ func Test(t *testing.T, f func()) {
 		// Exploration did not exhaust the state space, so "no failure found" is
 		// inconclusive; fail loudly rather than give an unreliable green light.
 		t.Errorf("weave: exploration INCOMPLETE after %d schedule(s): %s; "+
-			"no failure found in the explored subset. Reduce the model or raise "+
-			"the budget with WEAVE_MAX_SCHEDULES.", res.Runs, res.TruncatedReason)
+			"no failure found in the explored subset. Reduce the model, or raise the "+
+			"limits with WEAVE_MAX_SCHEDULES / WEAVE_TIMEOUT (WEAVE_TIMEOUT=0 disables "+
+			"the time limit).", res.Runs, res.TruncatedReason)
 	case maxPreempt >= 0:
 		t.Logf("weave: ok, explored %d schedule(s) within %d preemption(s)", res.Runs, maxPreempt)
 	default:
