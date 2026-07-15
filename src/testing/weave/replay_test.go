@@ -5,6 +5,7 @@
 package weave
 
 import (
+	"internal/weave"
 	"strings"
 	"testing"
 	"time"
@@ -32,26 +33,30 @@ func TestResolveTimeout(t *testing.T) {
 }
 
 // The reproduce command must be a single safe shell line: a select seed contains
-// '|', which must be quoted so the shell does not treat it as a pipe, and the
-// -run pattern must be anchored/quoted. It must also preserve the build mode
-// (-weave iff built with it), since the two modes explore different schedules.
+// '|', which must be quoted so the shell does not treat it as a pipe; the -run
+// pattern must escape regexp metacharacters per name segment; and -weave is added
+// exactly when the failure involved memory instrumentation (a read/write in the
+// trace), reflecting the actual build mode rather than a build tag.
 func TestReplayCommandFormat(t *testing.T) {
-	cmd := replayCommand("0.1.2|0", "TestFoo/bar")
-
+	// Channel/mutex-only failure: no memory op in the trace, so no -weave.
+	chanTrace := []weave.Step{{Op: "chan send"}, {Op: "chan recv"}}
+	cmd := replayCommand("0.1.2|0", "TestFoo/a+b", chanTrace)
 	if !strings.Contains(cmd, "WEAVE_REPLAY='0.1.2|0'") {
 		t.Errorf("seed with '|' must be single-quoted; got: %s", cmd)
 	}
-	if !strings.Contains(cmd, "-run '^TestFoo/bar$'") {
-		t.Errorf("-run pattern must be anchored and quoted; got: %s", cmd)
+	if !strings.Contains(cmd, `-run '^TestFoo$/^a\+b$'`) {
+		t.Errorf("-run must escape regexp metacharacters per segment; got: %s", cmd)
 	}
-	if builtWithWeave {
-		if !strings.Contains(cmd, "go test -weave -run") {
-			t.Errorf("a -weave build must reproduce with -weave; got: %s", cmd)
-		}
-	} else {
-		if strings.Contains(cmd, "-weave") {
-			t.Errorf("a non-weave build must not add -weave; got: %s", cmd)
-		}
+	if strings.Contains(cmd, "-weave") {
+		t.Errorf("a channel/mutex-only failure must not add -weave; got: %s", cmd)
 	}
-	t.Logf("replay command: %s", cmd)
+
+	// Memory-race failure: the trace has a read/write, so the command must carry
+	// -weave (the failure is only reproducible with instrumentation).
+	memTrace := []weave.Step{{Op: "read"}, {Op: "write"}}
+	cmd2 := replayCommand("0.0", "TestMem", memTrace)
+	if !strings.Contains(cmd2, "go test -weave -run") {
+		t.Errorf("a memory-race failure must reproduce with -weave; got: %s", cmd2)
+	}
+	t.Logf("replay commands: %q / %q", cmd, cmd2)
 }

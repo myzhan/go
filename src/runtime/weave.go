@@ -218,27 +218,16 @@ func weaveChoose(ctl *weaveControl) int {
 			if o := ctl.runnableOp[idx]; o == uint8(weaveOpRead) || o == uint8(weaveOpWrite) {
 				ctl.tracePC[ctl.step] = uint64(ctl.runnablePC[idx])
 				if ctl.traceVal != nil {
-					if o == uint8(weaveOpRead) && ctl.runnableSize[idx] != 0 {
-						// Re-sample the read value now: this participant is the one
-						// being granted the token and will perform the load next, with
-						// no other participant running in between. Sampling here (rather
-						// than when it first joined the runnable set) makes the trace show
-						// the value it will actually observe, even if it parked at this
-						// read while another participant wrote the location.
-						v, ok := weaveLoadVal(ctl.runnableAddr[idx], ctl.runnableSize[idx])
-						ctl.traceVal[ctl.step] = v
-						if ok {
-							ctl.traceValSet[ctl.step] = 1
-						} else {
-							ctl.traceValSet[ctl.step] = 0
-						}
+					// Record the value the compiler supplied (writes) or a placeholder
+					// (reads). A read's value is backfilled by weaveread after the
+					// participant resumes and performs the load, so the runtime never
+					// dereferences a user address from the controller context (where a
+					// fault would be a process-fatal rather than a recoverable panic).
+					ctl.traceVal[ctl.step] = ctl.runnableVal[idx]
+					if ctl.runnableValSet[idx] {
+						ctl.traceValSet[ctl.step] = 1
 					} else {
-						ctl.traceVal[ctl.step] = ctl.runnableVal[idx]
-						if ctl.runnableValSet[idx] {
-							ctl.traceValSet[ctl.step] = 1
-						} else {
-							ctl.traceValSet[ctl.step] = 0
-						}
+						ctl.traceValSet[ctl.step] = 0
 					}
 				}
 			} else {
@@ -488,11 +477,43 @@ func weaveSchedPointSlow(op weaveOp, id unsafe.Pointer, size, pc uintptr, val ui
 
 func weaveread(addr, size uintptr) {
 	if weaveActive() {
-		// The read value is sampled in weaveChoose when this participant is granted
-		// the token (just before the real load), so the trace reflects the value it
-		// actually observes even if it parks here while another participant writes.
 		weaveSchedPointSlow(weaveOpRead, unsafe.Pointer(addr), size, sys.GetCallerPC(), 0, false)
+		// After the scheduling point the participant holds the token and is about to
+		// perform the real load, with no other participant running in between, so the
+		// value here is exactly what it observes (fresh even if it parked at this
+		// read while another participant wrote). Sample it now, in participant
+		// context: a fault on an unmapped address is a recoverable panic (subject to
+		// the model's runtime.SetPanicOnFault) rather than a controller-context
+		// process-fatal. Backfill it into the transition just recorded.
+		val, valSet := weaveLoadVal(addr, size)
+		weaveBackfillReadVal(val, valSet)
 	}
+}
+
+// weaveBackfillReadVal records the value observed by the just-executed read into
+// its transition (the most recent step for this participant, recorded when it was
+// granted the token). No-op outside a controlled bubble or if the last step is
+// not this participant's read.
+func weaveBackfillReadVal(val uint64, valSet bool) {
+	gp := getg()
+	b := gp.bubble
+	if b == nil || !b.controlled {
+		return
+	}
+	ctl := b.weaveCtl
+	lock(&b.mu)
+	if ctl.traceVal != nil {
+		s := ctl.step - 1
+		if s >= 0 && s < len(ctl.traceVal) && ctl.traceWid[s] == gp.weaveWid && ctl.traceOp[s] == int32(weaveOpRead) {
+			ctl.traceVal[s] = val
+			if valSet {
+				ctl.traceValSet[s] = 1
+			} else {
+				ctl.traceValSet[s] = 0
+			}
+		}
+	}
+	unlock(&b.mu)
 }
 
 func weavewrite(addr, size uintptr) {

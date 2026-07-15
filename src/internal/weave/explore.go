@@ -81,6 +81,9 @@ func Run(f func()) {
 	if outcome == 1 {
 		panic("weave: deadlock: all goroutines in bubble are blocked")
 	}
+	if outcome == 2 {
+		panic("weave: capacity limit exceeded (too many runnable goroutines or trace overflow)")
+	}
 }
 
 const traceCap = 1 << 16

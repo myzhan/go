@@ -126,6 +126,14 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg
 	if p.Internal.FuzzInstrument {
 		gcflags = append(gcflags, fuzzInstrumentFlags()...)
 	}
+	if cfg.BuildWeave && p.Internal.CmdlinePkg {
+		// -weave instruments memory accesses only in the command-line packages, not
+		// their dependencies: instrumenting sync/runtime internals would turn their
+		// private memory operations into scheduling points and break the soundness
+		// of transition reduction (e.g. mutex/RWMutex conflicts). Appended after the
+		// user's -gcflags so it never shadows them.
+		gcflags = append(gcflags, "-weave")
+	}
 	// Add -c=N to use concurrent backend compilation, if possible.
 	c, release := compilerConcurrency()
 	defer release()

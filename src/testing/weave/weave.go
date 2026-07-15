@@ -47,6 +47,7 @@ import (
 	"internal/weave"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -102,10 +103,15 @@ func Test(t *testing.T, f func()) {
 
 	if seed := os.Getenv("WEAVE_REPLAY"); seed != "" {
 		res := weave.Replay(seed, f)
-		if res.Failed || res.Deadlock {
+		switch {
+		case res.Failed, res.Deadlock:
 			t.Errorf("weave: replayed interleaving (seed %s):\n%s%s%s",
 				seed, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res))
-		} else {
+		case res.Truncated:
+			// The replayed schedule overflowed the trace/participant capacity, so
+			// it did not run to completion; "no failure" would be a false pass.
+			t.Errorf("weave: replay INCOMPLETE (seed %s): %s", seed, res.TruncatedReason)
+		default:
 			t.Logf("weave: replayed seed %s, no failure", seed)
 		}
 		return
@@ -130,7 +136,7 @@ func Test(t *testing.T, f func()) {
 	case res.Failed, res.Deadlock:
 		t.Errorf("weave: found failing interleaving after %d schedule(s):\n%s%s%s\n"+
 			"reproduce with: %s",
-			res.Runs, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res), replayCommand(res.Seed, t.Name()))
+			res.Runs, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res), replayCommand(res.Seed, t.Name(), res.Trace))
 	case res.Truncated:
 		// Exploration did not exhaust the state space, so "no failure found" is
 		// inconclusive; fail loudly rather than give an unreliable green light.
@@ -152,12 +158,38 @@ func Test(t *testing.T, f func()) {
 // reproducible under -weave, so the flag is included exactly when this binary was
 // built with it — running the plain command would explore a different schedule
 // space and could spuriously pass.
-func replayCommand(seed, name string) string {
+func replayCommand(seed, name string, trace []weave.Step) string {
 	flag := ""
-	if builtWithWeave {
+	if traceNeedsWeave(trace) {
 		flag = " -weave"
 	}
-	return fmt.Sprintf("WEAVE_REPLAY=%s go test%s -run %s", shellSingleQuote(seed), flag, shellSingleQuote("^"+name+"$"))
+	return fmt.Sprintf("WEAVE_REPLAY=%s go test%s -run %s", shellSingleQuote(seed), flag, shellSingleQuote(runPattern(name)))
+}
+
+// traceNeedsWeave reports whether the failing interleaving contains a memory
+// read/write transition. Those transitions exist only when the package was built
+// with -weave (memory instrumentation), and the schedule points differ between
+// the two modes, so such a failure reproduces only under -weave. Deciding from
+// the trace reflects the actual instrumentation that produced the failure, unlike
+// a build tag, which can diverge from -gcflags=-weave.
+func traceNeedsWeave(trace []weave.Step) bool {
+	for _, s := range trace {
+		if s.Op == "read" || s.Op == "write" {
+			return true
+		}
+	}
+	return false
+}
+
+// runPattern builds a -run value that matches exactly this test (and subtest),
+// escaping each slash-separated segment so regexp metacharacters in the name
+// (e.g. + or [) are matched literally rather than as a pattern.
+func runPattern(name string) string {
+	parts := strings.Split(name, "/")
+	for i, p := range parts {
+		parts[i] = "^" + regexp.QuoteMeta(p) + "$"
+	}
+	return strings.Join(parts, "/")
 }
 
 // shellSingleQuote wraps s in single quotes, escaping embedded single quotes, so

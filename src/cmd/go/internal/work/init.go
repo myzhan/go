@@ -146,15 +146,15 @@ func weaveInit() {
 		base.SetExitStatus(2)
 		base.Exit()
 	}
-	// Instrument memory accesses in the packages being built (the compiler skips
-	// NoInstrument packages such as the runtime). Use forcedGcflags rather than
-	// mutating the user's -gcflags: forcedGcflags are applied *in addition to* the
-	// per-package -gcflags, so a bare "-weave" rule can no longer shadow a user
-	// rule like -gcflags=-N (which the last-match PerPackageFlag semantics would
-	// otherwise drop).
-	forcedGcflags = append(forcedGcflags, "-weave")
-	// Define the "weave" build tag (like -race defines "race"), so tests can
-	// gate weave-only code with //go:build weave.
+	// The actual "-weave" gcflag is appended per package in (*builder).gcflags,
+	// but only for command-line packages — not their dependencies. Instrumenting
+	// sync/runtime internals would turn their private memory operations into
+	// scheduling points and break the soundness of transition reduction, so the
+	// instrumentation scope is deliberately limited (and applied additively, never
+	// shadowing the user's -gcflags).
+	//
+	// Define the "weave" build tag (like -race defines "race"), so tests can gate
+	// weave-only code with //go:build weave.
 	cfg.BuildContext.BuildTags = append(cfg.BuildContext.BuildTags, "weave")
 }
 

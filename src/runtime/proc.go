@@ -5394,6 +5394,13 @@ func newproc(fn *funcval) {
 		// its panics are captured) and waits for the controller to grant it the
 		// run token; the parent keeps running.
 		bubble := gp.bubble
+		if bubble.weaveCtl.overflow {
+			// The run already overflowed the controller's capacity and is being
+			// torn down as truncated; do not spawn further participants (they could
+			// only be dropped and leaked). Skipping creation is safe because the
+			// run's result is already inconclusive.
+			return
+		}
 		systemstack(func() {
 			newg := weaveNewParticipant(gp, pc, fn)
 			weaveRegisterChild(bubble, newg)

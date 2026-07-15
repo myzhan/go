@@ -457,7 +457,17 @@ func TestTooManyGoroutinesTruncates(t *testing.T) {
 	if !res.Truncated {
 		t.Fatalf("expected Truncated on runnable-capacity overflow, got %+v", res)
 	}
-	t.Logf("capacity overflow correctly Truncated: %s", res.TruncatedReason)
+	// Run must propagate the capacity overflow (panic), not silently return
+	// success as if the model had been fully explored.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Errorf("Run should panic on capacity overflow, not return success")
+			}
+		}()
+		Run(model)
+	}()
+	t.Logf("capacity overflow correctly Truncated (Explore) and propagated (Run): %s", res.TruncatedReason)
 }
 
 // A select waiter (G) is woken through one case (chB), leaving a stale, already

@@ -457,6 +457,55 @@ func TestChannelHBNoStaleEdge(t *testing.T) {
 	t.Logf("channel HB with non-blocking consumer: DPOR states=%v == exhaustive (sound)", sortedKeys(dpor))
 }
 
+// Under -weave the instrumentation must cover only the command-line package, not
+// its dependencies: instrumenting sync's internals turns RWMutex's private memory
+// operations into scheduling points and breaks transition reduction, making DPOR
+// miss the TryRLock==false outcome. With the scope limited to the command-line
+// package, only the Lock/TryRLock transitions matter and DPOR stays sound. This
+// test fails if -weave regresses to instrumenting dependencies. Requires -weave.
+func TestRWMutexTryRLockSound(t *testing.T) {
+	model := func(rec func(bool)) func() {
+		return func() {
+			var mu sync.RWMutex
+			go func() { mu.Lock(); mu.Unlock() }()
+			ok := mu.TryRLock()
+			if ok {
+				mu.RUnlock()
+			}
+			Wait()
+			rec(ok)
+		}
+	}
+	dpor := map[bool]bool{}
+	Explore(model(func(v bool) { dpor[v] = true }))
+	exh := map[bool]bool{}
+	exploreExhaustive(model(func(v bool) { exh[v] = true }))
+	if dpor[true] != exh[true] || dpor[false] != exh[false] {
+		t.Fatalf("RWMutex.TryRLock: DPOR states %v != exhaustive %v (dependency instrumentation broke reduction?)", dpor, exh)
+	}
+	if !dpor[true] || !dpor[false] {
+		t.Fatalf("RWMutex.TryRLock: expected both success and failure, DPOR=%v exhaustive=%v", dpor, exh)
+	}
+	t.Logf("RWMutex.TryRLock sound under -weave: DPOR=%v == exhaustive", dpor)
+}
+
+// Sampling a read value must not dereference a bad user address from the
+// controller context, where a fault would be a process-fatal. weaveread samples
+// in participant context after the scheduling point, so a faulting read is a
+// recoverable panic captured by Explore. Regression: a nil dereference under
+// -weave is reported as a failure, not a crash. Requires -weave.
+func TestReadFaultRecoverable(t *testing.T) {
+	model := func() {
+		var p *int
+		_ = *p // faults; weaveread samples this address in participant context
+	}
+	res := Explore(model)
+	if !res.Failed {
+		t.Fatalf("expected the faulting read to be captured as a failure, got %+v", res)
+	}
+	t.Logf("faulting read captured as a recoverable failure (not a process fatal)")
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
