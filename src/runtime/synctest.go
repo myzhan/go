@@ -235,8 +235,10 @@ func synctestRun1(f func(), controlled bool) {
 	})
 
 	// Controlled bubbles are driven entirely by the weave controller, which
-	// tracks liveness and detects completion/deadlock itself. Skip the synctest
-	// fake-time quiescence loop.
+	// tracks liveness and detects completion/deadlock itself. weaveRootWait is the
+	// weave analogue of the synctest fake-time quiescence loop below: it advances
+	// the fake clock and fires timers when the bubble is quiescent, integrated with
+	// the run-token handoff.
 	if controlled {
 		weaveRootWait(bubble)
 		return

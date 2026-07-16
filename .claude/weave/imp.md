@@ -58,8 +58,8 @@
 - `synctestBubble` 加 `controlled bool` + `weaveCtl *weaveControl`。
 - `changegstatus`/`incActive`/`decActive` 对受控 bubble no-op(控制器自管存活,run-token 不变量
   取代空闲计数)。
-- `synctestRun1(f, controlled)`:受控分支建 parked main + `weaveStart` + `weaveRootWait`,**跳过
-  synctest 假时钟推进循环**(D11 的根源)。
+- `synctestRun1(f, controlled)`:受控分支建 parked main + `weaveStart` + `weaveRootWait`;
+  `weaveRootWait` 现在就是 weave 版的假时钟推进循环(见 §5.B.1 与 design D11)。
 
 ### chan / select —— `src/runtime/chan.go` / `select.go`
 - chan:`chansend`/`chanrecv`/`closechan` 在**加锁前**插 `weaveSchedPoint`。阻塞用
@@ -141,9 +141,12 @@
    `INCOMPLETE`,而非静默 ok)。
 
 ### B. goroutine 离开受控世界(I/O / 真实时间)
-1. **真实时间/定时器**:受控 bubble 内假时钟推进**被禁用**(D11)——`time.Sleep`/`time.After`/
-   `NewTimer`/`context.WithTimeout` 会误报死锁。用内存接缝替代(channel/select/`net.Pipe`/
-   `context.WithCancel`)。实证见 `weavedemo/asyncio_test.go`。
+1. **真实时间/定时器**:受控 bubble 内**已支持假时钟推进**(D11)——`weaveRootWait` 在全组 durably
+   blocked 且有 pending timer 时推进 `bubble.now`、`timers.check` 触发到期定时器(经 `ready`→
+   `weaveEnqueue` 唤醒参与者)。`time.Sleep`/`time.After`/`NewTimer`/`context.WithTimeout` 均可正常
+   工作(`weaveOnBlock`/`weaveOnGoexit` 用 `timers.wakeTime()>0` 区分推进时钟 vs 真死锁)。回归
+   `internal/weave` 的 `TestFakeClock*`。小限制:同 deadline 定时器触发顺序不单独枚举;永不停止的
+   `time.Tick` 无限推进时钟 → 受预算约束(Truncated)。
 2. **真实网络/文件 I/O**:须用内存 fake,继承 synctest 规矩。跨 bubble 通信保留 synctest 现有
    `fatal`(`send/recv on synctest channel from outside bubble`)。
 3. **泡泡外并发的显式检测**(`uncontrolled concurrency detected`)——**未实现**,roadmap 候选
@@ -178,7 +181,7 @@
 | 抢占看门狗(死循环兜底)| ⬜ | 见 §5.A.2 |
 | 泡泡外并发显式检测 + undo-log 跨 run 重置 | ⬜ | 见 design D9 |
 | 并行探索(多 worker 跑子树)、状态空间估计 | ⬜ | UX |
-| 受控 bubble 内假时钟推进 | ⬜ | 已知限制 D11 |
+| 受控 bubble 内假时钟推进(time.Sleep/After/timer/context.WithTimeout)| ✅ | `weaveRootWait`;`TestFakeClock*` |
 | 死锁泄漏清理 | ⬜ | 已知限制(与 synctest 一致,可接受)|
 
 ---
@@ -190,7 +193,8 @@
   被插桩)。
 - **GC/finalizer/系统 goroutine 不入 bubble**,天然不受影响;但 GC **抢占**会同步打断持令牌的
   参与者——已正确处理(D10:排除 `waitReasonPreempted`,`weaveBlocked` 前置)。
-- **假时钟禁用**(D11):`time.Sleep`/定时器误报死锁,用内存接缝。
+- **假时钟已支持**(D11):`time.Sleep`/`time.After`/`NewTimer`/`context.WithTimeout` 在受控 bubble
+  内正常推进;仅同 deadline 定时器触发序不枚举、永不停止的 ticker 受预算约束。
 - **`-weave` 下重内存/热循环用例状态空间爆炸**:如 `weavedemo/gcrepro_test.go` 的 GC 抢占压力
   测试(200 轮 × 长 spin),`-weave` 下每次内存访问成调度点会撑到超时。它测的是令牌在 GC 抢占下
   的健壮性、非数据竞争,故用 `weave` 构建标签跳过、并 `-short` 降迭代。

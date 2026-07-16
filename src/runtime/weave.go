@@ -65,15 +65,16 @@ type weaveControl struct {
 	runnableSize   [weaveMaxRunnable]uintptr // pending memory op's access width (bytes); 0 for non-memory ops
 	nrun           int                       // number of valid entries
 
-	nextWid    int32  // next participant id to assign
-	live       int    // participants enrolled and not yet exited
-	done       bool   // all participants have exited
-	deadlock   bool   // some remain but none can run
-	rootParked bool   // root goroutine is parked in weaveRootWait
-	waiter     *g     // participant parked in weave.Wait, or nil
-	randState  uint64 // deterministic RNG state for this run
-	panicked   bool   // a participant panicked
-	panicValue any    // the recovered panic value
+	nextWid      int32  // next participant id to assign
+	live         int    // participants enrolled and not yet exited
+	done         bool   // all participants have exited
+	deadlock     bool   // some remain but none can run
+	advanceClock bool   // no participant is runnable but a timer is pending; root must advance the fake clock
+	rootParked   bool   // root goroutine is parked in weaveRootWait
+	waiter       *g     // participant parked in weave.Wait, or nil
+	randState    uint64 // deterministic RNG state for this run
+	panicked     bool   // a participant panicked
+	panicValue   any    // the recovered panic value
 
 	// Exploration state. plan forces, at scheduling point i, the wid to run
 	// (plan[i]); beyond len(plan) the lowest runnable wid is chosen. The trace
@@ -392,7 +393,14 @@ func weaveOnBlock(bubble *synctestBubble) {
 		weaveGrant(next)
 		return
 	}
-	ctl.deadlock = true
+	// No participant is runnable. If a timer is pending, the bubble is not
+	// deadlocked: the fake clock can advance and fire it, waking a participant.
+	// The root drives that (weaveRootWait). Otherwise it is a real deadlock.
+	if bubble.timers.wakeTime() > 0 {
+		ctl.advanceClock = true
+	} else {
+		ctl.deadlock = true
+	}
 	wake := ctl.rootParked
 	ctl.rootParked = false
 	unlock(&bubble.mu)
@@ -422,6 +430,10 @@ func weaveOnGoexit(bubble *synctestBubble) {
 	}
 	if ctl.live == 0 {
 		ctl.done = true
+	} else if bubble.timers.wakeTime() > 0 {
+		// Participants remain but none is runnable; a pending timer can still make
+		// progress once the fake clock advances (driven by the root).
+		ctl.advanceClock = true
 	} else {
 		ctl.deadlock = true
 	}
@@ -584,16 +596,59 @@ func weaveGrant(gp *g) {
 	releasem(mp)
 }
 
-// weaveRootWait parks the root goroutine until the controller reports the bubble
-// finished or deadlocked.
+// weaveRootWait drives the controlled bubble from the root goroutine: it parks
+// until the controller reports the bubble finished or deadlocked, and — when the
+// bubble is quiescent but a timer is pending — advances the fake clock and fires
+// due timers so time.Sleep/time.After/timers make progress under weave. This is
+// the analogue of synctest's fake-time quiescence loop, integrated with the
+// run-token handoff.
 func weaveRootWait(bubble *synctestBubble) {
+	root := getg()
+	ctl := bubble.weaveCtl
 	for {
 		lock(&bubble.mu)
-		fin := bubble.weaveCtl.done || bubble.weaveCtl.deadlock
-		unlock(&bubble.mu)
-		if fin {
+		if ctl.done || ctl.deadlock {
+			unlock(&bubble.mu)
 			return
 		}
+		if ctl.advanceClock {
+			// All participants are durably blocked but a timer is pending. Advance
+			// the fake clock to the next deadline and fire the due timers; their
+			// callbacks wake participants via ready -> weaveEnqueue. Then grant the
+			// token to one of them and resume driving.
+			ctl.advanceClock = false
+			if next := bubble.timers.wakeTime(); next > bubble.now {
+				bubble.now = next
+			}
+			unlock(&bubble.mu)
+			// Clear m.curg while running timers so timer goroutines inherit their
+			// race context from g0, as synctest does.
+			systemstack(func() {
+				curg := root.m.curg
+				root.m.curg = nil
+				bubble.timers.check(bubble.now, bubble)
+				root.m.curg = curg
+			})
+			lock(&bubble.mu)
+			next := weaveTake(ctl)
+			if next != nil {
+				unlock(&bubble.mu)
+				weaveGrant(next)
+				continue
+			}
+			// The timers fired but woke no participant. Decide the next state.
+			switch {
+			case ctl.live == 0:
+				ctl.done = true
+			case bubble.timers.wakeTime() > 0:
+				ctl.advanceClock = true // more timers remain; advance again
+			default:
+				ctl.deadlock = true
+			}
+			unlock(&bubble.mu)
+			continue
+		}
+		unlock(&bubble.mu)
 		gopark(weaveRootPark, unsafe.Pointer(bubble), waitReasonSynctestRun, traceBlockSynctest, 0)
 	}
 }
@@ -606,7 +661,10 @@ func weaveRootWait(bubble *synctestBubble) {
 func weaveRootPark(gp *g, arg unsafe.Pointer) bool {
 	b := (*synctestBubble)(arg)
 	lock(&b.mu)
-	if b.weaveCtl.done || b.weaveCtl.deadlock {
+	// Decline to park (root loops and re-checks) if the bubble finished,
+	// deadlocked, or needs the clock advanced — the last closes the
+	// wake-before-park race for a timer signalled just before the root parks.
+	if b.weaveCtl.done || b.weaveCtl.deadlock || b.weaveCtl.advanceClock {
 		unlock(&b.mu)
 		return false
 	}

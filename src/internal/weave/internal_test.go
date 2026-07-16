@@ -5,9 +5,89 @@
 package weave
 
 import (
+	"context"
 	"sync"
 	"testing"
+	"time"
 )
+
+// Fake-clock advancement: a participant that sleeps must be released by the
+// controller advancing the bubble's fake clock, not deadlock. If the clock did
+// not advance, the receive below would block forever and Run would panic with a
+// deadlock.
+func TestFakeClockSleepCompletes(t *testing.T) {
+	Run(func() {
+		ch := make(chan bool, 1)
+		go func() {
+			time.Sleep(time.Second)
+			ch <- true
+		}()
+		<-ch
+	})
+	t.Log("time.Sleep released by fake-clock advancement")
+}
+
+// Timers fire in deadline order: the 1s sleeper wakes before the 2s sleeper.
+func TestFakeClockDeadlineOrder(t *testing.T) {
+	Run(func() {
+		ch := make(chan int, 2)
+		go func() { time.Sleep(2 * time.Second); ch <- 2 }()
+		go func() { time.Sleep(1 * time.Second); ch <- 1 }()
+		a := <-ch
+		b := <-ch
+		if a != 1 || b != 2 {
+			panic("timers fired out of deadline order")
+		}
+	})
+	t.Log("timers fired in deadline order")
+}
+
+// A select with a time.After timeout: when the worker is slower than the
+// timeout, fake-clock advancement fires the earlier (timeout) timer, so the
+// timeout branch is taken. Without clock advancement this select would deadlock.
+func TestFakeClockTimeoutFires(t *testing.T) {
+	Run(func() {
+		result := make(chan int, 1)
+		go func() { time.Sleep(2 * time.Second); result <- 42 }()
+		var outcome string
+		select {
+		case <-result:
+			outcome = "result"
+		case <-time.After(time.Second):
+			outcome = "timeout"
+		}
+		if outcome != "timeout" {
+			panic("expected the 1s timeout to fire before the 2s worker")
+		}
+	})
+	t.Log("time.After timeout reachable under fake-clock advancement")
+}
+
+// context.WithTimeout is timer-backed; it must also fire under weave.
+func TestFakeClockContextTimeout(t *testing.T) {
+	Run(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		<-ctx.Done()
+		if ctx.Err() != context.DeadlineExceeded {
+			panic("context did not time out")
+		}
+	})
+	t.Log("context.WithTimeout fires under fake-clock advancement")
+}
+
+// A genuine deadlock with no pending timer must still be reported as a deadlock,
+// not mistaken for a clock-advance opportunity.
+func TestFakeClockNoTimerStillDeadlock(t *testing.T) {
+	res := Explore(func() {
+		ch := make(chan int) // unbuffered, no sender
+		<-ch
+	})
+	if !res.Deadlock {
+		t.Fatalf("expected deadlock with no timer, got %+v", res)
+	}
+	t.Log("no-timer block still reported as deadlock")
+}
 
 // The classic AB/BA lock-ordering deadlock in real sync.Mutexes. DPOR does not
 // yet record mutex operations, so this uses exhaustive exploration; the Yield

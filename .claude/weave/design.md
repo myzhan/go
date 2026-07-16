@@ -292,16 +292,22 @@ weave 测试。成本靠运行时门控(`weaveActive()` + `weaveGloballyActive` 
 分支回退。仅改 `proc.go`,非受控 bubble 零影响。实证:`TestSyncPrimitivesExplorable` 由 ~1/20
 flaky → 60/60。是 GC-抢占家族的最后残余。
 
-### D11 — 受控 bubble 内禁用假时钟推进
-`synctestRun1` 在 controlled 分支直接走 `weaveRootWait` 并 return,**跳过 synctest 的假时钟推进
-循环**;且 `incActive`/`decActive` 对受控 bubble 早退。**后果(已实证)**:`weave.Test` 内
-`time.Sleep`/`time.After`/`NewTimer`/`context.WithTimeout` 会注册假定时器但 `bubble.now` 永不
-推进 → 定时器不触发 → 永久 park → **误报死锁**。**决策**:暂不融合假时钟推进(与调度枚举交互
-复杂),保持"先禁用"。这是**明确边界**而非缺陷,与 loom/Coyote/synctest 同源——时间/IO 用**可被
-weave 探索的内存接缝**建模:channel、select、sync 原语、`net.Pipe`、`context.WithCancel`
-(channel/mutex 实现,可用;`context.WithTimeout` 走定时器,不可用)。实证见
-`weavedemo/asyncio_test.go`。**未来**:可在控制器里集成——当所有参与者 durably blocked 且仅剩
-定时器可推进时,由控制器推进 `bubble.now` 并把到期定时器作为调度点纳入枚举(roadmap 候选)。
+### D11 — 受控 bubble 内的假时钟推进(原禁用,现已支持)
+**历史(已废弃)**:早期 `synctestRun1` 的 controlled 分支直接走 `weaveRootWait` 并 return,跳过
+synctest 的假时钟推进循环 → `time.Sleep`/`time.After`/`NewTimer`/`context.WithTimeout` 注册的假
+定时器永不触发 → 永久 park → **误报死锁**。当时决策是"先禁用",时间/IO 用内存接缝(channel/
+select/`context.WithCancel`)建模。
+
+**现状(已实现)**:`weaveRootWait` 现在**就是** weave 版的静止推进循环。当所有参与者 durably
+blocked、无 runnable、但有 pending timer 时,控制器(root)把 `bubble.now` 推进到下一个到期时刻、
+调 `bubble.timers.check` 触发到期定时器;定时器回调经 `ready`→`weaveEnqueue` 唤醒参与者,再由
+run-token 交回令牌。只有"无 runnable 且无 pending timer"才是真死锁(`weaveOnBlock`/`weaveOnGoexit`
+用 `bubble.timers.wakeTime()>0` 区分 advanceClock 与 deadlock)。于是 `time.Sleep`/`time.After`/
+`NewTimer`/`context.WithTimeout` 在 `weave.Test` 内**可正常工作**。定时器**触发顺序**沿用 synctest
+的定时器堆(deadline)序(确定性,不新增 seed 维度);被唤醒参与者的**运行顺序**仍由 DPOR 在普通
+调度点枚举。**小限制**:同一 deadline 的多个定时器的触发顺序不单独枚举;永不停止的 `time.Tick`
+会无限推进时钟 → 探索受调度/时间预算约束(超限报 Truncated)。回归见 `internal/weave` 的
+`TestFakeClock*`。
 
 ---
 
@@ -312,4 +318,3 @@ weave 探索的内存接缝**建模:channel、select、sync 原语、`net.Pipe`�
 - 基于 `weavewrite` 钩子的 **undo-log 自动重置**:回滚粒度、只覆盖插桩内存的边界、开销。
 - 弱内存(atomic C11 重排 / read-from 枚举)与 DPOR 的组合,复杂度可控性待验证。
 - 状态空间预算/超时的默认策略与用户可调项;是否提供并行探索(多 worker 跑不同子树)。
-- 受控 bubble 内假时钟推进的融合(见 D11 未来)。
