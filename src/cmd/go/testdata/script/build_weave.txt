@@ -8,6 +8,15 @@ go build -n -weave -gcflags=-N .
 stderr 'compile.* -weave .*main\.go'
 stderr 'compile.* -N .*main\.go'
 
+# -weave instruments only the command-line package, not its dependencies:
+# instrumenting sync/runtime internals would turn their private memory operations
+# into scheduling points and break DPOR's transition reduction. Force a full
+# rebuild so dependencies are recompiled and check that the command-line package
+# gets -weave while the sync dependency does not.
+go build -a -n -weave .
+stderr 'compile.* -p main .* -weave'
+! stderr 'compile.* -p sync .* -weave'
+
 # -weave defines the "weave" build tag.
 go list -weave -f '{{.GoFiles}}' .
 stdout 'weave_only.go'
@@ -20,9 +29,14 @@ go 1.25
 -- main.go --
 package main
 
+import "sync"
+
 func main() {
+	var mu sync.Mutex
+	mu.Lock()
 	x := 0
 	_ = x
+	mu.Unlock()
 }
 
 -- weave_only.go --

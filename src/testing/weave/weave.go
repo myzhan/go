@@ -47,7 +47,6 @@ import (
 	"internal/weave"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -103,16 +102,17 @@ func Test(t *testing.T, f func()) {
 
 	if seed := os.Getenv("WEAVE_REPLAY"); seed != "" {
 		res := weave.Replay(seed, f)
-		switch {
-		case res.Failed, res.Deadlock:
-			t.Errorf("weave: replayed interleaving (seed %s):\n%s%s%s",
-				seed, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res))
-		case res.Truncated:
+		if !replayInconclusive(res) {
+			t.Logf("weave: replayed seed %s, no failure", seed)
+			return
+		}
+		if res.Truncated {
 			// The replayed schedule overflowed the trace/participant capacity, so
 			// it did not run to completion; "no failure" would be a false pass.
 			t.Errorf("weave: replay INCOMPLETE (seed %s): %s", seed, res.TruncatedReason)
-		default:
-			t.Logf("weave: replayed seed %s, no failure", seed)
+		} else {
+			t.Errorf("weave: replayed interleaving (seed %s):\n%s%s%s",
+				seed, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res))
 		}
 		return
 	}
@@ -187,15 +187,41 @@ func traceNeedsWeave(trace []weave.Step) bool {
 func runPattern(name string) string {
 	parts := strings.Split(name, "/")
 	for i, p := range parts {
-		parts[i] = "^" + regexp.QuoteMeta(p) + "$"
+		parts[i] = "^" + quoteMeta(p) + "$"
 	}
 	return strings.Join(parts, "/")
+}
+
+// quoteMeta escapes regexp metacharacters in s (matching regexp.QuoteMeta), so a
+// test name is matched literally by -run. Inlined rather than importing regexp,
+// to keep testing/weave's dependency set minimal (see go/build/deps_test.go).
+func quoteMeta(s string) string {
+	const special = `\.+*?()|[]{}^$`
+	var b strings.Builder
+	b.Grow(2 * len(s))
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; strings.IndexByte(special, c) >= 0 {
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // shellSingleQuote wraps s in single quotes, escaping embedded single quotes, so
 // it is a single safe shell word regardless of characters like '|' or '$'.
 func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// replayInconclusive reports whether a replayed result must fail the test rather
+// than be reported as a clean pass: a panic or deadlock is a reproduced failure,
+// and a truncated replay did not run to completion (capacity overflow), so
+// treating it as "no failure" would be a false green light.
+func replayInconclusive(res weave.Result) bool {
+	return res.Failed || res.Deadlock || res.Truncated
 }
 
 func outcomeMsg(res weave.Result) string {

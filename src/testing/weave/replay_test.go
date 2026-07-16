@@ -32,6 +32,24 @@ func TestResolveTimeout(t *testing.T) {
 	}
 }
 
+// A replayed result must fail the test unless it ran cleanly to completion. In
+// particular a Truncated replay (capacity overflow) is inconclusive and must not
+// be reported as a silent pass.
+func TestReplayInconclusive(t *testing.T) {
+	if replayInconclusive(weave.Result{}) {
+		t.Errorf("a clean replay result must not be inconclusive")
+	}
+	for _, res := range []weave.Result{
+		{Failed: true},
+		{Deadlock: true},
+		{Truncated: true},
+	} {
+		if !replayInconclusive(res) {
+			t.Errorf("result %+v must be treated as inconclusive (not a silent pass)", res)
+		}
+	}
+}
+
 // The reproduce command must be a single safe shell line: a select seed contains
 // '|', which must be quoted so the shell does not treat it as a pipe; the -run
 // pattern must escape regexp metacharacters per name segment; and -weave is added
