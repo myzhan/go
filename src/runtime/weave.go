@@ -461,6 +461,15 @@ func weaveSchedPoint(op weaveOp, id unsafe.Pointer) {
 
 func weaveSchedPointSlow(op weaveOp, id unsafe.Pointer, size, pc uintptr, val uint64, valSet bool) {
 	gp := getg()
+	// If the participant is holding a runtime lock or is procPinned (m.locks!=0),
+	// we cannot park here: gopark -> schedule would hit "schedule: holding locks".
+	// Such regions (e.g. sync.Pool's procPin, runtime lock sections) are
+	// non-preemptible in real execution, so declining to interleave inside them
+	// is also semantically correct — the goroutine simply performs the memory op
+	// without yielding, exactly as it would under the real scheduler.
+	if gp.m.locks != 0 {
+		return
+	}
 	bubble := gp.bubble
 	ctl := bubble.weaveCtl
 	lock(&bubble.mu)

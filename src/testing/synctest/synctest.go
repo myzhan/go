@@ -287,6 +287,12 @@ import (
 //     associated with the bubble.
 //   - T.Run, T.Parallel, and T.Deadline must not be called.
 func Test(t *testing.T, f func(*testing.T)) {
+	// Under -weave, run f through weave's systematic interleaving exploration
+	// instead of a single synctest pass. weaveExplore is a no-op returning false
+	// in non-weave builds, so ordinary `go test` keeps the single-run behavior.
+	if weaveExplore(t, f) {
+		return
+	}
 	var ok bool
 	synctest.Run(func() {
 		ok = testingSynctestTest(t, f)

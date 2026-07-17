@@ -10,7 +10,7 @@
 // weave is always compiled in and runs under a plain `go test`; it has no effect
 // unless a controlled bubble is created via Run/Explore.
 //
-// This is not a public API; testing/weave wraps it.
+// This is not a public API; testing/synctest drives it under -weave.
 package weave
 
 import _ "unsafe" // for linkname

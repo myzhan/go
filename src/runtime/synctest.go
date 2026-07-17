@@ -326,6 +326,15 @@ func synctestWait() {
 	if gp.bubble == nil {
 		panic("goroutine is not in a bubble")
 	}
+	if gp.bubble.controlled {
+		// Under weave's controlled scheduler the bubble's running/active
+		// accounting is owned by the run token, so the ordinary synctest wait
+		// (synctestwait_c) would trip its "running == 0 && active == 0" assertion.
+		// Route to weave's barrier instead: wait until every other participant
+		// has finished. This makes synctest.Wait() work unchanged under -weave.
+		weaveWait()
+		return
+	}
 	lock(&gp.bubble.mu)
 	// We use a bubble.waiting bool to detect simultaneous calls to Wait rather than
 	// checking to see if bubble.waiter is non-nil. This avoids a race between unlocking

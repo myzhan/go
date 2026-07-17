@@ -19,8 +19,8 @@ weave 是一个**单元级、封闭(hermetic)的并发交错验证器**:让一�
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ L4  testing/weave      weave.Test(t, f) · Yield · Wait         │  公共 API
-│                        失败报告(trace + 图例 + seed)          │
+│ L4  testing/synctest    synctest.Test(t, f) + `go test -weave`  │  公共 API(=标准库)
+│                        失败报告(trace + 图例 + seed)          │  无 weave 专属 API
 ├──────────────────────────────────────────────────────────────┤
 │ L3  internal/weave     DPOR 探索引擎:跨 run 枚举交错          │  纯 Go,跑在 root/driver
 │                        happens-before · conflict · seed 复现   │
@@ -39,15 +39,17 @@ weave 是一个**单元级、封闭(hermetic)的并发交错验证器**:让一�
 - **L1 是可选增强**:`-weave` 构建档把普通内存读写也变成调度点,让 DPOR 枚举数据竞态维度。
   仅在需要探索 plain 变量竞争(如无锁的丢更新)时才需要。
 - **L3 是引擎**:纯 Go,不依赖 runtime 内部;经 `//go:linkname` 由 L2 提供的原语驱动。
-- **L4 是入口**:镜像 `testing/synctest`,把引擎结果渲染成可读的失败报告。
+- **L4 是入口**:**就是标准库 `testing/synctest`**——`-weave` 下 `synctest.Test` 改派到 L3 探索引擎
+  (`weave_off.go`/`weave.go` 按 `weave` build tag 分流),失败结果渲染成可读报告。不再有独立的
+  `testing/weave` 包(见 design.md D12)。
 
 ## 端到端数据流
 
-一次 `weave.Test(t, f)` 的完整流动:
+一次 `synctest.Test(t, f)` 在 `-weave` 下的完整流动:
 
 ```
-weave.Test(t, f)                              [L4]
-  └─ internal/weave.Explore(f)                [L3] DPOR 主循环,反复调用:
+synctest.Test(t, f)  [-weave]                 [L4] weaveExplore → testingWeaveTest(f 作为 root 内联跑)
+  └─ internal/weave.ExploreBounded(body)      [L3] DPOR 主循环,反复调用:
        └─ runSchedule(f, plan, trace...)       ── linkname ──▶ runtime.weaveRunSchedule  [L2]
             └─ 建 controlled synctest bubble,把 f 作为主参与者(parked)
                授予 run token,进入 run-token 调度:
@@ -122,7 +124,8 @@ choke point,可廉价运行时门控。只有 L1 内存插桩遍布每次访问,
 
 | 命令 | 覆盖 | 说明 |
 |---|---|---|
-| `go test`(无 flag) | chan/select/mutex/rwmutex/waitgroup/cond/once + `weave.Yield` | L2 始终在,`weave.Test` 直接可用 |
+| `go test`(无 flag) | 一次普通 `synctest.Test` 单跑(不探索) | 标准库行为不变 |
+| `go test -weave` | 同一 `synctest.Test` 用例 → 系统交错探索(含普通内存维度) | L1 插桩 + `synctest.Test` 改派 L3 |
 | `go test -weave` | 上述 + **普通内存读写**(plain 变量、结构体字段、切片元素…) | L1 内存插桩,探索数据竞态;与 `-race`/`-msan`/`-asan` 互斥 |
 
 `-weave` 等价于对命令行包加 `-gcflags=-weave` 并定义 `weave` 构建标签(仿 `-race` 定义 `race`)。

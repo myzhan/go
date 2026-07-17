@@ -1,3 +1,0 @@
-pkg testing/weave, func Test(*testing.T, func()) #99999
-pkg testing/weave, func Wait() #99999
-pkg testing/weave, func Yield() #99999

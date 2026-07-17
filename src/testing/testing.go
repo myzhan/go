@@ -2310,6 +2310,66 @@ func testingSynctestTest(t *T, f func(*T)) (ok bool) {
 	return !t2.failed
 }
 
+var errWeaveScheduleFailed = errors.New("weave: schedule failed")
+
+// testingWeaveTest runs f as the body of one weave exploration schedule. Unlike
+// testingSynctestTest it does NOT start a child goroutine: f runs inline in the
+// calling goroutine, which is weave's bubble root, so synctest.Wait()/weave.Wait()
+// wait only for the goroutines f itself starts (running f in a child goroutine
+// would make this caller a phantom participant that weave.Wait deadlocks on).
+//
+// A test failure — t.Fail/FailNow/Error/Fatal (Fatal/FailNow run runtime.Goexit)
+// or a panic in f — is re-surfaced as a panic so the weave engine records the
+// schedule as a failing interleaving. It is only used under -weave.
+//
+//go:linkname testingWeaveTest testing/synctest.testingWeaveTest
+func testingWeaveTest(t *T, f func(*T)) {
+	if t.cleanupStarted.Load() {
+		panic("testing: synctest.Test called during t.Cleanup")
+	}
+
+	var pc [maxStackLen]uintptr
+	n := runtime.Callers(2, pc[:])
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	t2 := &T{
+		common: common{
+			barrier:    make(chan bool),
+			signal:     make(chan bool, 1),
+			name:       t.name,
+			parent:     &t.common,
+			level:      t.level + 1,
+			creator:    pc[:n],
+			chatty:     t.chatty,
+			ctx:        ctx,
+			cancelCtx:  cancelCtx,
+			isSynctest: true,
+		},
+		tstate: t.tstate,
+	}
+
+	completed := false
+	defer func() {
+		rec := recover()
+		// Run any cleanups f registered (best effort); a cleanup panic wins if
+		// f itself did not already panic.
+		if cp := t2.runCleanup(recoverAndReturnPanic); cp != nil && rec == nil {
+			rec = cp
+		}
+		cancelCtx()
+		switch {
+		case rec != nil:
+			panic(rec) // preserve f's panic; weave records the failing schedule
+		case !completed || t2.failed:
+			// f ran runtime.Goexit (Fatal/FailNow) or marked the test failed.
+			panic(errWeaveScheduleFailed)
+		}
+	}()
+
+	f(t2)
+	completed = true
+}
+
 // Deadline reports the time at which the test binary will have
 // exceeded the timeout specified by the -timeout flag.
 //

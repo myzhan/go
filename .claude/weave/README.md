@@ -23,47 +23,53 @@ I/O 与时钟)同样适用。
 已达到**可用里程碑**:未改写的真实 `chan`/`select`/`sync.Mutex`/`RWMutex`/`WaitGroup`/`Cond`/
 `Once` + 普通内存(`-weave`)代码可被系统性交错探索;DPOR(含差分健全性验证 + 抢占上界)、
 select-case 枚举、非阻塞 channel 操作、RNG/map 序确定化、panic 捕获、失败 seed 重放 + 源码行号 +
-goroutine 图例 + 读写值显示均已落地。**唯一大缺口**:`sync/atomic` 插桩(无锁代码探索不了)。
+goroutine 图例 + 读写值显示均已落地。**API 已精简**:不再有 `testing/weave`/`weave.Test`——直接用
+标准 `testing/synctest.Test`,`-weave` 下自动进入探索(ADR D12)。**唯一大缺口**:`sync/atomic`
+插桩(无锁代码探索不了)。
 
 详细能力清单与里程碑见 [imp.md](imp.md) §1、§6。
 
 ## 快速跑通
 
 ```sh
-# 核心引擎(无 -weave;chan/mutex/select 等已是调度点)
-cd src && ../bin/go test internal/weave/ testing/weave/
-
-# 含普通内存插桩的健全性套件
+# 核心引擎 + 健全性套件
+cd src && ../bin/go test internal/weave/ testing/synctest/
 cd src && ../bin/go test -weave internal/weave/
 
-# 演示模块(部分用例为故意失败,以展示 weave 抓 bug + 打印 seed)
+# 演示模块:全部是普通 testing/synctest 用例,加 -weave 即进入系统交错探索
+# (部分用例为故意失败,展示 weave 抓 bug + 打印 seed)
 cd weavedemo && ../bin/go test -weave -v
 ```
 
 失败时打印逐步交错 + goroutine 图例 + 一个 seed,例如:
 
 ```
-reproduce with: WEAVE_REPLAY=0.0.0.0.1.1.0.0.0.0.0 go test -run TestLostUpdate -v
+reproduce with: WEAVE_REPLAY=0.0.0.0.1.1.0.0.0.0.0 go test -weave -run '^TestLostUpdate$'
 ```
 
 用该 seed 可确定性重放逐字节相同的交错。
 
 ## 用户如何写测试
 
+**没有 weave 专属 API**——就写标准 `testing/synctest` 用例,加 `go test -weave` 即让同一个用例
+跑进系统化交错探索(类比 `-race` 是模式而非 API,见 [design.md](design.md) D12)。
+
 ```go
 func TestCounter(t *testing.T) {
-    weave.Test(t, func() {               // testing/weave,真实类型、零改写
+    synctest.Test(t, func(t *testing.T) {   // 标准库 testing/synctest,真实类型、零改写
         var x int
         var mu sync.Mutex
         go func() { mu.Lock(); x++; mu.Unlock() }()
         go func() { mu.Lock(); x++; mu.Unlock() }()
-        weave.Wait()                     // 等其余参与者退出后再断言
+        synctest.Wait()                      // 等其余 goroutine 退出后再断言
         if x != 2 { t.Errorf("x = %d, want 2", x) }
     })
 }
 ```
 
+`go test`(不带 -weave)= 一次普通 synctest 单跑;`go test -weave` = 同一用例的系统交错探索。
+
 约束(同 loom/synctest):模型闭包必须**可重跑**(共享状态在闭包内声明)、除调度外**确定性**
-(勿用 `rand`/真实时间/依赖 map 迭代序)、所有 goroutine 必须能结束。时间/IO 用可被 weave 探索的
-**内存接缝**建模(channel/select/`net.Pipe`/`context.WithCancel`);`time.Sleep`/定时器/
-`context.WithTimeout` 在受控 bubble 内不可用(会误报死锁,见 [design.md](design.md) D11)。
+(勿用 `rand`/依赖 map 迭代序)、所有 goroutine 必须能结束。时间/定时器由 synctest 假时钟驱动,
+`time.Sleep`/`time.After`/`context.WithTimeout` 在受控 bubble 内**可正常工作**(见 [design.md](design.md)
+D11);仍建议用 channel/`context.WithCancel` 等内存接缝让交错更显式。

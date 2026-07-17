@@ -120,7 +120,8 @@ Flags:
 		Remove prefix from recorded source file paths.
 	-weave
 		Instrument memory accesses so they become scheduling points for the
-		weave interleaving explorer (see testing/weave). Analogous to -race.
+		weave interleaving explorer, which runs testing/synctest tests under
+		systematic schedule exploration. Analogous to -race.
 
 Flags related to debugging information:
 

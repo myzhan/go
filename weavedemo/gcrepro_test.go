@@ -4,7 +4,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
-	"testing/weave"
+	"testing/synctest"
 	"time"
 )
 
@@ -25,13 +25,18 @@ func spin(n int) uint64 {
 var spinSink uint64
 
 // TestGCPreemptHolder stresses the interaction between GC stack-scan preemption
-// and weave's run token. A participant holds the token while spinning long
+// and the bubble scheduler: a goroutine holds the scheduler while spinning long
 // enough that a concurrent, out-of-bubble runtime.GC() will suspendG it in
-// _Grunning and drive it through _Gpreempted -> ready. If weave loses the token
-// on that resume, the run hangs.
+// _Grunning and drive it through _Gpreempted -> ready.
+//
+// It is written as an ordinary synctest test. Under -weave it is skipped:
+// memory instrumentation over the long spin explodes exploration to a timeout,
+// and this test targets GC-preemption robustness, not data races. The deeper
+// regression for weave's run token specifically (ADR D10) lives with the engine
+// in internal/weave.
 func TestGCPreemptHolder(t *testing.T) {
 	if builtWithWeave {
-		t.Skip("prohibitively slow under -weave memory instrumentation; this stress test exercises the run token under GC preemption, not data races, so run it without -weave")
+		t.Skip("prohibitively slow under -weave memory instrumentation; this stress test exercises the scheduler under GC preemption, not data races, so run it without -weave")
 	}
 	iters := 200
 	if testing.Short() {
@@ -57,21 +62,21 @@ func TestGCPreemptHolder(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 
 	for iter := 0; iter < iters; iter++ {
-		weave.Test(t, func() {
+		synctest.Test(t, func(t *testing.T) {
 			var mu sync.Mutex
 			x := 0
 			inc := func() {
 				mu.Lock()
-				spinSink = spin(200000) // hold the token, spinning, GC can catch it
+				spinSink = spin(200000) // hold the scheduler, spinning, GC can catch it
 				x = x + 1
 				mu.Unlock()
 			}
 			go inc()
 			go inc()
 			go inc()
-			weave.Wait()
+			synctest.Wait()
 			if x != 3 {
-				panic("lost update under GC")
+				t.Fatal("lost update under GC")
 			}
 		})
 	}

@@ -1,36 +1,43 @@
 // Package weavedemo shows the final weave test form: ordinary Go concurrency
-// code — real `go func()`, real sync.Mutex, real channels, plain int — with no
-// special primitives. weave systematically explores the goroutine interleavings.
+// code — real `go func()`, real sync.Mutex, real channels, plain int — written
+// as STANDARD testing/synctest tests, with no weave-specific API.
 //
-// Run with the built toolchain. The -weave flag enables memory instrumentation
-// so that ordinary reads/writes become scheduling points (needed only for
-// data-race tests like TestLostUpdate; channel/mutex tests work without it):
+// Run the ordinary way for a single deterministic synctest pass:
+//
+//	../bin/go test -v
+//
+// Add -weave to turn the SAME synctest tests into systematic interleaving
+// exploration. The -weave flag defines the "weave" build tag and enables memory
+// instrumentation, so ordinary reads/writes become scheduling points (needed for
+// data-race tests like TestLostUpdate; channel/mutex tests explore without it):
 //
 //	../bin/go test -weave -v
 //
-// TestLostUpdate and TestDeadlock are EXPECTED TO FAIL: that failure is weave
-// reporting the bug, printing the exact interleaving and a seed to reproduce it
-// with WEAVE_REPLAY. The other tests are correct code and pass.
+// TestLostUpdate, TestCheckThenActOverdraw and TestDeadlock are EXPECTED TO FAIL
+// under -weave: that failure is weave reporting the bug, printing the exact
+// interleaving and a seed to reproduce it with WEAVE_REPLAY. Without -weave a
+// single synctest schedule does not hit the buggy interleaving, so they pass.
+// The other tests are correct code and pass in both modes.
 package weavedemo
 
 import (
 	"sync"
 	"testing"
-	"testing/weave"
+	"testing/synctest"
 )
 
 // Lost update: two goroutines run x = x + 1 with no synchronization. Under
-// -gcflags=-weave the compiler turns the read and write of x into scheduling
-// points, so weave finds the interleaving that reads 0 in both goroutines and
-// leaves x == 1. EXPECTED TO FAIL (weave found the bug).
+// -weave the compiler turns the read and write of x into scheduling points, so
+// weave finds the interleaving that reads 0 in both goroutines and leaves
+// x == 1. EXPECTED TO FAIL under -weave (weave found the bug).
 func TestLostUpdate(t *testing.T) {
-	weave.Test(t, func() {
+	synctest.Test(t, func(t *testing.T) {
 		x := 0
 		go func() { x = x + 1 }()
 		go func() { x = x + 1 }()
-		weave.Wait() // join both goroutines before asserting
+		synctest.Wait() // wait for both goroutines to finish before asserting
 		if x != 2 {
-			panic("lost update")
+			t.Fatal("lost update")
 		}
 	})
 }
@@ -38,7 +45,7 @@ func TestLostUpdate(t *testing.T) {
 // The same increment guarded by a sync.Mutex is always correct: weave explores
 // every interleaving and finds no failure.
 func TestMutexProtected(t *testing.T) {
-	weave.Test(t, func() {
+	synctest.Test(t, func(t *testing.T) {
 		var mu sync.Mutex
 		x := 0
 		done := make(chan bool, 2)
@@ -53,18 +60,18 @@ func TestMutexProtected(t *testing.T) {
 		<-done
 		<-done
 		if x != 2 {
-			panic("lost update")
+			t.Fatal("lost update")
 		}
 	})
 }
 
 // A real unbuffered channel rendezvous always delivers the value.
 func TestChannelRendezvous(t *testing.T) {
-	weave.Test(t, func() {
+	synctest.Test(t, func(t *testing.T) {
 		ch := make(chan int)
 		go func() { ch <- 42 }()
 		if got := <-ch; got != 42 {
-			panic("bad value")
+			t.Fatal("bad value")
 		}
 	})
 }
@@ -76,9 +83,9 @@ func TestChannelRendezvous(t *testing.T) {
 // sees 40 < 60 and skips). But an interleaving where both read balance == 100
 // before either subtracts overdraws the account to -20. Under -weave the
 // reads/writes of balance are scheduling points, so weave finds it.
-// EXPECTED TO FAIL (weave reporting the overdraw, with a reproducing seed).
+// EXPECTED TO FAIL under -weave (weave reporting the overdraw, with a seed).
 func TestCheckThenActOverdraw(t *testing.T) {
-	weave.Test(t, func() {
+	synctest.Test(t, func(t *testing.T) {
 		balance := 100
 		withdraw := func(amount int) {
 			if balance >= amount { // check
@@ -87,9 +94,9 @@ func TestCheckThenActOverdraw(t *testing.T) {
 		}
 		go func() { withdraw(60) }()
 		go func() { withdraw(60) }()
-		weave.Wait()
+		synctest.Wait()
 		if balance < 0 {
-			panic("account overdrawn: balance went negative")
+			t.Fatal("account overdrawn: balance went negative")
 		}
 	})
 }
@@ -99,7 +106,7 @@ func TestCheckThenActOverdraw(t *testing.T) {
 // interleaving and confirms the balance never goes negative — a passing test
 // that shows weave verifying a fix, not just finding a bug.
 func TestCheckThenActGuarded(t *testing.T) {
-	weave.Test(t, func() {
+	synctest.Test(t, func(t *testing.T) {
 		var mu sync.Mutex
 		balance := 100
 		withdraw := func(amount int) {
@@ -111,19 +118,19 @@ func TestCheckThenActGuarded(t *testing.T) {
 		}
 		go func() { withdraw(60) }()
 		go func() { withdraw(60) }()
-		weave.Wait()
+		synctest.Wait()
 		if balance < 0 {
-			panic("account overdrawn: balance went negative")
+			t.Fatal("account overdrawn: balance went negative")
 		}
 	})
 }
 
-// Classic AB/BA lock-ordering deadlock in real sync.Mutexes. EXPECTED TO FAIL:
-// weave finds the interleaving where each goroutine holds one lock and blocks
-// waiting for the other. (No -weave needed: mutex operations are always
-// recorded.)
+// Classic AB/BA lock-ordering deadlock in real sync.Mutexes. EXPECTED TO FAIL
+// under -weave: weave finds the interleaving where each goroutine holds one lock
+// and blocks waiting for the other. (Mutex operations are always scheduling
+// points, so no memory instrumentation is required for this one.)
 func TestDeadlock(t *testing.T) {
-	weave.Test(t, func() {
+	synctest.Test(t, func(t *testing.T) {
 		var a, b sync.Mutex
 		go func() {
 			a.Lock()

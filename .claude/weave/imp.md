@@ -11,7 +11,7 @@
 ## 1. 现状速览(可用里程碑)
 
 **已达到可用**:未改写的真实 `chan`/`select`/`sync.Mutex`/`RWMutex`/`WaitGroup`/`Cond`/`Once` +
-普通内存(`-weave`)代码,可在 `weave.Test` 内被系统性交错探索,失败给出逐步 trace + goroutine
+普通内存(`-weave`)代码,可在 `synctest.Test`(`-weave`)内被系统性交错探索,失败给出逐步 trace + goroutine
 图例 + 可复现 seed。DPOR(含差分健全性验证 + 抢占计数上界)、select-case 枚举、非阻塞 channel
 操作、RNG/map 序确定化、spawned goroutine panic 捕获、`go test -weave` flag 均已落地。
 
@@ -91,9 +91,15 @@
 - source-DPOR 主循环:backtrack 集合 + select-case 枚举(`selD`/`selCase`);`exploreExhaustive`
   (odometer)做等价性对拍;`buildTrace`/`buildGoroutines`/`encodeSeed`/`decodeSeed`。
 
-### L4 API —— `src/testing/weave/weave.go`
-- `Test(t, f)` / `Yield` / `Wait`;`formatTrace`/`formatGoroutines` 渲染报告;截断报
-  `INCOMPLETE` + `t.Errorf`。
+### L4 API —— `src/testing/synctest/`(标准库,无 weave 专属包)
+- `synctest.Test(t, f)` / `synctest.Wait`——`-weave` 下由 `weave.go`(`//go:build weave`)的
+  `weaveExplore` 改派到 L3;`weave_off.go`(`//go:build !weave`)是 no-op(普通单跑)。`formatTrace`/
+  `formatGoroutines`/`replayCommand` 等富报告渲染现居于 `testing/synctest/weave.go`;截断报 `INCOMPLETE`。
+- `testing.testingWeaveTest`(linkname 到 testing/synctest):把 f **内联作为 bubble root** 跑并把
+  `t.Fatal/Error`/panic 失败转成 panic 供引擎捕获(不用 `testingSynctestTest` 的子 goroutine,避免幽灵
+  root 等待者导致的伪死锁 + 模型放大)。
+- `runtime.synctestWait`:受控 bubble(`bubble.controlled`)内路由到 `weaveWait`。
+- **`testing/weave` 包已删除**(见 design.md D12)。
 
 ### 演示 —— `weavedemo/`(独立 module)
 - `weave_test.go`(丢更新/加锁/channel/check-then-act/死锁)、`asyncio_test.go`(异步 IO/
@@ -172,7 +178,7 @@
 | 非阻塞 channel 操作作为调度点(no-HB) | ✅ | ChanSendNB/RecvNB |
 | RNG / map 迭代序确定化 | ✅ | `weaveRand`,select.go/rand.go |
 | spawned goroutine panic 捕获 | ✅ | `weaveGoWrapper` |
-| 失败 seed 重放 + 源码行号 + goroutine 图例 + 读写值 | ✅ | explore + testing/weave |
+| 失败 seed 重放 + 源码行号 + goroutine 图例 + 读写值 | ✅ | explore + testing/synctest |
 | 探索预算 / wall-clock 超时 / 截断显式上报 | ✅ | `ExploreBounded`/`Truncated` |
 | `-weave` 与 `-race`/`-msan`/`-asan` 互斥 | ✅ | `weaveInit` + compile 校验 |
 | **atomic 插桩** | ⬜ | 最大缺口,见 §1 |
@@ -188,6 +194,15 @@
 
 ## 7. 已知坑 / 注意事项
 
+- **持锁 / procPin 区内不得插调度点(已修,2026-07-16)**:`weaveSchedPointSlow` 若在 `gp.m.locks != 0`
+  时 `gopark`,会命中 `fatal error: schedule: holding locks`(schedule() 断言 m.locks==0)。触发场景:
+  被插桩的普通内存读写恰好落在一段 procPin / 持 runtime 锁的区间里——实测把整条 **gin `ServeHTTP`**
+  请求路径(Context `sync.Pool` 等)并发包进 `synctest.Test`(`-weave`)时必现。修复:`weaveSchedPointSlow` 开头
+  `if gp.m.locks != 0 { return }` 直接跳过调度点。**这是健全的**:持锁/pin 区在真实调度器下本就不可抢占,
+  weave 不在其中交错正好符合真实语义(少探这一点=更贴近现实,非漏报意义上的少边)。修后回归
+  `internal/weave` + `-weave` 套件全绿;之前崩溃的 gin 并发用例可探 4753 调度通过。
+
+
 - **快速路径钩子要极轻**:非受控 bubble 时必须一次判空即返回(nosplit 友好)。
 - **控制器自身不能递归触发 weaveSchedPoint**:driver / 非参与者的内存访问是 no-op(runtime 从不
   被插桩)。
@@ -197,9 +212,42 @@
   内正常推进;仅同 deadline 定时器触发序不枚举、永不停止的 ticker 受预算约束。
 - **`-weave` 下重内存/热循环用例状态空间爆炸**:如 `weavedemo/gcrepro_test.go` 的 GC 抢占压力
   测试(200 轮 × 长 spin),`-weave` 下每次内存访问成调度点会撑到超时。它测的是令牌在 GC 抢占下
-  的健壮性、非数据竞争,故用 `weave` 构建标签跳过、并 `-short` 降迭代。
+  的健壮性、非数据竞争,故用 `weave` 构建标签跳过、并 `-short` 降迭代。同理,包住重插桩库代码
+  (msgpack 编解码、crypto/hash 等)的多个 goroutine 若同时可运行,也会爆预算;实测经验是**一次只
+  让一个后台 goroutine 活跃**(对端阻塞在 channel 上、让重活单线程跑),可把调度数压回可探范围。
+- **map / runtime 调用不产生调度点 → 无锁 map 竞态漏报**:调度点只在被插桩的标量/结构体字段
+  load/store、channel、sync 原语处产生;**经 runtime 函数完成的访问(Go map `mapaccess`/`mapdelete`
+  等)不插桩、不成调度点**。故一个原子性违背若两个竞争访问**都落在 map 上**(无锁 check-then-act),
+  weave 会把整段当原子块 → **漏报**。对拍已证实(2026-07-16,ganc):同一 check-then-act 写在标量
+  bool 上 8 个调度即报出,写在 map 上探完判 ok。规避见 design.md §4"已知漏报边界";加锁即可覆盖
+  (mutex 本身是调度点)。
 - **非确定性来源**(模型需规避):GC/finalizer/`AddCleanup` 时序、`sync.Pool`、指针地址(ASLR/
   分配器/裸指针 hash)、cgo/外部进程——均不可控,模型不得依赖。
+- **monkey-patching 测试库(mockey)在当前原型工具链上链接失败——根因是 Go 版本,不是 weave 机制**:
+  `bytedance/mockey` 的 arm64 打桩汇编引用 `runtime.duffcopy`/`duffzero`,而本原型基于的 **go1.27-devel
+  已移除 arm64 的 Duff's device**(提交 `e4291e484c runtime: remove duff support for arm64`,`src/runtime/`
+  下已无 `duff_arm64.s`),故 arm64 上这两个符号不存在 → 链接期报 `relocation target runtime.duffcopy
+  not defined`。**实测(2026-07-16,kun/darwin-arm64):该失败在不带 `-weave` 时同样发生;go1.25.1 上
+  mockey 正常**,可见与 `-weave` / weave 机制无关,纯粹是 go1.27-arm64 移除了 duff 符号、mockey 尚未适配。
+  影响面:同目录所有 `_test.go` 编进同一个测试二进制,只要有兄弟测试(哪怕间接)引入 mockey,该包在
+  本工具链上就构建不了。**更完整的复盘(2026-07-16,对最新版 mockey `d48df59`)**:duff 那个坑新版
+  已修(1.26+ 走 `linkname.FuncPCForName("runtime.duffcopy")` 运行期软查找、符号不存在则降级,取代旧版
+  链接期硬引用);但最新 mockey **整体仍不支持 go1.27**——它硬依赖按 Go 版本写死的 runtime 内部
+  (`doStopTheWorld`、`gGoroutineIDOffset`、`sysmonLockOffset`),这些文件的 build 约束**全部 `!go1.27`**
+  (支持上限 = Go 1.26),在 go1.27 上这些符号一律 undefined。→ 结论:**mockey 支持上限 Go 1.26,而本
+  原型是 go1.27-devel,纯版本错位、与 weave 机制无关**。规避:把 weave 用例放到不依赖 mockey 的包
+  (如 kun `internal/sdk/mq/queue`);**根治:weave 基线选 ≤ Go 1.26**(不只 mockey,gohook 等一切硬依赖
+  runtime 内部布局的库都会在 go1.27 碰壁),或等 mockey 出 go1.27 门控。`e4291e484c`(移除 arm64 duff)
+  作者日期 2025-06-05、合入 2025-08-15。
+  另需注意一个**语义**问题(与构建无关):mockey 在运行期改写目标函数的序言跳转到 mock,而 `-weave`
+  的内存插桩在原函数体里——被 patch 掉的原函数体不会被 weave 探索(执行的是 mock);通常这正是你想
+  mock 掉的外部依赖,可接受,但要清楚 weave 只探索"真正执行到的代码"。
+- **把 weave 用例对准"共享状态原语"而非"扇出编排"**:worker-pool 式代码(`sync.WaitGroup` + 按批
+  spawn N 个 goroutine)在 `-weave` 下会因"同时可运行的 goroutine × 每个 goroutine 的插桩内存操作"
+  组合爆炸(kun `queue.Worker.Run` 实测撑爆 100 万预算)。真正需要验证的并发安全其实只在少数
+  mutex 保护的操作里(如 `AddErr` 的切片 append)。直接对这些操作起 2 个 goroutine 竞争(绕开
+  Run 的编排)即可把状态空间压到几十条(26/16),同时精确覆盖竞争点——去掉锁后 weave 4 条调度即
+  报 `lost an append`。
 
 ---
 
@@ -208,12 +256,12 @@
 1. **只加字段 + no-op 钩子**,跑 `go test runtime sync internal/synctest testing/synctest` 确认零回归。
 2. **round-robin 串行化**,验证真实 `go func()` 严格一次跑一个。
 3. **接真实 sync.Mutex**(internal/sync 入口加 schedPoint),验证真实 Mutex 用例可探索。
-4. **接 chan/select**,移植 L3 引擎,`testing/weave.Test` 可用。
+4. **接 chan/select**,移植 L3 引擎,`synctest.Test`(`-weave`)可用。
 5. **失败 seed 重放**;差分健全性对拍(`TestDPORSoundnessSuite`)。
 
 **日常构建/测试**:
 ```sh
-cd src && ../bin/go test internal/weave/ testing/weave/       # 核心引擎(无 -weave)
+cd src && ../bin/go test internal/weave/ testing/synctest/    # 核心引擎(无 -weave)
 cd src && ../bin/go test -weave internal/weave/                # 含内存插桩的健全性套件
 cd src && ../bin/go test runtime sync internal/synctest testing/synctest   # 回归
 ```
@@ -253,10 +301,10 @@ cd src && ../bin/go test runtime sync internal/synctest testing/synctest   # 回
 - **`-weave` 不覆盖用户 `-gcflags`**:改用 `forcedGcflags`(附加、不 shadow 用户规则)。回归
   `cmd/go` script `build_weave.txt`。
 - **replay 命令 shell-quote + 保留构建模式**:seed 单引号包裹(select seed 含 `|`)、`-run` 锚定、
-  仅在 `-weave` 构建下带 `-weave`。回归 `testing/weave.TestReplayCommandFormat`。
+  仅在失败 trace 含内存 transition 时带 `-weave`。逻辑现居 `testing/synctest/weave.go` 的 `replayCommand`。
 - **wall-clock timeout 明确为 runs 之间的 soft limit**(单条卡死 schedule 需外部 `-timeout`;
   抢占看门狗仍是已知缺口,见 §5.A.2)。
 
 **Go 仓库集成门禁**
-- `testing/weave` 登记进 `api/next/weave.txt` 与 `go/build/deps_test.go`;`cmd/api TestCheck` 与
-  `go/build.TestDependencies` 通过。
+- `testing/synctest` 在 `go/build/deps_test.go` 里获得 `internal/weave` + `path/filepath` 依赖;
+  `testing/weave` 条目已移除。`go/build.TestDependencies` 通过。
