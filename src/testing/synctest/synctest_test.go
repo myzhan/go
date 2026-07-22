@@ -99,6 +99,12 @@ func TestCleanup(t *testing.T) {
 }
 
 func TestContext(t *testing.T) {
+	if underWeave {
+		// Asserts t.Context() lifecycle via state shared outside the closure;
+		// weave re-runs the closure across schedules, which that shared state and
+		// the per-run t.Context() semantics do not fit.
+		t.Skip("verifies t.Context() lifecycle; not applicable under -weave")
+	}
 	state := "not started"
 	synctest.Test(t, func(t *testing.T) {
 		go func() {
@@ -169,6 +175,13 @@ func runTest(t *testing.T, args []string, f func(), pattern string) {
 		return
 	}
 	t.Helper()
+	if underWeave {
+		// These tests fork a child that runs f and assert its plain-synctest
+		// output (testing-package failure/skip formatting). Under -weave the child
+		// runs f under systematic exploration, changing the output, so the
+		// assertion no longer applies.
+		t.Skip("verifies plain-synctest testing output; not applicable under -weave")
+	}
 	re := regexp.MustCompile(pattern)
 	testenv.MustHaveExec(t)
 	cmd := testenv.Command(t, testenv.Executable(t), "-test.run=^"+regexp.QuoteMeta(t.Name())+"$", "-test.count=1")
@@ -190,6 +203,11 @@ func TestNow(t *testing.T) {
 }
 
 func TestSynctestTimerRaceCtxCrash(t *testing.T) {
+	if underWeave {
+		// 20 × 100 pending timers per schedule exceeds weave's per-schedule trace
+		// recording capacity; this stress test targets the plain fake clock.
+		t.Skip("timer-heavy stress test; exceeds weave's per-schedule recording capacity")
+	}
 	for range 20 {
 		t.Run("", func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {

@@ -15,6 +15,7 @@ import (
 	"net"
 	"testing"
 	"testing/synctest"
+	"time"
 )
 
 // TestAsyncWorkerRequestResponse models asynchronous IO with an in-memory
@@ -89,10 +90,10 @@ func TestContextCancelPropagation(t *testing.T) {
 // is ready at the select point, modeling "the deadline already passed".
 func TestTimeoutGoroutineLeak(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		result := make(chan int)      // unbuffered: the bug
+		result := make(chan int) // unbuffered: the bug
 		timeout := make(chan struct{}, 1)
-		timeout <- struct{}{}         // deadline already elapsed
-		go func() { result <- 42 }()  // worker tries to deliver
+		timeout <- struct{}{}        // deadline already elapsed
+		go func() { result <- 42 }() // worker tries to deliver
 		select {
 		case <-result:
 		case <-timeout:
@@ -107,13 +108,31 @@ func TestTimeoutGoroutineLeak(t *testing.T) {
 // explores the schedules and finds no deadlock. PASS.
 func TestTimeoutLeakFixed(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		result := make(chan int, 1)   // buffered: the fix
+		result := make(chan int, 1) // buffered: the fix
 		timeout := make(chan struct{}, 1)
 		timeout <- struct{}{}
 		go func() { result <- 42 }()
 		select {
 		case <-result:
 		case <-timeout:
+		}
+	})
+}
+
+// TestTimerVsEventFalseNegative shows a subtlety of the fake clock, not a bug in
+// the code under test. It races a real time.After(timeout) against a concurrent
+// event, but the event goroutine stays runnable, so the fake clock never advances
+// to fire the timer — the "timeout wins" interleaving is never explored (a false
+// negative). weave PASSES but prints a note: a pending timer never fired. The fix
+// on the *test* side is to align the event to the timer boundary (Sleep it to the
+// same virtual instant); see .claude/weave/README.md.
+func TestTimerVsEventFalseNegative(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		done := make(chan int, 1)
+		go func() { done <- 1 }() // event is always immediately runnable
+		select {
+		case <-done:
+		case <-time.After(time.Second): // never fires: clock can't advance
 		}
 	})
 }
