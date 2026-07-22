@@ -62,9 +62,15 @@ synctest.Test(t, f)  [-weave]                 [L4] weaveExplore → testingWeave
        ◀── 带回 trace 缓冲 + outcome ──
        DPOR 回溯分析:对每对冲突且并发的 transition 加 backtrack → 生成下一条 plan
        命中 panic/死锁 → 停,构造 Result{Seed, Trace, Goroutines}
-  └─ 失败:t.Errorf + 打印逐步交错 + goroutine 图例 + WEAVE_REPLAY=<seed> 复现命令
-     成功:t.Logf "explored N schedule(s)";截断:报 INCOMPLETE
+  └─ 失败:t.Errorf + 打印逐步交错(同步对象用 mutex#/chan# 等可读标签)+ goroutine 图例
+     + WEAVE_REPLAY=<seed> 复现命令;死锁额外逐 goroutine 列出等待对象
+     成功:t.Logf "explored N schedule(s) up to K preemption(s)"(有未触发 timer 时追加对齐提示)
+     截断:报 INCOMPLETE
 ```
+
+L4 的默认探索是**迭代加深**:未设 `WEAVE_MAX_PREEMPTIONS` 时按抢占 0,1,…,`defaultPreemptCeiling`(=2)
+逐层调 L3 的 `ExploreBounded`,命中失败即停(反例用最少抢占),否则报"up to K preemptions"——避免旧的
+无界搜索在真实模型上爆炸。设了该 env 则以其为上限。
 
 要点:**探索驱动(DPOR、panic 捕获)在 Go 侧(L3)**,runtime 只暴露"跑一条调度"的原语
 `weaveRunSchedule`。这样引擎能用 `defer recover` 把模型 panic 捕获成"该调度失败",而不崩溃进程。

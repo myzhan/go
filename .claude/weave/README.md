@@ -23,7 +23,9 @@ I/O 与时钟)同样适用。
 已达到**可用里程碑**:未改写的真实 `chan`/`select`/`sync.Mutex`/`RWMutex`/`WaitGroup`/`Cond`/
 `Once` + 普通内存(`-weave`)代码可被系统性交错探索;DPOR(含差分健全性验证 + 抢占上界)、
 select-case 枚举、非阻塞 channel 操作、RNG/map 序确定化、panic 捕获、失败 seed 重放 + 源码行号 +
-goroutine 图例 + 读写值显示均已落地。**API 已精简**:不再有 `testing/weave`/`weave.Test`——直接用
+goroutine 图例 + 读写值显示均已落地。**易用性**:不设抢占上界时**默认自动迭代加深**(0→2,避免真实
+模型爆炸)、失败轨迹对象用**可读标签**(mutex#1/chan#2)、**死锁报告逐 goroutine 列出等待对象**、
+假时钟"超时 vs 事件"漏探时**打印对齐提示**。**API 已精简**:不再有 `testing/weave`/`weave.Test`——直接用
 标准 `testing/synctest.Test`,`-weave` 下自动进入探索(ADR D12)。**唯一大缺口**:`sync/atomic`
 插桩(无锁代码探索不了)。
 
@@ -73,3 +75,33 @@ func TestCounter(t *testing.T) {
 (勿用 `rand`/依赖 map 迭代序)、所有 goroutine 必须能结束。时间/定时器由 synctest 假时钟驱动,
 `time.Sleep`/`time.After`/`context.WithTimeout` 在受控 bubble 内**可正常工作**(见 [design.md](design.md)
 D11);仍建议用 channel/`context.WithCancel` 等内存接缝让交错更显式。
+
+## 搜索深度(抢占上界)
+
+不设 `WEAVE_MAX_PREEMPTIONS` 时,weave **自动迭代加深**:依次探索 0,1,…,2 次抢占的调度,
+找到失败即停(反例用最少抢占,最易读),否则报 "explored N schedule(s) up to 2 preemption(s)"。
+这避免了在真实模型上无界爆炸。**大多数并发 bug 在 ≤2 次抢占内出现**(CHESS 经验);若某 bug
+需要更深(如跨多次让出的竞争),用 `WEAVE_MAX_PREEMPTIONS=<c>` 提高上界(会更慢)。
+`WEAVE_MAX_SCHEDULES` / `WEAVE_TIMEOUT` 是总预算,耗尽则报 INCOMPLETE(注明探到第几层)。
+
+## 测网络 / IO 逻辑
+
+真实 socket 会离开 bubble——weave 无法控制或探索它(同 loom/Coyote/CHESS 的边界)。做法是把
+**传输换成内存 fake**,让 weave 探索其上的交错:
+
+- **首选 `net.Pipe`**:它本就是 bubble-aware(channel 实现),且**紧凑**——Read/Write 是同步
+  rendezvous,每次交接一个调度点,探索空间小。请求/响应、协议握手、断线重连都能直接跑在它上面
+  (见 `weavedemo/netfake_test.go`、`asyncio_test.go`)。
+- **别用 `sync.Cond`+`[]byte` 自造 buffered conn**:`-weave` 下每次 slice/标志访问都成调度点,
+  fake 自身的内部状态就会撑爆搜索(一个单字节回显都可能超预算)。确需缓冲就用 **buffered channel**
+  (每条消息一个调度点),不要 cond+slice。
+- **超时/重连**:用 `context`/channel 表达超时,而不是依赖真实时间;重连建模为"替换当前 conn +
+  通知"(mutex/cond),weave 会探索"旧 conn 出错 vs 重连接管"的交错。
+
+### 假时钟与"超时 vs 事件"竞争的一个坑
+
+假时钟只在 bubble **全体 durably blocked** 时才推进(推进到最近的 pending timer)。因此若被测的
+并发事件对应的 goroutine **一直可运行**,假时钟不会推进,基于 `time.After` 的超时**永远不会触发**,
+"超时 vs 事件"这一类竞争就探不到(假阴性)。要探这类竞争,把并发事件**对齐到定时器边界**——例如
+让事件 goroutine 先 `time.Sleep(超时时长)` 到与超时同一虚拟时刻,两者便在同一时刻竞争,weave 即可
+交错二者。(weave 在探索结束若发现有从未触发的定时器,会打印提示引导你这样做。)

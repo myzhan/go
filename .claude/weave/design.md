@@ -375,6 +375,35 @@ panic 值/断言细节暂被 sentinel 覆盖(报告靠 seed 复现,可后续保�
 幂等仍是隐式要求(见 D9 A 类,undo-log 缓解)。子 T + tRunner 机制进入探索循环会引入额外调度点
 (正确用例上已见 schedule 数偏高,如 3556),后续可评估是否绕过 tRunner 直接跑 f 以缩小模型。
 
+### D13 — 默认自动迭代加深抢占上界(替代无界搜索)
+
+**决策**:未设 `WEAVE_MAX_PREEMPTIONS` 时,不再无界搜索,而是按抢占 0,1,…,`defaultPreemptCeiling`(=2)
+**迭代加深**(L4 `exploreIterative` 逐层调 `ExploreBounded`),命中失败即停、否则报 "up to K preemptions"。
+**理由**:实测真实代码(含 net.Pipe 协议握手)在无界下状态空间爆炸(一个请求/响应 demo 33s 撞满 100 万
+预算 INCOMPLETE);而 CHESS 经验是绝大多数并发 bug 在 ≤2 次抢占出现。迭代加深让**反例用最少抢占**
+(最易读),并把"零配置开箱"从"爆炸"变成"秒级 PASS 且给出 ≤K 抢占的保证"。设了 env 则以其为上限
+(单次 `ExploreBounded` 已 complete-within-itself,不再迭代)。代价:PASS 用例白跑低层(可接受,低层小)。
+
+### D14 — 失败报告可读性:对象标签 + 死锁等待对象
+
+**决策**:轨迹里无源码位置的同步对象由裸地址 `@0x...` 改为稳定标签 `mutex#1`/`chan#2`/`cond#`/`wg#`/
+`once#`/`mem#`(`addrLabeler`,按操作种类推断、同址复用编号);死锁报告在 "all goroutines blocked" 后
+**逐 goroutine 列出等待对象**(`gN blocked on lock mutex#4`)。**理由**:裸指针无法看出"是不是同一个锁",
+ABBA 死锁尤其难读。等待对象**直接从 trace 每个参与者的最后一步推断**(它 park 在那个调度点),故是纯
+渲染层、不动 runtime。标签器在 trace 与死锁列表间共享,保证同址同名。
+
+### D15 — 假时钟:基准对齐、假阴性提示、非并发测试跳过
+
+**决策(三点)**:
+1. **基准对齐(bug 修复)**:`weaveRunBubble` 曾漏设 `bubble.now`,使 `-weave` 下 `time.Now()` 返回 1970
+   而非普通 synctest 的 2000。把 `synctestBaseTime` 提为 runtime 包级 const,两条路径共用。
+2. **假阴性提示**:假时钟只在全体 durably blocked 时推进,故"超时 vs 一直可运行的事件"竞争会漏探
+   (假阴性)。某调度里参与者全退出却仍有 pending timer 时,`weaveControl.unfiredTimer`→`Result.UnfiredTimer`,
+   成功报告追加提示"把事件对齐到定时器边界"。**不自动修复**(对齐是模型侧的事),只诊断引导。
+3. **非并发测试跳过**:`testing/synctest` 里验证 testing-package 交互输出(fork 子进程断言非-weave 格式)
+   或重量级/压力(net/http 集成、100 定时器)的用例,在 `-weave` 下语义不适用/超容量,用 build-tag 常量
+   `underWeave` 跳过(仿标准库对 `-race` 的 `//go:build !race`)。修后 `-weave` 下 `testing/synctest` 全绿。
+
 ---
 
 ## 9. 待定 / 开放问题

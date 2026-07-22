@@ -15,6 +15,17 @@
 图例 + 可复现 seed。DPOR(含差分健全性验证 + 抢占计数上界)、select-case 枚举、非阻塞 channel
 操作、RNG/map 序确定化、spawned goroutine panic 捕获、`go test -weave` flag 均已落地。
 
+**易用性增强(后续迭代)**:
+- **默认自动迭代加深抢占上界**:不设 `WEAVE_MAX_PREEMPTIONS` 时,从抢占=0 逐层加深到默认上限
+  `defaultPreemptCeiling`(=2,`weaveExplore`/`exploreIterative`),而非旧的无界搜索——避免真实模型状态
+  空间爆炸,并让反例用最少抢占(最易读)。设了该 env 则以其为上限。
+- **失败报告可读性**:轨迹里同步对象由裸地址改为稳定标签(`mutex#1`/`chan#2`/`cond#3`/`wg`/`once`/`mem`,
+  `addrLabeler`);死锁报告额外逐 goroutine 列出等待对象(`gN blocked on lock mutex#4`,由每个参与者的
+  最后 trace step 推断,`blockedWaits`)。
+- **假时钟假阴性提示**:某调度中所有参与者已退出却仍有未触发的 pending timer 时,`weaveControl.unfiredTimer`
+  经 `runSchedule` 回传聚合到 `Result.UnfiredTimer`,成功报告追加提示"把并发事件对齐到定时器边界",
+  帮用户发现"超时 vs 事件"这类因假时钟不推进而漏探的竞争。
+
 **唯一大缺口**:`sync/atomic` 插桩——atomic 目前既非调度点也不记录,用 atomic 的无锁代码探索
 不了。正解仿 `-race` 用 instrumented std 重建,工程量大,为免拖累全体 Go 程序 atomic 性能未
 草率合入,留作独立专注实现。
@@ -170,6 +181,9 @@
 | M0 原型引擎(纯 Go,穷举 + 库级插桩) | ✅ | 已完成使命,原型库删除,现保留 `exploreExhaustive` 做对拍 |
 | DPOR 替换穷举(source-DPOR + 差分对拍) | ✅ | `explore.go` |
 | 抢占计数上界(CHESS context bounding) | ✅ | `ExploreBounded` |
+| 默认自动迭代加深抢占上界(未设 env 时 0→2 逐层,替代无界) | ✅ | `exploreIterative`/`defaultPreemptCeiling` |
+| 失败报告对象标签化(mutex#/chan#/…)+ 死锁列出各 goroutine 等待对象 | ✅ | `addrLabeler`/`blockedWaits` |
+| 假时钟假阴性提示(退出时仍有未触发 timer)| ✅ | `weaveControl.unfiredTimer`→`Result.UnfiredTimer` |
 | L2 接入真实 chan/mutex/rwmutex/waitgroup/cond/once(零改写) | ✅ | runtime + sync |
 | L1 编译器内存插桩(`-weave`,含结构体/切片/值显示) | ✅ | cmd/compile + cmd/go |
 | channel happens-before(DPOR 对 channel 冲突健全) | ✅ | `channelHB` |
@@ -210,6 +224,20 @@
   参与者——已正确处理(D10:排除 `waitReasonPreempted`,`weaveBlocked` 前置)。
 - **假时钟已支持**(D11):`time.Sleep`/`time.After`/`NewTimer`/`context.WithTimeout` 在受控 bubble
   内正常推进;仅同 deadline 定时器触发序不枚举、永不停止的 ticker 受预算约束。
+- **假时钟基准时间已修**(2026-07-22):weave 路径的 `weaveRunBubble` 曾漏设 `bubble.now`,导致 `-weave`
+  下 `time.Now()` 返回 1970 而非普通 synctest 的 2000 基准(`TestNow` 失败)。修复:把 `synctestBaseTime`
+  提为 runtime 包级 const,`weaveRunBubble` 建 bubble 时一并设 `now`,与普通 synctest 完全一致。
+- **假时钟假阴性("超时 vs 事件"竞争)**:假时钟只在**全体 durably blocked** 时推进,故若并发事件的
+  goroutine 一直可运行,基于 `time.After` 的超时**永不触发**,该类竞争探不到(假阴性)。规避是把事件
+  **对齐到定时器边界**(如让事件 goroutine `Sleep(超时时长)` 到同一虚拟时刻)。weave 现会在探索结束、
+  发现有从未触发的 pending timer 时**打印提示**引导这样做(`Result.UnfiredTimer`)。
+- **`-weave` 下不适用的测试用 `underWeave` 跳过**:`testing/synctest` 里验证 testing-package **交互
+  输出**的用例(TestFatal/Error/VerboseError/Skip/VerboseSkip/Helper——经 `runTest` fork 子进程断言
+  非-weave 输出格式;TestContext——用闭包外共享状态断言 `t.Context()` 生命周期)以及重量级/压力用例
+  (TestHTTPTransport100Continue 的 net/http 集成、TestSynctestTimerRaceCtxCrash 的 100 定时器压力)
+  在探索模式下语义不适用或超容量。它们靠 build-tag 常量 `underWeave`(`underweave_on_test.go` /
+  `underweave_off_test.go`)在 `-weave` 时 `t.Skip`——如同标准库对 `-race` 用 `//go:build !race`。
+  修后 `-weave` 下 `testing/synctest` 全绿。
 - **`-weave` 下重内存/热循环用例状态空间爆炸**:如 `weavedemo/gcrepro_test.go` 的 GC 抢占压力
   测试(200 轮 × 长 spin),`-weave` 下每次内存访问成调度点会撑到超时。它测的是令牌在 GC 抢占下
   的健壮性、非数据竞争,故用 `weave` 构建标签跳过、并 `-short` 降迭代。同理,包住重插桩库代码
