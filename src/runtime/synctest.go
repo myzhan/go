@@ -186,6 +186,11 @@ func (bubble *synctestBubble) raceaddr() unsafe.Pointer {
 
 var bubbleGen atomic.Uint64 // bubble ID counter
 
+// synctestBaseTime is the fake-clock start time for every bubble (both plain
+// synctest and weave-controlled), so time.Now() is deterministic and identical
+// across the two modes.
+const synctestBaseTime = 946684800000000000 // midnight UTC 2000-01-01
+
 //go:linkname synctestRun internal/synctest.Run
 func synctestRun(f func()) {
 	synctestRun1(f, false)
@@ -208,7 +213,6 @@ func synctestRun1(f func(), controlled bool) {
 	if controlled {
 		bubble.weaveCtl = &weaveControl{}
 	}
-	const synctestBaseTime = 946684800000000000 // midnight UTC 2000-01-01
 	bubble.now = synctestBaseTime
 	lockInit(&bubble.mu, lockRankSynctest)
 	lockInit(&bubble.timers.mu, lockRankTimers)

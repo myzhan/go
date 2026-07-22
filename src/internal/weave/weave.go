@@ -43,4 +43,4 @@ func Wait()
 // exploration path sets it.
 //
 //go:linkname runSchedule
-func runSchedule(f func(), plan, traceWid, traceOp, traceValSet, selPlan, selTrace, selBranch, selStepIdx []int32, traceAddr, traceSize []int64, traceEnabled, tracePC, spawnPC, traceVal []uint64, sticky bool) (steps, nsel, outcome int, failure any)
+func runSchedule(f func(), plan, traceWid, traceOp, traceValSet, selPlan, selTrace, selBranch, selStepIdx []int32, traceAddr, traceSize []int64, traceEnabled, tracePC, spawnPC, traceVal []uint64, sticky bool) (steps, nsel, outcome int, failure any, unfiredTimer bool)

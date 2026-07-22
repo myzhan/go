@@ -70,6 +70,7 @@ type weaveControl struct {
 	done         bool   // all participants have exited
 	deadlock     bool   // some remain but none can run
 	advanceClock bool   // no participant is runnable but a timer is pending; root must advance the fake clock
+	unfiredTimer bool   // all participants exited while a timer was still pending (fake clock never advanced to it)
 	rootParked   bool   // root goroutine is parked in weaveRootWait
 	waiter       *g     // participant parked in weave.Wait, or nil
 	randState    uint64 // deterministic RNG state for this run
@@ -430,6 +431,13 @@ func weaveOnGoexit(bubble *synctestBubble) {
 	}
 	if ctl.live == 0 {
 		ctl.done = true
+		// All participants exited while a timer was still pending: the fake clock
+		// only advances when the whole bubble is durably blocked, so a timer never
+		// reached only because some goroutine stayed runnable is now stranded. Flag
+		// it so the driver can hint that a timeout-vs-event race may be unexplored.
+		if bubble.timers.wakeTime() > 0 {
+			ctl.unfiredTimer = true
+		}
 	} else if bubble.timers.wakeTime() > 0 {
 		// Participants remain but none is runnable; a pending timer can still make
 		// progress once the fake clock advances (driven by the root).
@@ -694,6 +702,7 @@ func weaveRunBubble(f func(), ctl *weaveControl) {
 		root:       gp,
 		controlled: true,
 		weaveCtl:   ctl,
+		now:        synctestBaseTime, // match plain synctest so time.Now() is deterministic
 	}
 	lockInit(&bubble.mu, lockRankSynctest)
 	lockInit(&bubble.timers.mu, lockRankTimers)
@@ -725,7 +734,7 @@ func weaveRunBubble(f func(), ctl *weaveControl) {
 // it calls once per schedule.
 //
 //go:linkname weaveRunSchedule internal/weave.runSchedule
-func weaveRunSchedule(f func(), plan, traceWid, traceOp, traceValSet, selPlan, selTrace, selBranch, selStepIdx []int32, traceAddr, traceSize []int64, traceEnabled, tracePC, spawnPC, traceVal []uint64, sticky bool) (steps, nsel, outcome int, failure any) {
+func weaveRunSchedule(f func(), plan, traceWid, traceOp, traceValSet, selPlan, selTrace, selBranch, selStepIdx []int32, traceAddr, traceSize []int64, traceEnabled, tracePC, spawnPC, traceVal []uint64, sticky bool) (steps, nsel, outcome int, failure any, unfiredTimer bool) {
 	ctl := new(weaveControl)
 	ctl.stickyDefault = sticky
 	ctl.lastWid = -1
@@ -754,7 +763,7 @@ func weaveRunSchedule(f func(), plan, traceWid, traceOp, traceValSet, selPlan, s
 	case ctl.deadlock:
 		outcome = 1
 	}
-	return ctl.step, ctl.selStep, outcome, failure
+	return ctl.step, ctl.selStep, outcome, failure, ctl.unfiredTimer
 }
 
 // weaveSelectChoose picks which of the nready ready cases of a controlled select

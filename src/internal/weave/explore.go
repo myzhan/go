@@ -69,12 +69,19 @@ type Result struct {
 	// not report it as success. TruncatedReason gives a short explanation.
 	Truncated       bool
 	TruncatedReason string
+
+	// UnfiredTimer is set if any explored schedule finished with all participants
+	// exited while a timer was still pending. The fake clock only advances when the
+	// whole bubble is durably blocked, so a timeout that never fired because some
+	// goroutine stayed runnable can hide a "timeout vs event" race; the driver uses
+	// this to hint the user to align the event to the timer boundary.
+	UnfiredTimer bool
 }
 
 // Run executes f once in a controlled bubble (a single default schedule).
 // It panics if the run deadlocks.
 func Run(f func()) {
-	_, _, outcome, failure := runSchedule(f, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+	_, _, outcome, failure, _ := runSchedule(f, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
 	if failure != nil {
 		panic(failure)
 	}
@@ -350,8 +357,11 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 	start := time.Now()
 
 	for {
-		steps, nsel, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceSize, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal, maxPreemptions >= 0)
+		steps, nsel, outcome, failure, unfired := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceSize, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal, maxPreemptions >= 0)
 		e.res.Runs++
+		if unfired {
+			e.res.UnfiredTimer = true
+		}
 
 		// The runtime keeps counting scheduling points after the trace buffers
 		// overflow (reported as outcome==2 below), so steps/nsel can exceed the
@@ -562,7 +572,8 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 func Replay(seed string, f func()) Result {
 	e := newExplorer(f)
 	plan, selPlan := decodeSeed(seed)
-	steps, _, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceSize, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal, false)
+	steps, _, outcome, failure, unfired := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceSize, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal, false)
+	e.res.UnfiredTimer = unfired
 	e.res.Runs = 1
 	e.res.Seed = seed
 	// Same clamp/outcome ordering as ExploreBounded: the runtime keeps counting
@@ -740,7 +751,7 @@ func exploreExhaustive(f func()) Result {
 	e := newExplorer(f)
 	var plan []int32
 	for {
-		steps, _, outcome, failure := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, nil, nil, nil, nil, e.traceAddr, e.traceSize, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal, false)
+		steps, _, outcome, failure, _ := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, nil, nil, nil, nil, e.traceAddr, e.traceSize, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal, false)
 		e.res.Runs++
 		if failure != nil {
 			e.res.Failed = true

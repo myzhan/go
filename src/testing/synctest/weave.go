@@ -59,8 +59,9 @@ func weaveExplore(t *testing.T, f func(*testing.T)) bool {
 		case res.Truncated:
 			t.Errorf("weave: replay INCOMPLETE (seed %s): %s", seed, res.TruncatedReason)
 		default:
+			lab := newAddrLabeler()
 			t.Errorf("weave: replayed interleaving (seed %s):\n%s%s%s",
-				seed, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res))
+				seed, formatGoroutines(res.Goroutines), formatTrace(res.Trace, lab), formatOutcome(res, lab))
 		}
 		return true
 	}
@@ -79,24 +80,96 @@ func weaveExplore(t *testing.T, f func(*testing.T)) bool {
 	}
 	timeout := resolveTimeout(os.Getenv("WEAVE_TIMEOUT"))
 
-	res := weave.ExploreBounded(body, budget, maxPreempt, timeout)
+	// Iterative deepening on the preemption bound: when the user does not pin
+	// WEAVE_MAX_PREEMPTIONS, search 0..defaultPreemptCeiling instead of unbounded
+	// (which explodes on realistic models). A pinned value raises the ceiling.
+	ceiling := defaultPreemptCeiling
+	if maxPreempt >= 0 {
+		ceiling = maxPreempt
+	}
+	res := exploreIterative(body, budget, ceiling, timeout)
 	switch {
 	case res.Failed, res.Deadlock:
+		lab := newAddrLabeler()
 		t.Errorf("weave: found failing interleaving after %d schedule(s):\n%s%s%s\n"+
 			"reproduce with: %s",
-			res.Runs, formatGoroutines(res.Goroutines), formatTrace(res.Trace), outcomeMsg(res),
+			res.Runs, formatGoroutines(res.Goroutines), formatTrace(res.Trace, lab), formatOutcome(res, lab),
 			replayCommand(res.Seed, t.Name(), res.Trace))
 	case res.Truncated:
-		t.Errorf("weave: exploration INCOMPLETE after %d schedule(s): %s; "+
-			"no failure found in the explored subset. Reduce the model, or raise the "+
-			"limits with WEAVE_MAX_SCHEDULES / WEAVE_TIMEOUT (WEAVE_TIMEOUT=0 disables "+
-			"the time limit).", res.Runs, res.TruncatedReason)
-	case maxPreempt >= 0:
-		t.Logf("weave: ok, explored %d schedule(s) within %d preemption(s)", res.Runs, maxPreempt)
+		hint := ""
+		if maxPreempt < 0 {
+			hint = " raise WEAVE_MAX_PREEMPTIONS to search deeper, or"
+		}
+		t.Errorf("weave: exploration INCOMPLETE after %d schedule(s): %s;"+
+			" no failure found in the explored subset.%s reduce the model or raise"+
+			" WEAVE_MAX_SCHEDULES / WEAVE_TIMEOUT (WEAVE_TIMEOUT=0 disables the time limit).",
+			res.Runs, res.TruncatedReason, hint)
 	default:
-		t.Logf("weave: ok, explored %d schedule(s)", res.Runs)
+		note := ""
+		if maxPreempt < 0 {
+			note = " (default ceiling; set WEAVE_MAX_PREEMPTIONS to search deeper)"
+		}
+		t.Logf("weave: ok, explored %d schedule(s) up to %d preemption(s)%s", res.Runs, ceiling, note)
+		if res.UnfiredTimer {
+			t.Logf("weave: note: a pending timer never fired (all goroutines exited first). " +
+				"The fake clock only advances when the whole bubble is durably blocked, so a " +
+				"timeout-vs-event race may be unexplored; align the event to the timer boundary " +
+				"(e.g. Sleep the event to the same virtual instant) so weave can interleave them.")
+		}
 	}
 	return true
+}
+
+// defaultPreemptCeiling bounds the automatic search when WEAVE_MAX_PREEMPTIONS is
+// unset. Most concurrency bugs surface within a couple of preemptions (the CHESS
+// insight), so exploring 0..ceiling keeps an unset run from exploding on
+// realistic models while still giving a meaningful "no failure up to K
+// preemptions" guarantee. Users raise it via WEAVE_MAX_PREEMPTIONS.
+const defaultPreemptCeiling = 2
+
+// exploreIterative runs iterative-deepening context-bounded search: it explores
+// schedules with 0,1,...,ceiling preemptions in order, stopping at the first
+// failing/deadlocking schedule (so the reported counterexample uses the fewest
+// preemptions) or when the schedule/time budget is exhausted. Each level reuses
+// ExploreBounded, whose bound is complete within itself; the deepest level
+// subsumes the lower ones, so its Runs is the count reported on success.
+func exploreIterative(body func(), budget, ceiling int, timeout time.Duration) weave.Result {
+	start := time.Now()
+	var last weave.Result
+	spent := 0
+	unfired := false // any level left a timer pending at exit (aggregated across levels)
+	for c := 0; c <= ceiling; c++ {
+		remBudget := budget
+		if budget > 0 {
+			remBudget = budget - spent
+			if remBudget <= 0 {
+				last.Truncated = true
+				last.TruncatedReason = fmt.Sprintf("schedule budget reached at %d preemption(s)", c)
+				last.UnfiredTimer = unfired
+				return last
+			}
+		}
+		remTime := timeout
+		if timeout > 0 {
+			remTime = timeout - time.Since(start)
+			if remTime <= 0 {
+				last.Truncated = true
+				last.TruncatedReason = fmt.Sprintf("time budget reached at %d preemption(s)", c)
+				last.UnfiredTimer = unfired
+				return last
+			}
+		}
+		res := weave.ExploreBounded(body, remBudget, c, remTime)
+		spent += res.Runs
+		unfired = unfired || res.UnfiredTimer
+		if res.Failed || res.Deadlock || res.Truncated {
+			res.UnfiredTimer = unfired
+			return res
+		}
+		last = res // level c fully explored, no failure
+	}
+	last.UnfiredTimer = unfired
+	return last
 }
 
 // resolveTimeout returns the per-test wall-clock budget from the WEAVE_TIMEOUT
@@ -182,14 +255,72 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-func outcomeMsg(res weave.Result) string {
+// formatOutcome renders the outcome line(s) of a failing schedule. For a panic
+// it shows the recovered value; for a deadlock it additionally lists what each
+// still-blocked goroutine is waiting on, derived from each participant's last
+// trace step (the scheduling point it parked at). lab is shared with formatTrace
+// so object labels (mutex#1, chan#2, ...) match between the trace and this list.
+func formatOutcome(res weave.Result, lab *addrLabeler) string {
 	if res.Failed {
 		return fmt.Sprintf("panic: %v", res.Value)
 	}
-	if res.Deadlock {
+	if !res.Deadlock {
+		return ""
+	}
+	bw := blockedWaits(res.Trace)
+	if len(bw) == 0 {
 		return "deadlock: all goroutines blocked"
 	}
-	return ""
+	var b strings.Builder
+	b.WriteString("deadlock: all goroutines blocked\n")
+	for _, w := range bw {
+		fmt.Fprintf(&b, "    g%d blocked on %s %s\n", w.wid, w.op, lab.label(w.addr, w.op))
+	}
+	return b.String()
+}
+
+type blockedWait struct {
+	wid  int
+	op   string
+	addr uint64
+}
+
+// blockedWaits infers, for a deadlocked schedule, what each participant is stuck
+// on: its last recorded trace step is the scheduling point it parked at. Only
+// participants whose last step is a blocking operation (and not the model root)
+// are reported, in first-appearance order.
+func blockedWaits(steps []weave.Step) []blockedWait {
+	last := map[int]weave.Step{}
+	order := []int{}
+	for _, s := range steps {
+		if _, seen := last[s.Wid]; !seen {
+			order = append(order, s.Wid)
+		}
+		last[s.Wid] = s
+	}
+	var out []blockedWait
+	for _, wid := range order {
+		if wid == 0 {
+			continue // model root
+		}
+		s := last[wid]
+		if isBlockingOp(s.Op) {
+			out = append(out, blockedWait{wid: wid, op: s.Op, addr: s.Addr})
+		}
+	}
+	return out
+}
+
+// isBlockingOp reports whether an operation can leave a goroutine parked waiting
+// (so its appearance as a participant's last step means "blocked here"). Ops
+// that never block (unlock, close, signal, add, non-blocking select cases, plain
+// memory access) are excluded.
+func isBlockingOp(op string) bool {
+	switch op {
+	case "lock", "chan send", "chan recv", "cond wait", "wg wait":
+		return true
+	}
+	return false
 }
 
 // formatGoroutines renders the legend mapping each gN in the trace to the source
@@ -224,7 +355,7 @@ func funcName(fn string) string {
 	return fn
 }
 
-func formatTrace(steps []weave.Step) string {
+func formatTrace(steps []weave.Step, lab *addrLabeler) string {
 	var b strings.Builder
 	n := 0
 	for i, s := range steps {
@@ -238,7 +369,7 @@ func formatTrace(steps []weave.Step) string {
 		case s.File != "":
 			loc = fmt.Sprintf("  %s:%d", filepath.Base(s.File), s.Line)
 		case s.Addr != 0:
-			loc = fmt.Sprintf("  @%#x", s.Addr)
+			loc = "  " + lab.label(s.Addr, s.Op)
 		}
 		val := ""
 		if s.HasVal {
@@ -248,4 +379,51 @@ func formatTrace(steps []weave.Step) string {
 		fmt.Fprintf(&b, "  %2d: g%d %s%s%s\n", n, s.Wid, s.Op, val, loc)
 	}
 	return b.String()
+}
+
+// addrLabeler maps opaque object addresses to short, stable, human-readable
+// labels (mutex#1, chan#2, ...) so a trace/deadlock report identifies "the same
+// object" across steps instead of printing raw pointers. The kind is inferred
+// from the operation that touched the address; the same address always maps to
+// the same label within one report. Shared by formatTrace and the deadlock
+// report so both name the same object consistently.
+type addrLabeler struct {
+	labels map[uint64]string
+	counts map[string]int
+}
+
+func newAddrLabeler() *addrLabeler {
+	return &addrLabeler{labels: map[uint64]string{}, counts: map[string]int{}}
+}
+
+func (l *addrLabeler) label(addr uint64, op string) string {
+	if s, ok := l.labels[addr]; ok {
+		return s
+	}
+	k := opKind(op)
+	l.counts[k]++
+	s := fmt.Sprintf("%s#%d", k, l.counts[k])
+	l.labels[addr] = s
+	return s
+}
+
+// opKind classifies an operation name into the object kind it acts on, so the
+// generated label reflects what the address is (a mutex, a channel, ...).
+func opKind(op string) string {
+	switch {
+	case op == "lock" || op == "unlock":
+		return "mutex"
+	case strings.HasPrefix(op, "chan"):
+		return "chan"
+	case strings.HasPrefix(op, "cond"):
+		return "cond"
+	case strings.HasPrefix(op, "wg"):
+		return "wg"
+	case op == "once":
+		return "once"
+	case op == "read" || op == "write":
+		return "mem"
+	default:
+		return "obj"
+	}
 }
