@@ -104,6 +104,22 @@ func block() {
 	gopark(nil, nil, waitReasonSelectNoCases, traceBlockForever, 1) // forever
 }
 
+// weaveCaseReady reports whether a select case could proceed right now, without
+// committing to it or disturbing any queue. recv tells whether cas is a receive.
+// The caller must hold the channel locks (sellock).
+//
+// It uses waitq.weaveHasClaimable rather than a bare `first != nil` so a stale,
+// already-woken select sudog still lingering on a queue is not mistaken for a
+// ready partner: dequeue would skip it, and treating it as ready makes the commit
+// fail and can spuriously report a deadlock.
+func weaveCaseReady(cas *scase, recv bool) bool {
+	c := cas.c
+	if recv {
+		return c.sendq.weaveHasClaimable() || c.qcount > 0 || c.closed != 0
+	}
+	return c.closed != 0 || c.recvq.weaveHasClaimable() || c.qcount < c.dataqsiz
+}
+
 // selectgo implements the select statement.
 //
 // cas0 points to an array of type [ncases]scase, and order0 points to
@@ -281,30 +297,30 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	var caseReleaseTime int64 = -1
 	var recvOK bool
 	if weaveControlled {
-		// Collect the ready cases without committing (non-destructive peek), then
-		// let the explorer choose which one fires so alternatives are enumerated.
-		// The channels are locked and no yield happens between peek and commit, so
-		// readiness is stable.
-		var ready []int
+		// Count the ready cases without committing (non-destructive peek), let the
+		// explorer choose one of them, then walk the poll order again to find it. Two
+		// passes rather than a []int of ready cases: we hold every channel's lock
+		// here, and growing a slice would allocate inside that non-preemptible
+		// region. The channels stay locked and no yield happens between peek and
+		// commit, so readiness is stable across the two passes.
+		nready := int32(0)
 		for _, casei := range pollorder {
-			i := int(casei)
-			cc := scases[i].c
-			var ok bool
-			if i >= nsends { // receive
-				// weaveHasClaimable (not a bare first != nil) so a stale, already-woken
-				// select sudog still lingering on the queue is not mistaken for a ready
-				// sender: dequeue would skip it, and treating it as ready makes the
-				// commit fail and can spuriously report a deadlock.
-				ok = cc.sendq.weaveHasClaimable() || cc.qcount > 0 || cc.closed != 0
-			} else { // send
-				ok = cc.closed != 0 || cc.recvq.weaveHasClaimable() || cc.qcount < cc.dataqsiz
-			}
-			if ok {
-				ready = append(ready, i)
+			if weaveCaseReady(&scases[int(casei)], int(casei) >= nsends) {
+				nready++
 			}
 		}
-		if len(ready) > 0 {
-			casi = ready[weaveSelectChoose(int32(len(ready)))]
+		if nready > 0 {
+			pick := weaveSelectChoose(nready)
+			casi = -1
+			for _, casei := range pollorder {
+				if weaveCaseReady(&scases[int(casei)], int(casei) >= nsends) {
+					if pick == 0 {
+						casi = int(casei)
+						break
+					}
+					pick--
+				}
+			}
 			cas = &scases[casi]
 			c = cas.c
 			if casi >= nsends {

@@ -191,27 +191,23 @@ var bubbleGen atomic.Uint64 // bubble ID counter
 // across the two modes.
 const synctestBaseTime = 946684800000000000 // midnight UTC 2000-01-01
 
+// synctestRun runs f in a new bubble.
+//
+// A weave-controlled bubble is NOT created here: weave drives one schedule per
+// exploration through weaveRunBubble (runtime/weave.go), which builds the bubble
+// itself so it can attach the per-schedule weaveControl.
+//
 //go:linkname synctestRun internal/synctest.Run
 func synctestRun(f func()) {
-	synctestRun1(f, false)
-}
-
-// synctestRun1 runs f in a new bubble. If controlled is true, the bubble is
-// scheduled by weave's controlled scheduler (weave build only).
-func synctestRun1(f func(), controlled bool) {
 	gp := getg()
 	if gp.bubble != nil {
 		panic("synctest.Run called from within a synctest bubble")
 	}
 	bubble := &synctestBubble{
-		id:         bubbleGen.Add(1),
-		total:      1,
-		running:    1,
-		root:       gp,
-		controlled: controlled,
-	}
-	if controlled {
-		bubble.weaveCtl = &weaveControl{}
+		id:      bubbleGen.Add(1),
+		total:   1,
+		running: 1,
+		root:    gp,
 	}
 	bubble.now = synctestBaseTime
 	lockInit(&bubble.mu, lockRankSynctest)
@@ -226,27 +222,11 @@ func synctestRun1(f func(), controlled bool) {
 	pc := sys.GetCallerPC()
 	systemstack(func() {
 		fv := *(**funcval)(unsafe.Pointer(&f))
-		if controlled {
-			// Create main parked and let the controller grant it the run token.
-			bubble.main = newproc1(fv, gp, pc, true, waitReasonWeaveScheduled)
-			weaveStart(bubble, bubble.main)
-		} else {
-			bubble.main = newproc1(fv, gp, pc, false, waitReasonZero)
-			pp := getg().m.p.ptr()
-			runqput(pp, bubble.main, true)
-			wakep()
-		}
+		bubble.main = newproc1(fv, gp, pc, false, waitReasonZero)
+		pp := getg().m.p.ptr()
+		runqput(pp, bubble.main, true)
+		wakep()
 	})
-
-	// Controlled bubbles are driven entirely by the weave controller, which
-	// tracks liveness and detects completion/deadlock itself. weaveRootWait is the
-	// weave analogue of the synctest fake-time quiescence loop below: it advances
-	// the fake clock and fires timers when the bubble is quiescent, integrated with
-	// the run-token handoff.
-	if controlled {
-		weaveRootWait(bubble)
-		return
-	}
 
 	lock(&bubble.mu)
 	bubble.active++

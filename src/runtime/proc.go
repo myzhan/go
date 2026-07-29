@@ -4559,8 +4559,10 @@ func goexit0(gp *g) {
 	}
 	// Capture the controlled bubble before gdestroy clears gp.bubble, so we can
 	// hand the run token to the next participant after this one has fully exited.
+	// Only participants are accounted for: the root/driver never exits inside the
+	// bubble, and counting it as one would corrupt the controller's live count.
 	var weaveBubble *synctestBubble
-	if gp.bubble != nil && gp.bubble.controlled {
+	if weaveControlledParticipant(gp) {
 		weaveBubble = gp.bubble
 	}
 	gdestroy(gp)

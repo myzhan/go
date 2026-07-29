@@ -129,18 +129,22 @@ func weaveRand(b *synctestBubble) uint64 {
 	return z ^ (z >> 31)
 }
 
-// weaveActive reports whether the current goroutine is a participant in a
-// controlled bubble.
+// weaveActive reports whether the current goroutine is a schedulable participant
+// in a controlled bubble.
 //
-// The weaveGloballyActive short-circuit keeps the cost on hot paths that call
-// this in every program (chan.go, select.go) to a single global load when no
-// weave bubble exists anywhere — no getg, no per-goroutine field access — so
-// non-weave programs pay essentially nothing.
+// The root (driver) goroutine is excluded: it is inside the bubble but is not a
+// participant, has no wid, and must never take the run token. Every other entry
+// point that consults bubble membership excludes it too (ready, park_m, goexit0),
+// and letting the root through here would silently corrupt a schedule — it would
+// join the runnable set as wid 0, impersonating the model's main participant.
+// Today the root only runs uninstrumented runtime code while gp.bubble is set, so
+// this is defense in depth rather than a live bug fix.
 //
 //go:nosplit
 func weaveActive() bool {
 	gp := getg()
-	return gp.bubble != nil && gp.bubble.controlled
+	b := gp.bubble
+	return b != nil && b.controlled && gp != b.root
 }
 
 // weaveControlledParticipant reports whether gp is a schedulable participant of
@@ -889,4 +893,11 @@ const (
 	weaveOpAtomicLoad
 	weaveOpAtomicStore
 	weaveOpAtomicRMW
+	// RWMutex read lock/unlock. Distinct from Lock/Unlock so a report can tell a
+	// shared acquire from an exclusive one (the whole point of an RWMutex demo), and
+	// so a replay command can tell which transitions exist only in a -weave build.
+	// They currently conflict exactly like Lock/Unlock; treating RLock/RLock as
+	// independent is a sound future reduction.
+	weaveOpRLock
+	weaveOpRUnlock
 )
