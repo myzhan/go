@@ -5713,6 +5713,25 @@ func (s *state) rtcall(fn *obj.LSym, returns bool, results []*types.Type, args .
 
 // do *left = right for type t.
 func (s *state) storeType(t *types.Type, left, right *ssa.Value, skip skipMask, leftIsStmt bool) {
+	// Under -weave, store a pointer-free multi-field struct field-by-field, with a
+	// scheduling point before each field store, so a concurrent reader can observe
+	// a torn (partially-written) struct. This models the fact that a multi-word
+	// struct assignment is not atomic. Normal builds and the race/msan/asan
+	// sanitizers keep the single whole-struct store (one range hook).
+	if base.Flag.Weave && skip == 0 && isStructNotSIMD(t) && !t.HasPointers() &&
+		t.NumComponents(types.CountBlankFields) > 1 {
+		n := t.NumFields()
+		for i := 0; i < n; i++ {
+			ft := t.FieldType(i)
+			addr := s.newValue1I(ssa.OpOffPtr, ft.PtrTo(), t.FieldOff(i), left)
+			val := s.newValue1I(ssa.OpStructSelect, ft, int64(i), right)
+			// Recurse: a scalar field gets its own weavewrite hook + store; a nested
+			// struct field decomposes again.
+			s.storeType(ft, addr, val, 0, false)
+		}
+		return
+	}
+
 	s.instrument2(t, left, nil, right, instrumentWrite)
 
 	if skip == 0 && (!t.HasPointers() || ssa.IsStackAddr(left)) {

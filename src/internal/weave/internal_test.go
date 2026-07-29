@@ -141,6 +141,38 @@ func TestMutexDPORFindsDeadlock(t *testing.T) {
 	t.Logf("DPOR found mutex deadlock after %d schedule(s); seed %q", res.Runs, res.Seed)
 }
 
+// AB/BA deadlock built from capacity-1 channels used as locks (recv = acquire,
+// send = release). This exercises the channelHB token-recycling taint (D16): a
+// participant both sends and receives on each lock channel, so the FIFO send→recv
+// pairing is not a stable happens-before and must not be used to prune the
+// reversal that reaches the deadlock. Regression: before the taint, DPOR explored
+// a single schedule and missed this, while the equivalent sync.Mutex version
+// (TestMutexDPORFindsDeadlock) was found.
+func TestChannelLockDPORFindsDeadlock(t *testing.T) {
+	res := Explore(func() {
+		lockA := make(chan int, 1)
+		lockB := make(chan int, 1)
+		lockA <- 1 // token present = unlocked
+		lockB <- 1
+		go func() {
+			<-lockA
+			<-lockB
+			lockB <- 1
+			lockA <- 1
+		}()
+		go func() {
+			<-lockB
+			<-lockA
+			lockA <- 1
+			lockB <- 1
+		}()
+	})
+	if !res.Deadlock {
+		t.Fatalf("expected DPOR to find AB/BA channel-lock deadlock; explored %d schedules", res.Runs)
+	}
+	t.Logf("DPOR found channel-lock deadlock after %d schedule(s); seed %q", res.Runs, res.Seed)
+}
+
 // Channel operations are recorded as transitions, so DPOR reasons about them
 // soundly with no compiler instrumentation. Two sends to the same buffered
 // channel race; the order determines which value is received first. DPOR must

@@ -882,4 +882,11 @@ const (
 	// receives nothing must not be matched against a sender.
 	weaveOpChanSendNB
 	weaveOpChanRecvNB
+	// sync/atomic operations, hooked in the sync/atomic package. They are
+	// scheduling points and conflict by address (like other sync objects), so a
+	// non-atomic Load+Store read-modify-write becomes explorable. No happens-before
+	// is modeled (they are excluded from channelHB, like mutex).
+	weaveOpAtomicLoad
+	weaveOpAtomicStore
+	weaveOpAtomicRMW
 )

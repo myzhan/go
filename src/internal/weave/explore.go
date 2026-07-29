@@ -31,6 +31,9 @@ const (
 	opOnce
 	opChanSendNB // non-blocking send (select default); scheduling point, no HB
 	opChanRecvNB // non-blocking recv (select default); scheduling point, no HB
+	opAtomicLoad // sync/atomic load; scheduling point, conflicts by address, no HB
+	opAtomicStore
+	opAtomicRMW // atomic read-modify-write (Add/Swap/CAS/And/Or)
 )
 
 // Step is one transition in a recorded interleaving.
@@ -172,6 +175,11 @@ func conflict(opi uint8, ai, si int64, opj uint8, aj, sj int64) bool {
 	if ai != aj {
 		return false
 	}
+	// Two atomic loads of the same location are both read-only, so their order
+	// does not matter: independent (mirrors read/read on plain memory).
+	if opi == opAtomicLoad && opj == opAtomicLoad {
+		return false
+	}
 	if isSyncOp(opi) || isSyncOp(opj) {
 		return true
 	}
@@ -218,14 +226,45 @@ func channelHB(wid, op []int32, addr []int64, steps int) func(i, j int) bool {
 	// could prune a needed reversal (unsound). So we suppress channel HB for a
 	// tainted channel, and for every channel in a run that contains a select.
 	// Program order still applies; fewer edges only widens the search.
+	//
+	// A channel used as a lock/semaphore is tainted for a further reason: when the
+	// SAME participant both sends and receives on it (acquires a token by receiving
+	// and releases it by sending), the FIFO send→recv pairing is not stable across
+	// reorderings — which send a receive pairs with depends on the schedule. Using
+	// that pairing as happens-before spuriously orders two competing receivers and
+	// prunes the reversal that reaches an AB/BA deadlock over channel locks. So if
+	// any participant both sends and receives on a channel, suppress its HB too.
 	tainted := map[int64]bool{}
 	hasSelect := false
+	chanSenders := map[int64]map[int32]bool{} // channel -> set of participants that sent
+	chanRecvers := map[int64]map[int32]bool{} // channel -> set of participants that received
+	note := func(m map[int64]map[int32]bool, c int64, p int32) {
+		s := m[c]
+		if s == nil {
+			s = map[int32]bool{}
+			m[c] = s
+		}
+		s[p] = true
+	}
 	for i := 0; i < steps; i++ {
 		switch uint8(op[i]) {
 		case opChanSendNB, opChanRecvNB:
 			tainted[addr[i]] = true
+		case opChanSend:
+			note(chanSenders, addr[i], wid[i])
+		case opChanRecv:
+			note(chanRecvers, addr[i], wid[i])
 		case opSelect:
 			hasSelect = true
+		}
+	}
+	// Taint channels where a participant both sends and receives (token recycling).
+	for c, senders := range chanSenders {
+		for p := range senders {
+			if chanRecvers[c][p] {
+				tainted[c] = true
+				break
+			}
 		}
 	}
 	P := 0
@@ -286,7 +325,8 @@ func isChanOp(op uint8) bool {
 func isSyncOp(op uint8) bool {
 	switch op {
 	case opLock, opUnlock, opChanSend, opChanRecv, opChanClose, opChanSendNB, opChanRecvNB,
-		opSelect, opWaitGroupWait, opWaitGroupAdd, opCondWait, opCondSignal, opCondBroadcast, opOnce:
+		opSelect, opWaitGroupWait, opWaitGroupAdd, opCondWait, opCondSignal, opCondBroadcast, opOnce,
+		opAtomicLoad, opAtomicStore, opAtomicRMW:
 		return true
 	}
 	return false
@@ -671,6 +711,12 @@ func opName(op uint8) string {
 		return "cond broadcast"
 	case opOnce:
 		return "once"
+	case opAtomicLoad:
+		return "atomic load"
+	case opAtomicStore:
+		return "atomic store"
+	case opAtomicRMW:
+		return "atomic rmw"
 	}
 	return "run"
 }
