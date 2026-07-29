@@ -36,7 +36,18 @@ const (
 	opAtomicRMW // atomic read-modify-write (Add/Swap/CAS/And/Or)
 	opRLock     // RWMutex read lock (shared); conflicts like opLock for now
 	opRUnlock   // RWMutex read unlock
+	// opClockAdvance advances the fake clock to the next deadline and fires the due
+	// timers. It is performed by the controller on behalf of the synthetic clock
+	// participant (ClockWid), not by any goroutine. See design.md D22.
+	opClockAdvance
 )
+
+// ClockWid is the participant id reserved for the synthetic clock. Transitions
+// with this wid are clock advances, not goroutine steps: they have no creation
+// site and must not appear in the goroutine legend. Kept in sync with
+// runtime.weaveClockWid (optab_test.go checks the op codes; this one is asserted
+// by TestClockWidReserved).
+const ClockWid = 63
 
 // Step is one transition in a recorded interleaving.
 type Step struct {
@@ -76,11 +87,13 @@ type Result struct {
 	TruncatedReason string
 
 	// UnfiredTimer is set if any explored schedule finished with all participants
-	// exited while a timer was still pending. The fake clock only advances when the
-	// whole bubble is durably blocked, so a timeout that never fired because some
-	// goroutine stayed runnable can hide a "timeout vs event" race; the driver uses
-	// this to hint the user to align the event to the timer boundary.
-	UnfiredTimer bool
+	// exited while a timer was still pending. ClockAdvanced is set if any explored
+	// schedule advanced the fake clock as a scheduling choice (see D22). Together
+	// they tell the driver whether a stranded timer is worth reporting: if the clock
+	// was never advanced anywhere, the timeout side of a "timeout vs event" race was
+	// out of reach (typically because the preemption bound forbade it).
+	UnfiredTimer  bool
+	ClockAdvanced bool
 }
 
 // Run executes f once in a controlled bubble (a single default schedule).
@@ -141,6 +154,21 @@ func newExplorer(f func()) *explorer {
 // distinct addresses are independent. Read/read on the same address is
 // independent; any write, or any synchronization-object operation, conflicts.
 func conflict(opi uint8, ai, si int64, opj uint8, aj, sj int64) bool {
+	// A clock advance fires the due timers, and their effect reaches participants
+	// only through synchronization: a send on the timer's channel, a goready, or a
+	// goroutine spawned by AfterFunc. It writes no user memory, so it COMMUTES with
+	// plain reads and writes — which is what lets weavePushClock skip memory
+	// scheduling points without losing coverage. Against synchronization it must be
+	// conservative, and address-agnostically so: its transition records no address,
+	// and a select's readiness can hinge on a timer channel it examines. Checked
+	// before the select case below, which would otherwise call the pair independent.
+	if opi == opClockAdvance || opj == opClockAdvance {
+		other := opi
+		if opi == opClockAdvance {
+			other = opj
+		}
+		return other == opClockAdvance || isSyncOp(other)
+	}
 	// A select's outcome (which case fires, or default) depends on the readiness
 	// of every channel it examines, but its transition records only a single
 	// address (0), so that dependency cannot be matched by address. Conservatively
@@ -422,6 +450,12 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 		addr := e.traceAddr[:steps]
 		size := e.traceSize[:steps]
 		en := e.traceEnabled[:steps]
+		for _, w := range wid {
+			if w == ClockWid {
+				e.res.ClockAdvanced = true
+				break
+			}
+		}
 		selTrace := e.selTrace[:nsel]
 		selBranch := e.selBranch[:nsel]
 		selStepIdx := e.selStepIdx[:nsel]
@@ -476,12 +510,28 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 		// yields a schedule whose prefix has cum[i-1] preemptions plus one more if
 		// switching to w there is itself a preemption; allow the backtrack only if
 		// that stays within maxPreemptions.
+		// The synthetic clock is priced differently from a goroutine, in both
+		// directions. Leaving it un-advanced is never a preemption (it is not a
+		// goroutine we switched away from). Choosing it is one whenever ANY real
+		// participant was runnable — not merely when the previous one still was —
+		// because letting time move instead of letting a ready goroutine run is
+		// exactly the relaxation D22 introduces. That pricing is what makes
+		// WEAVE_MAX_PREEMPTIONS=0 an exact opt-out: at 0 the clock can only be chosen
+		// when nothing else can run, which is synctest's idle-only contract.
+		clockPreempts := func(i int) bool {
+			return en[i]&^(uint64(1)<<uint(ClockWid)) != 0
+		}
 		var cum []int
 		if maxPreemptions >= 0 {
 			cum = make([]int, steps)
 			for i := 1; i < steps; i++ {
 				cum[i] = cum[i-1]
-				if wid[i] != wid[i-1] && en[i]&(1<<uint(wid[i-1])) != 0 {
+				switch {
+				case wid[i] == ClockWid:
+					if clockPreempts(i) {
+						cum[i]++
+					}
+				case wid[i] != wid[i-1] && wid[i-1] != ClockWid && en[i]&(1<<uint(wid[i-1])) != 0:
 					cum[i]++
 				}
 			}
@@ -493,11 +543,32 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 			cost := 0
 			if i >= 1 {
 				cost = cum[i-1]
-				if w != wid[i-1] && en[i]&(1<<uint(wid[i-1])) != 0 {
+			}
+			switch {
+			case w == ClockWid:
+				if clockPreempts(i) {
 					cost++
 				}
+			case i >= 1 && w != wid[i-1] && wid[i-1] != ClockWid && en[i]&(1<<uint(wid[i-1])) != 0:
+				cost++
 			}
 			return cost <= maxPreemptions
+		}
+
+		// The clock is an OPTIONAL transition: unlike a participant, which always
+		// runs eventually and so always shows up in some run, the clock may never
+		// appear at all — the default policy picks it only when nothing else can run.
+		// DPOR's backward analysis can only reverse transitions it has observed, so
+		// without seeding it here "the timeout fired" would never be explored. Add a
+		// backtrack wherever the clock was offered but not taken; done/allow keep it
+		// bounded, and conflict() reduces the resulting positions.
+		for i := 0; i < steps; i++ {
+			if en[i]&(1<<uint(ClockWid)) == 0 || wid[i] == ClockWid {
+				continue
+			}
+			if !stack[i].done[ClockWid] && allow(i, ClockWid) {
+				stack[i].backtrack[ClockWid] = true
+			}
 		}
 
 		hb := channelHB(wid, op, addr, steps)
@@ -618,6 +689,12 @@ func Replay(seed string, f func()) Result {
 	steps, _, outcome, failure, unfired := runSchedule(e.f, plan, e.traceWid, e.traceOp, e.traceValSet, selPlan, e.selTrace, e.selBranch, e.selStepIdx, e.traceAddr, e.traceSize, e.traceEnabled, e.tracePC, e.spawnPC, e.traceVal, false)
 	e.res.UnfiredTimer = unfired
 	e.res.Runs = 1
+	for _, w := range e.traceWid[:min(steps, traceCap)] {
+		if w == ClockWid {
+			e.res.ClockAdvanced = true
+			break
+		}
+	}
 	e.res.Seed = seed
 	// Same clamp/outcome ordering as ExploreBounded: the runtime keeps counting
 	// scheduling points after the trace buffers overflow, so clamp before slicing
@@ -664,6 +741,9 @@ func buildTrace(wid, op []int32, addr []int64, pc []uint64, valSet []int32, val 
 func buildGoroutines(wid []int32, spawnPC []uint64) []Goroutine {
 	max := 0
 	for _, w := range wid {
+		if w == ClockWid {
+			continue // the synthetic clock is not a goroutine
+		}
 		if int(w) > max {
 			max = int(w)
 		}
@@ -694,6 +774,8 @@ func opName(op uint8) string {
 		return "rlock"
 	case opRUnlock:
 		return "runlock"
+	case opClockAdvance:
+		return "clock advance"
 	case opChanSend:
 		return "chan send"
 	case opChanRecv:

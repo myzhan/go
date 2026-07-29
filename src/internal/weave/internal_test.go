@@ -76,6 +76,115 @@ func TestFakeClockContextTimeout(t *testing.T) {
 	t.Log("context.WithTimeout fires under fake-clock advancement")
 }
 
+// The timeout side of a "timeout vs event" race must be reachable. The worker here
+// is always immediately runnable, so under synctest's rule — advance the clock only
+// once the WHOLE bubble is durably blocked — the timer could never fire and "the
+// timeout won" was not in the state space at all. Advancing the fake clock is now a
+// schedule choice of its own (D22), so the interleaving where the timeout wins and
+// strands the worker forever on an unbuffered send (a textbook goroutine leak) must
+// be found and reported as a deadlock.
+func TestClockAdvanceIsAScheduleChoice(t *testing.T) {
+	res := Explore(func() {
+		result := make(chan int) // unbuffered: nobody left to receive once we give up
+		go func() { result <- 42 }()
+		select {
+		case <-result:
+		case <-time.After(time.Second):
+			// gave up; the worker's send can never complete
+		}
+	})
+	if !res.Deadlock {
+		t.Fatalf("expected the timeout branch to strand the worker; explored %d schedule(s): %+v", res.Runs, res)
+	}
+	if !res.ClockAdvanced {
+		t.Fatalf("deadlock found without ever advancing the clock — not the interleaving under test: %+v", res.Trace)
+	}
+	sawAdvance := false
+	for _, s := range res.Trace {
+		if s.Op != "clock advance" {
+			continue
+		}
+		sawAdvance = true
+		if s.Wid != ClockWid {
+			t.Errorf("clock advance attributed to wid %d, want the reserved %d", s.Wid, ClockWid)
+		}
+		if s.Val != uint64(time.Second) {
+			t.Errorf("clock advanced by %v, want %v", time.Duration(s.Val), time.Second)
+		}
+	}
+	if !sawAdvance {
+		t.Fatalf("failing trace has no clock-advance transition: %+v", res.Trace)
+	}
+	for _, g := range res.Goroutines {
+		if g.Wid == ClockWid {
+			t.Errorf("the synthetic clock leaked into the goroutine legend: %+v", g)
+		}
+	}
+	t.Logf("timeout-vs-event found after %d schedule(s); seed %q", res.Runs, res.Seed)
+}
+
+// Choosing the clock over a runnable goroutine costs a preemption. That is what
+// keeps synctest's idle-only behaviour available: at 0 preemptions the clock still
+// advances when nothing else can run (so time.Sleep-style models keep working) but
+// can never preempt a runnable goroutine, making WEAVE_MAX_PREEMPTIONS=0 an exact
+// opt-out of the D22 relaxation.
+func TestClockAdvanceCostsAPreemption(t *testing.T) {
+	model := func() {
+		result := make(chan int)
+		go func() { result <- 42 }()
+		select {
+		case <-result:
+		case <-time.After(time.Second):
+		}
+	}
+	b0 := ExploreBounded(model, DefaultMaxSchedules, 0, 0)
+	if b0.Failed || b0.Deadlock {
+		t.Fatalf("with 0 preemptions the clock must not preempt a runnable goroutine; got %+v", b0)
+	}
+	if b0.ClockAdvanced {
+		t.Fatalf("with 0 preemptions no schedule should have advanced the clock; got %+v", b0)
+	}
+	if b0.Truncated {
+		t.Fatalf("a preemption bound should not truncate; got %+v", b0)
+	}
+	b1 := ExploreBounded(model, DefaultMaxSchedules, 1, 0)
+	if !b1.Deadlock {
+		t.Fatalf("with one preemption allowed the timeout branch should be reached; got %+v", b1)
+	}
+	t.Logf("clock bounded by preemption count: c=0 clean (%d schedules), c=1 found the leak (%d)", b0.Runs, b1.Runs)
+}
+
+// A seed containing a clock advance must replay to the same interleaving: the clock
+// is just another wid in the choice vector, and every schedule starts from a fresh
+// bubble whose clock is reset, so no extra state needs recording.
+func TestClockAdvanceSeedReplays(t *testing.T) {
+	model := func() {
+		result := make(chan int)
+		go func() { result <- 42 }()
+		select {
+		case <-result:
+		case <-time.After(time.Second):
+		}
+	}
+	found := Explore(model)
+	if !found.Deadlock || found.Seed == "" {
+		t.Fatalf("expected a deadlock with a seed; got %+v", found)
+	}
+	for i := range 3 {
+		rep := Replay(found.Seed, model)
+		if !rep.Deadlock {
+			t.Fatalf("replay %d: seed %q did not reproduce the deadlock", i, found.Seed)
+		}
+		if !rep.ClockAdvanced {
+			t.Fatalf("replay %d: seed %q replayed without the clock advance", i, found.Seed)
+		}
+		if !sameSchedule(rep.Trace, found.Trace) {
+			t.Fatalf("replay %d: interleaving differs\norig: %v\nrep:  %v", i, found.Trace, rep.Trace)
+		}
+	}
+	t.Logf("clock-advance seed %q replays deterministically", found.Seed)
+}
+
 // A genuine deadlock with no pending timer must still be reported as a deadlock,
 // not mistaken for a clock-advance opportunity.
 func TestFakeClockNoTimerStillDeadlock(t *testing.T) {

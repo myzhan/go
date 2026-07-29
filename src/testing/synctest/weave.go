@@ -116,11 +116,14 @@ func weaveExplore(t *testing.T, f func(*testing.T)) bool {
 			note = " (default ceiling; set WEAVE_MAX_PREEMPTIONS to search deeper)"
 		}
 		t.Logf("weave: ok, explored %d schedule(s) up to %d preemption(s)%s", res.Runs, ceiling, note)
-		if res.UnfiredTimer {
-			t.Logf("weave: note: a pending timer never fired (all goroutines exited first). " +
-				"The fake clock only advances when the whole bubble is durably blocked, so a " +
-				"timeout-vs-event race may be unexplored; align the event to the timer boundary " +
-				"(e.g. Sleep the event to the same virtual instant) so weave can interleave them.")
+		if res.UnfiredTimer && !res.ClockAdvanced {
+			// Advancing the clock is a scheduling choice now (D22), so a stranded timer
+			// only matters when that choice was never taken anywhere — which within a
+			// bounded search means the bound forbade it.
+			t.Logf("weave: note: a pending timer never fired and the fake clock was never " +
+				"advanced in any explored schedule, so the \"timeout wins\" side of a " +
+				"timeout-vs-event race is unexplored. Advancing the clock while a goroutine " +
+				"is still runnable costs a preemption, so raise WEAVE_MAX_PREEMPTIONS to reach it.")
 		}
 	}
 	return true
@@ -143,7 +146,8 @@ func exploreIterative(body func(), budget, ceiling int, timeout time.Duration) w
 	start := time.Now()
 	var last weave.Result
 	spent := 0
-	unfired := false // any level left a timer pending at exit (aggregated across levels)
+	unfired := false  // any level left a timer pending at exit (aggregated across levels)
+	advanced := false // any level advanced the fake clock as a scheduling choice
 	for c := 0; c <= ceiling; c++ {
 		remBudget := budget
 		if budget > 0 {
@@ -152,6 +156,7 @@ func exploreIterative(body func(), budget, ceiling int, timeout time.Duration) w
 				last.Truncated = true
 				last.TruncatedReason = fmt.Sprintf("schedule budget reached at %d preemption(s)", c)
 				last.UnfiredTimer = unfired
+				last.ClockAdvanced = advanced
 				return last
 			}
 		}
@@ -162,19 +167,23 @@ func exploreIterative(body func(), budget, ceiling int, timeout time.Duration) w
 				last.Truncated = true
 				last.TruncatedReason = fmt.Sprintf("time budget reached at %d preemption(s)", c)
 				last.UnfiredTimer = unfired
+				last.ClockAdvanced = advanced
 				return last
 			}
 		}
 		res := weave.ExploreBounded(body, remBudget, c, remTime)
 		spent += res.Runs
 		unfired = unfired || res.UnfiredTimer
+		advanced = advanced || res.ClockAdvanced
 		if res.Failed || res.Deadlock || res.Truncated {
 			res.UnfiredTimer = unfired
+			res.ClockAdvanced = advanced
 			return res
 		}
 		last = res // level c fully explored, no failure
 	}
 	last.UnfiredTimer = unfired
+	last.ClockAdvanced = advanced
 	return last
 }
 
@@ -393,6 +402,13 @@ func formatTrace(steps []weave.Step, lab *addrLabeler) string {
 		// Drop a bare "run" step immediately followed by a real operation from the
 		// same goroutine: the operation line already shows it was scheduled.
 		if s.Op == "run" && i+1 < len(steps) && steps[i+1].Wid == s.Wid {
+			continue
+		}
+		if s.Wid == weave.ClockWid {
+			// The synthetic clock is not a goroutine, so it gets no gN; show how far
+			// time moved instead, which is what makes a timeout-vs-event trace legible.
+			n++
+			fmt.Fprintf(&b, "  %2d: clock advance +%v\n", n, time.Duration(s.Val))
 			continue
 		}
 		loc := ""

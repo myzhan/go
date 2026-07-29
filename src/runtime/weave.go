@@ -221,7 +221,15 @@ func weaveChoose(ctl *weaveControl) int {
 			// A source PC is only meaningful for memory read/write ops; other
 			// transitions (run/exit/chan/mutex) reuse the g and would show a
 			// stale PC.
-			if o := ctl.runnableOp[idx]; o == uint8(weaveOpRead) || o == uint8(weaveOpWrite) {
+			if o := ctl.runnableOp[idx]; o == uint8(weaveOpClockAdvance) {
+				// No PC (no participant performs it), but carry how far the clock
+				// moves so the report can show "clock advance +1s".
+				ctl.tracePC[ctl.step] = 0
+				if ctl.traceVal != nil {
+					ctl.traceVal[ctl.step] = ctl.runnableVal[idx]
+					ctl.traceValSet[ctl.step] = 1
+				}
+			} else if o == uint8(weaveOpRead) || o == uint8(weaveOpWrite) {
 				ctl.tracePC[ctl.step] = uint64(ctl.runnablePC[idx])
 				if ctl.traceVal != nil {
 					// Record the value the compiler supplied (writes) or a placeholder
@@ -256,7 +264,12 @@ func weaveChoose(ctl *weaveControl) int {
 // plan. With stickyDefault it continues the previously-run participant if it is
 // still runnable (a preemption-free choice); otherwise it picks the lowest wid.
 func weaveDefaultChoice(ctl *weaveControl) int {
-	if ctl.stickyDefault && ctl.lastWid >= 0 {
+	// Never continue the synthetic clock: "keep advancing time" is not a
+	// preemption-free continuation of anything, and sticking to it would fire a
+	// whole timer chain before letting the woken participants run. Fall through to
+	// the lowest wid, where the clock (the highest id) is picked only when it is
+	// the sole candidate — which is exactly the pre-D22 behaviour.
+	if ctl.stickyDefault && ctl.lastWid >= 0 && ctl.lastWid != weaveClockWid {
 		for i := 0; i < ctl.nrun; i++ {
 			if ctl.runnableWid[i] == ctl.lastWid {
 				return i
@@ -276,15 +289,98 @@ func weaveLowestWid(ctl *weaveControl) int {
 	return idx
 }
 
-// weaveTake chooses and removes the next participant to run, or nil if none are
-// runnable. Caller holds bubble.mu.
-func weaveTake(ctl *weaveControl) *g {
+// weavePushClock offers "advance the fake clock to the next deadline and fire the
+// due timers" as a candidate transition, and returns its index in the runnable set
+// (-1 if it is not offered). Caller holds bubble.mu.
+//
+// The entry is synthetic: it carries no g, the reserved participant id
+// weaveClockWid, and the amount the clock would advance by (for the report). When
+// weaveChoose picks it, weaveTake reports isClock and the caller hands the token to
+// the root, which owns the advance loop (weaveRootWait).
+//
+// Offering it at all RELAXES synctest's fake-clock contract, which advances time
+// only once the whole bubble is durably blocked. Under exploration that contract
+// makes a whole bug class unreachable: if the goroutine racing a timeout stays
+// runnable, the timeout can never fire, so "the timeout won" is not in the state
+// space at all (see .claude/weave/design.md D22). The three conditions below keep
+// the relaxation as small as possible:
+//
+//   - a timer is actually pending;
+//   - some participant is BLOCKED (live > nrun). This is the relaxation: "all
+//     durably blocked" becomes "any blocked". Real time passes for a goroutine that
+//     is waiting, so its timeout may fire even though a sibling is still running.
+//     When nobody is blocked, every participant is making progress and the clock
+//     stays put — which is what keeps `start := time.Now(); work(); Since(start)`
+//     zero, the fake-clock property tests actually rely on;
+//   - this is not a plain memory scheduling point (atMemOp). A clock advance
+//     touches no user memory, so it commutes with reads and writes: any schedule
+//     with the advance between two memory ops has an equivalent one with it at the
+//     neighbouring sync point, which IS explored. Skipping memory points therefore
+//     costs no coverage and keeps -weave's per-access instrumentation from
+//     multiplying the clock dimension.
+//
+// Note the default policy (lowest wid first) never picks the clock while a real
+// participant is runnable, so the first schedule of every model is unchanged; the
+// clock is reached only by DPOR backtracking. WEAVE_MAX_PREEMPTIONS=0 therefore
+// restores the idle-only behaviour exactly.
+func weavePushClock(bubble *synctestBubble, atMemOp bool) int {
+	ctl := bubble.weaveCtl
+	if atMemOp || ctl.live == 0 || ctl.live <= ctl.nrun {
+		return -1
+	}
+	when := bubble.timers.wakeTime()
+	if when <= 0 {
+		return -1
+	}
+	delta := when - bubble.now
+	if delta < 0 {
+		delta = 0
+	}
+	if ctl.nrun >= weaveMaxRunnable {
+		ctl.overflow = true
+		return -1
+	}
+	i := ctl.nrun
+	ctl.runnable[i] = 0
+	ctl.runnableWid[i] = weaveClockWid
+	ctl.runnableOp[i] = uint8(weaveOpClockAdvance)
+	ctl.runnableAddr[i] = 0
+	ctl.runnableSize[i] = 0
+	ctl.runnablePC[i] = 0
+	ctl.runnableVal[i] = uint64(delta)
+	ctl.runnableValSet[i] = true
+	ctl.nrun++
+	return i
+}
+
+// weaveTake chooses and removes the next transition to run. It returns the
+// participant to grant the token to, or (nil, true) when the controlled clock was
+// chosen (the caller must let the root advance it), or (nil, false) when nothing
+// can run. Caller holds bubble.mu.
+//
+// atMemOp tells whether the caller is at a plain memory read/write scheduling
+// point; see weavePushClock.
+func weaveTake(bubble *synctestBubble, atMemOp bool) (*g, bool) {
+	ctl := bubble.weaveCtl
+	clockIdx := weavePushClock(bubble, atMemOp)
 	if ctl.nrun == 0 {
-		return nil
+		return nil, false
 	}
 	k := weaveChoose(ctl)
+	isClock := k == clockIdx
 	gp := ctl.runnable[k].ptr()
-	// Shift the tail down to remove index k, preserving relative order.
+	weaveDropRunnable(ctl, k)
+	if clockIdx >= 0 && !isClock {
+		// The synthetic entry is recomputed at every scheduling point, so drop it
+		// again. It was appended last, so after removing k it is the final entry.
+		weaveDropRunnable(ctl, ctl.nrun-1)
+	}
+	return gp, isClock
+}
+
+// weaveDropRunnable removes index k from the runnable set, preserving relative
+// order. Caller holds bubble.mu.
+func weaveDropRunnable(ctl *weaveControl, k int) {
 	for i := k; i < ctl.nrun-1; i++ {
 		ctl.runnable[i] = ctl.runnable[i+1]
 		ctl.runnableWid[i] = ctl.runnableWid[i+1]
@@ -297,7 +393,6 @@ func weaveTake(ctl *weaveControl) *g {
 	}
 	ctl.nrun--
 	ctl.runnable[ctl.nrun] = 0
-	return gp
 }
 
 // weaveStart enrolls the bubble's main goroutine (created parked) and grants it
@@ -308,7 +403,7 @@ func weaveStart(bubble *synctestBubble, main *g) {
 	ctl.live++
 	weaveAssignWid(ctl, main)
 	weavePush(ctl, main, weaveOpNone, 0, 0, 0, 0, false)
-	next := weaveTake(ctl)
+	next, _ := weaveTake(bubble, false) // no timers can exist yet
 	unlock(&bubble.mu)
 	weaveGrant(next)
 }
@@ -319,8 +414,10 @@ func weaveStart(bubble *synctestBubble, main *g) {
 func weaveAssignWid(ctl *weaveControl, gp *g) {
 	gp.weaveWid = ctl.nextWid
 	ctl.nextWid++
-	if ctl.nextWid > 64 {
-		ctl.overflow = true // too many participants for DPOR's 64-bit enabled mask
+	if gp.weaveWid >= weaveClockWid {
+		// Out of participant ids: the DPOR enabled mask is 64 bits wide and the top
+		// one is reserved for the synthetic clock participant.
+		ctl.overflow = true
 	}
 	if ctl.spawnPC != nil && int(gp.weaveWid) < len(ctl.spawnPC) {
 		ctl.spawnPC[gp.weaveWid] = uint64(gp.gopc)
@@ -392,7 +489,7 @@ func weaveEnqueue(gp *g) {
 func weaveOnBlock(bubble *synctestBubble) {
 	ctl := bubble.weaveCtl
 	lock(&bubble.mu)
-	next := weaveTake(ctl)
+	next, clock := weaveTake(bubble, false)
 	if next != nil {
 		unlock(&bubble.mu)
 		weaveGrant(next)
@@ -401,7 +498,7 @@ func weaveOnBlock(bubble *synctestBubble) {
 	// No participant is runnable. If a timer is pending, the bubble is not
 	// deadlocked: the fake clock can advance and fire it, waking a participant.
 	// The root drives that (weaveRootWait). Otherwise it is a real deadlock.
-	if bubble.timers.wakeTime() > 0 {
+	if clock || bubble.timers.wakeTime() > 0 {
 		ctl.advanceClock = true
 	} else {
 		ctl.deadlock = true
@@ -427,13 +524,15 @@ func weaveOnGoexit(bubble *synctestBubble) {
 		weavePush(ctl, ctl.waiter, weaveOpNone, 0, 0, 0, 0, false)
 		ctl.waiter = nil
 	}
-	next := weaveTake(ctl)
+	next, clock := weaveTake(bubble, false)
 	if next != nil {
 		unlock(&bubble.mu)
 		weaveGrant(next)
 		return
 	}
-	if ctl.live == 0 {
+	if clock {
+		ctl.advanceClock = true
+	} else if ctl.live == 0 {
 		ctl.done = true
 		// All participants exited while a timer was still pending: the fake clock
 		// only advances when the whole bubble is durably blocked, so a timer never
@@ -489,12 +588,20 @@ func weaveSchedPointSlow(op weaveOp, id unsafe.Pointer, size, pc uintptr, val ui
 	// pending operation (and, for a memory op, its width/PC/value) and taking the
 	// chosen one. If gp is chosen, it keeps running.
 	weavePush(ctl, gp, op, uintptr(id), size, pc, val, valSet)
-	next := weaveTake(ctl)
+	memOp := op == weaveOpRead || op == weaveOpWrite
+	next, clock := weaveTake(bubble, memOp)
 	if next == gp {
 		unlock(&bubble.mu)
 		return
 	}
 	unlock(&bubble.mu)
+	if clock {
+		// The clock was chosen over every runnable participant. gp stays in the
+		// runnable set (it was pushed but not taken) and will be granted the token
+		// later; park it and wake the root to perform the advance.
+		gopark(weaveHandoffClock, unsafe.Pointer(bubble), waitReasonWeaveScheduled, traceBlockSynctest, 0)
+		return
+	}
 	// Park gp; grant next in the unlockf, after gp is off its M.
 	gopark(weaveHandoff, unsafe.Pointer(next), waitReasonWeaveScheduled, traceBlockSynctest, 0)
 }
@@ -601,6 +708,33 @@ func weaveHandoff(gp *g, next unsafe.Pointer) bool {
 	return true
 }
 
+// weaveHandoffClock is the gopark unlockf used when the synthetic clock wins a
+// scheduling point: it asks the root to advance the fake clock and fire the due
+// timers (weaveRootWait owns that loop, and runs outside the instrumented,
+// participant world).
+//
+// Setting advanceClock here rather than before gopark is what keeps the
+// serialization invariant: park_m switches the caller off its M before running the
+// unlockf, so the root cannot start advancing while the caller is still running.
+// The rootParked handshake closes the wake-before-park race the same way
+// weaveOnBlock does, and weaveRootPark declines to park when advanceClock is
+// already set.
+func weaveHandoffClock(gp *g, arg unsafe.Pointer) bool {
+	b := (*synctestBubble)(arg)
+	lock(&b.mu)
+	b.weaveCtl.advanceClock = true
+	wake := b.weaveCtl.rootParked
+	b.weaveCtl.rootParked = false
+	unlock(&b.mu)
+	if wake {
+		// Mechanically identical to goready, but done inline like weaveGrant: we are
+		// on g0 inside park_m, where the deliberate choice everywhere else in this
+		// file is to avoid a systemstack round trip.
+		weaveGrant(b.root)
+	}
+	return true
+}
+
 // weaveGrant makes a participant runnable and gives it the run token. It mirrors
 // ready but bypasses ready's weave interception (which would re-enqueue the
 // participant instead of running it).
@@ -651,7 +785,7 @@ func weaveRootWait(bubble *synctestBubble) {
 				root.m.curg = curg
 			})
 			lock(&bubble.mu)
-			next := weaveTake(ctl)
+			next, clock := weaveTake(bubble, false)
 			if next != nil {
 				unlock(&bubble.mu)
 				weaveGrant(next)
@@ -659,6 +793,8 @@ func weaveRootWait(bubble *synctestBubble) {
 			}
 			// The timers fired but woke no participant. Decide the next state.
 			switch {
+			case clock:
+				ctl.advanceClock = true // another advance was chosen; go around again
 			case ctl.live == 0:
 				ctl.done = true
 			case bubble.timers.wakeTime() > 0:
@@ -833,8 +969,8 @@ func weaveWait() {
 			panic("weave: concurrent weave.Wait")
 		}
 		ctl.waiter = gp
-		next := weaveTake(ctl)
-		if next == nil {
+		next, clock := weaveTake(b, false)
+		if next == nil && !clock {
 			// Others remain but none can run: they can never exit → deadlock.
 			ctl.waiter = nil
 			ctl.deadlock = true
@@ -848,6 +984,12 @@ func weaveWait() {
 			return
 		}
 		unlock(&b.mu)
+		if clock {
+			// Let the root advance the clock; the waiter is re-enqueued by
+			// weaveOnGoexit as before, so the loop re-checks after it resumes.
+			gopark(weaveHandoffClock, unsafe.Pointer(b), waitReasonWeaveScheduled, traceBlockSynctest, 0)
+			continue
+		}
 		// Park; grant next in the unlockf. Resumed when re-enqueued on a goexit.
 		gopark(weaveHandoff, unsafe.Pointer(next), waitReasonWeaveScheduled, traceBlockSynctest, 0)
 	}
@@ -900,4 +1042,13 @@ const (
 	// independent is a sound future reduction.
 	weaveOpRLock
 	weaveOpRUnlock
+	// Advance the fake clock to the next deadline and fire the due timers. Not a
+	// participant's operation: it is performed by the controller (the bubble root)
+	// on behalf of the synthetic clock participant, weaveClockWid. See D22.
+	weaveOpClockAdvance
 )
+
+// weaveClockWid is the participant id reserved for the synthetic clock (see
+// weavePushClock). Real participants therefore get 0..weaveClockWid-1, which
+// weaveAssignWid enforces.
+const weaveClockWid = 63

@@ -53,6 +53,19 @@ var opTable = map[string]uint8{
 	"AtomicRMW":     opAtomicRMW,
 	"RLock":         opRLock,
 	"RUnlock":       opRUnlock,
+	"ClockAdvance":  opClockAdvance,
+}
+
+// The synthetic clock participant's id must match the runtime's, or a clock
+// transition would be attributed to a real goroutine (and vice versa).
+func TestClockWidReserved(t *testing.T) {
+	const want = 63 // runtime/weave.go: weaveClockWid
+	if ClockWid != want {
+		t.Fatalf("ClockWid = %d, runtime reserves %d", ClockWid, want)
+	}
+	if ClockWid > 63 {
+		t.Fatalf("ClockWid = %d does not fit the 64-bit enabled mask", ClockWid)
+	}
 }
 
 func TestOpCodesAgreeWithRuntime(t *testing.T) {
