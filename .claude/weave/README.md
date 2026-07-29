@@ -20,15 +20,23 @@ I/O 与时钟)同样适用。
 
 ## 当前状态
 
-已达到**可用里程碑**:未改写的真实 `chan`/`select`/`sync.Mutex`/`RWMutex`/`WaitGroup`/`Cond`/
-`Once` + 普通内存(`-weave`)代码可被系统性交错探索;DPOR(含差分健全性验证 + 抢占上界)、
-select-case 枚举、非阻塞 channel 操作、RNG/map 序确定化、panic 捕获、失败 seed 重放 + 源码行号 +
-goroutine 图例 + 读写值显示均已落地。**易用性**:不设抢占上界时**默认自动迭代加深**(0→2,避免真实
-模型爆炸)、失败轨迹对象用**可读标签**(mutex#1/chan#2)、**死锁报告逐 goroutine 列出等待对象**、
-假时钟"超时 vs 事件"漏探时**打印对齐提示**。**API 已精简**:不再有 `testing/weave`/`weave.Test`——直接用
-标准 `testing/synctest.Test`,`-weave` 下自动进入探索(ADR D12)。`sync/atomic` **类型化 API**
-(`atomic.Int64/Bool/Pointer` 等的方法)已插桩为调度点(ADR D18,库级钩子 + build-tag no-op 保内联),
-无锁 RMW 能探索了;**剩余缺口**:atomic 自由函数(`atomic.LoadInt64` 等 intrinsic)与 `atomic.Value`。
+已达到**可用里程碑**:未改写的真实 `chan`/`select`/`sync.Mutex`/`RWMutex`/`WaitGroup`/`Cond`/`Once`/
+`sync/atomic`(类型化 API)+ 普通内存(`-weave`)代码可被系统性交错探索;DPOR(含差分健全性验证 +
+抢占上界)、select-case 枚举、非阻塞 channel 操作、假时钟推进、RNG/map 序确定化、panic 捕获、失败
+seed 重放 + 源码行号 + goroutine 图例 + 读写值显示均已落地。
+
+**用户接口**:没有 weave 专属 API——直接写标准 `testing/synctest.Test`,`-weave` 下自动进入探索(D12)。
+
+**易用性**:不设抢占上界时**默认自动迭代加深**(0→2,避免真实模型爆炸)、失败轨迹对象用**可读标签**
+(mutex#1/chan#2/rwmutex#3)、**死锁报告逐 goroutine 列出等待对象**、假时钟"超时 vs 事件"漏探时
+**打印对齐提示**。
+
+**剩余缺口**:atomic 自由函数(`atomic.LoadInt64` 等编译器 intrinsic)与 `atomic.Value`;经 runtime
+函数完成的访问(Go map);弱内存重排。
+
+**钩子成本**(D20):除 chan/select 与 `sync.Mutex`(始终编译)之外的库级钩子——RWMutex/Once/Cond/
+WaitGroup/atomic——用 `-weave` 编译期常量门控 + 钩子体 noinline,普通构建开销精确为零;顺带修掉了
+本 fork 长期让 `RWMutex.RLock/RUnlock`、`Once.Do` 在所有程序里失去内联的回归。
 
 详细能力清单与里程碑见 [imp.md](imp.md) §1、§6。
 
@@ -40,8 +48,13 @@ cd src && ../bin/go test internal/weave/ testing/synctest/
 cd src && ../bin/go test -weave internal/weave/
 
 # 演示模块:全部是普通 testing/synctest 用例,加 -weave 即进入系统交错探索
-# (部分用例为故意失败,展示 weave 抓 bug + 打印 seed)
-cd weavedemo && ../bin/go test -weave -v
+# supported/ 里 23 个为故意失败(展示 weave 抓 bug + 打印 seed),correct_* 预期 PASS;
+# unsupported/ 全 PASS(已知假阴性,作边界文档)。根目录不放 .go 文件。
+cd weavedemo && ../bin/go test -weave -v ./...
+
+# 混编"预期失败/预期通过"导致退出码判不了对错,所以用这个脚本自动校验
+# (期望值从每个用例的注释推导,改动引擎后务必跑一遍):
+cd weavedemo && ./check.sh
 ```
 
 失败时打印逐步交错 + goroutine 图例 + 一个 seed,例如:
@@ -92,7 +105,7 @@ D11);仍建议用 channel/`context.WithCancel` 等内存接缝让交错更显式
 
 - **首选 `net.Pipe`**:它本就是 bubble-aware(channel 实现),且**紧凑**——Read/Write 是同步
   rendezvous,每次交接一个调度点,探索空间小。请求/响应、协议握手、断线重连都能直接跑在它上面
-  (见 `weavedemo/netfake_test.go`、`asyncio_test.go`)。
+  (见 `weavedemo/supported/correct_netfake_test.go`、`correct_asyncio_test.go`)。
 - **别用 `sync.Cond`+`[]byte` 自造 buffered conn**:`-weave` 下每次 slice/标志访问都成调度点,
   fake 自身的内部状态就会撑爆搜索(一个单字节回显都可能超预算)。确需缓冲就用 **buffered channel**
   (每条消息一个调度点),不要 cond+slice。
@@ -106,3 +119,6 @@ D11);仍建议用 channel/`context.WithCancel` 等内存接缝让交错更显式
 "超时 vs 事件"这一类竞争就探不到(假阴性)。要探这类竞争,把并发事件**对齐到定时器边界**——例如
 让事件 goroutine 先 `time.Sleep(超时时长)` 到与超时同一虚拟时刻,两者便在同一时刻竞争,weave 即可
 交错二者。(weave 在探索结束若发现有从未触发的定时器,会打印提示引导你这样做。)
+
+把"推进时钟到最近 deadline 并触发"本身建模成**一等的可枚举调度选项**可以根治它;这是当前最值得做的
+能力缺口,见 design.md §9。

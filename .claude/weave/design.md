@@ -133,7 +133,7 @@ bubble 归属在创建时继承,跨 package 自动生效,对被测代码透明�
 
 ### 3.4 L4:公共 API —— 就是标准库 `testing/synctest`(无 weave 专属 API)
 
-**没有 `testing/weave` 包了**(已删除,见 D12)。用户写普通 `testing/synctest` 用例:
+没有 weave 专属 API(见 D12)。用户写普通 `testing/synctest` 用例:
 
 ```go
 func Test(t *testing.T, f func(*testing.T))   // 标准库签名
@@ -142,7 +142,8 @@ func Wait()                                   // 阻塞到其余 goroutine durab
 
 `go test`(不带 flag)= 一次普通 synctest 单跑;`go test -weave` 下 `synctest.Test` 改派到 L3 探索引擎:
 `testing/synctest/weave.go`(`//go:build weave`)的 `weaveExplore` 起 controlled bubble、驱动引擎每条
-schedule(每条经 `testing.testingWeaveTest` 把 f **作为 bubble root 内联跑**,失败转 panic 供引擎捕获);
+schedule(每条经 `testing.testingWeaveTest` 把 f **内联作为 bubble 的主参与者**跑——而不是另起子
+goroutine,否则真 root 会成为 `weaveWait` 的幽灵等待者;失败转 panic 供引擎捕获);
 任一调度 panic/死锁 → `t.Errorf` + 逐步交错 + goroutine 图例 + seed;截断 → `INCOMPLETE`;成功 → `t.Logf`。
 `synctest.Wait()` 在受控 bubble 内自动路由到 weave 屏障(`runtime.synctestWait` 判 `bubble.controlled`)。
 
@@ -211,8 +212,8 @@ GC 抢占恢复丢令牌的竞态(见 D10),以及一轮代码评审报出的一�
   ```
     goroutines:
       g0: model root
-      g1: weavedemo.TestDeadlock.func1 (weave_test.go:79)
-      g2: weavedemo.TestDeadlock.func1 (weave_test.go:85)
+      g1: supported.TestMutexABBADeadlock.func1 (mutex_abba_deadlock_test.go:22)
+      g2: supported.TestMutexABBADeadlock.func1 (mutex_abba_deadlock_test.go:28)
   ```
   实现:`newproc` 里 `sys.GetCallerPC()` → `newg.gopc`;`weaveAssignWid` 按 wid 记进
   `weaveControl.spawnPC`,经 `weaveRunSchedule` 带回;`buildGoroutines` 用 `CallersFrames` 符号化。
@@ -290,14 +291,17 @@ M0 原型(纯库级插桩)下调度器只能在"回调进调度器的操作"处�
 失败时序完全由调度器各决策点的选择决定;捕获该向量 → seed → `Replay`/`WEAVE_REPLAY` 百分百
 重放。前提:模型除调度外确定;改被测代码 seed 失效。
 
-### D8 — L2 始终编译、纯运行时门控(不用 build tag)
-**最终决策(已修订)**:L2 的 runtime 钩子**始终编译进去、无 build tag**,`go test` 直接可跑
-weave 测试。成本靠运行时门控(`weaveActive()` + `weaveGloballyActive` 单次全局 load),普通程序
-只多一次可预测的 not-taken 分支,footprint 同 synctest。**为何不像 -race 用 build tag**:-race 在
-每次内存访问插桩(遍布、无法廉价门控),必须编译期开关;L2 钩子只在 park/ready/newproc/goexit
-少数 choke point,可廉价运行时门控。**曾经的中间态**:一度做过 `weaveenabled` const +
-`weave_on.go`/`weave_off.go` 的 build-tag DCE 方案(像 -race),后按用户要求去掉 tag,合并为单个
-始终编译的 `runtime/weave.go`。**L1 仍需 `-weave` 构建档**(内存插桩遍布每次访问)。
+### D8 — L2 的 runtime 钩子始终编译、纯运行时门控(不用 build tag)
+**决策**:L2 的 **runtime** 钩子(chan/select/park/ready/newproc/goexit)**始终编译进去、无 build tag**,
+`go test` 直接可跑 weave 测试。成本靠运行时门控(`weaveActive()` + `weaveGloballyActive` 单次全局 load),
+普通程序只多一次可预测的 not-taken 分支,footprint 同 synctest。**为何不像 -race 用 build tag**:-race 在
+每次内存访问插桩(遍布、无法廉价门控),必须编译期开关;L2 的 runtime 钩子只在 park/ready/newproc/goexit
+少数 choke point,可廉价运行时门控。**L1 仍需 `-weave` 构建档**(内存插桩遍布每次访问)。
+
+**范围已被 D20 收窄**:这条只对 runtime 钩子和 `internal/sync.Mutex` 成立。`sync` 的 RWMutex/Once/
+Cond/WaitGroup 与 `sync/atomic` 的钩子后来改成了 build-tag 常量(`weaveEnabled`)门控——因为"运行期
+门控"仍要付一次**函数调用**,而调用在内联成本模型里值 57 分,足以让上游正好卡在预算上的
+`RWMutex.RLock`/`RUnlock`/`Once.Do` 在每个 Go 程序里失去内联。理由与代价见 D20。
 
 ### D9 — "全局状态 / 泡泡外并发"是品类边界
 拆成两个可解性不同的子问题(详见 §7):
@@ -334,12 +338,13 @@ run-token 交回令牌。只有"无 runnable 且无 pending timer"才是真死�
 会无限推进时钟 → 探索受调度/时间预算约束(超限报 Truncated)。回归见 `internal/weave` 的
 `TestFakeClock*`。
 
-### D12 — weave 作为 `synctest.Test` 的 `-weave` 模式(免专属 API,**已落地,`testing/weave` 已删除**)
+### D12 — weave 作为 `synctest.Test` 的 `-weave` 模式(免专属 API)
 
-**落地状态(2026-07-17)**:`testing/weave` 包已删除;`weave.Test`/`weave.Wait`/`weave.Yield` 不再存在。
-用户只写标准 `testing/synctest.Test` + `synctest.Wait`,`go test -weave` 即进入探索。三处关键实现:
+**落地状态(2026-07-17)**:`testing/weave` 包已删除,不存在 `weave.Test`/`weave.Wait`/`weave.Yield`
+这类用户 API(`internal/weave.Yield`/`Wait` 只给引擎自测用)。用户只写标准 `testing/synctest.Test` +
+`synctest.Wait`,`go test -weave` 即进入探索。三处关键实现:
 (1) `testing/synctest/{weave.go,weave_off.go}` 按 `weave` build tag 分流 `weaveExplore`,并把富报告
-(trace/图例/seed)迁入此处;(2) `testing.testingWeaveTest` 把 f **内联作为 bubble root** 跑(而非
+(trace/图例/seed)迁入此处;(2) `testing.testingWeaveTest` 把 f **内联作为 bubble 的主参与者**跑(而非
 `testingSynctestTest` 的子 goroutine——否则真 root 阻塞在 signal 上成为 `weaveWait` 的幽灵等待者→伪
 死锁,且模型爆炸);(3) `runtime.synctestWait` 判 `bubble.controlled` 时路由到 `weaveWait`。deps 图
 (`go/build/deps_test.go`)与 `-weave` flag help(`build.go`/`compile/doc.go`/`alldocs.go`)已同步。
@@ -367,13 +372,12 @@ weavedemo 全部改为 `synctest.Test`;`go test -weave` 下正确用例 PASS、b
 
 **验证**:同一个只用 `synctest.Test` 的丢更新用例,普通 `go test` PASS(单跑漏报),`go test -weave`
 28 条 schedule 抓出 `x=1`;正确版 `-weave` 下 explored 3556 PASS(无误报);标准 `testing/synctest`
-(不带 `-weave`)与 `internal/weave`/`testing/weave` 全回归通过。
+(不带 `-weave`)与 `internal/weave` 全回归通过。
 
-**取舍/后续**:签名从 `func()` 变 `func(*testing.T)`——失败经"子 T 失败 → 转 panic"桥接,原始
-panic 值/断言细节暂被 sentinel 覆盖(报告靠 seed 复现,可后续保真)。`weave.Test` 可降级为薄别名或
-仅留给"显式 seed/budget"高级场景;`weave.Yield`(synctest 无对应)留给高级用户显式 import。跨 run
-幂等仍是隐式要求(见 D9 A 类,undo-log 缓解)。子 T + tRunner 机制进入探索循环会引入额外调度点
-(正确用例上已见 schedule 数偏高,如 3556),后续可评估是否绕过 tRunner 直接跑 f 以缩小模型。
+**当时的两个遗留,后来都已解决**:(1) 失败经"子 T 失败 → 转 panic"桥接时,断言原文被 sentinel
+覆盖 → 已由 **D17** 保真(报告直接显示 `t.Fatal` 的原文);(2) 走 `testingSynctestTest` 的子 T +
+tRunner 会引入额外调度点、放大模型 → 已改为 `testingWeaveTest` 把 f **内联作为 bubble 的主参与者**
+跑,绕开 tRunner。**仍然成立的隐式要求**:模型必须跨 run 幂等(见 D9 A 类)。
 
 ### D13 — 默认自动迭代加深抢占上界(替代无界搜索)
 
@@ -435,7 +439,7 @@ streaming 不缓冲——照搬 output 拿不到。
 **直接显示原文、不加 "panic:" 前缀**(真正的 panic 仍显示 `panic: v`)。此改惠及所有基于 `t.Fatal/Error` 的用例。
 
 **验证**:`testing`/`testing/synctest`/`internal/weave` 全绿;`weavedemo` 里 `TestLostUpdate` 等报告从
-"panic: weave: schedule failed" 变为 "weave_test.go:40: lost update"。
+"panic: weave: schedule failed" 变为 "lost_update_test.go:22: lost update"。
 
 ### D18 — `sync/atomic` 类型化 API 作为调度点(库级钩子,非编译器)
 
@@ -473,10 +477,101 @@ intrinsic,须仿 `-race` 在 `-weave` 下关掉 intrinsic 再走带钩子实现)
 **验证**:`internal/weave`(含 `TestStructWholeWriteVsFieldRead`)/`testing/synctest` 全绿;普通构建 `go build std`
 + `sync`/`strconv`/`encoding/json` 测试通过;`weavedemo/supported/struct_tearing` 现能被抓到(从 `unsupported/` 移入)。
 
+### D20 — 库级钩子的成本边界:编译期门控 + 禁止内联泄漏
+
+**问题**(审查发现,2026-07-29):`sync`/`internal/sync` 的钩子当年为兑现 D8"始终编译、运行期门控"而
+**无条件**插在 `RWMutex.RLock/RUnlock`、`Once.Do` 等函数体里。代价被低估了:内联成本模型里**一次函数调用
+就要 57 分**(预算 80),而 `RLock`/`RUnlock` 上游正好卡在 80。结果这三个函数在**用本 fork 编译的每一个 Go
+程序**里都失去内联(`TestIntendedInlining` 三项失败,cost 150/151/143),直接违反 D8 自己的"非 weave 程序
+几乎零开销"。另有一个更隐蔽的问题:`-weave` 的内存插桩只作用于**命令行包**,但**可内联的依赖函数体会被搬进
+命令行包一起插桩**——`sync/atomic` 的类型化方法正是这种情况,于是 `weaveAtomic` 里那句
+`if weaveGloballyActive != 0` 的**门控读自己变成了调度点**,每个 atomic 操作凭空多出两个 `read` transition,
+atomic 密集模型的状态空间近乎翻倍(实测 `atomic_lost_update` 的 trace 里 6 步噪声)。
+
+**决策**(三条):
+
+1. **钩子体一律 `//go:noinline`**(`sync/weave_on.go`、`internal/sync/weave.go`、`sync/atomic/weave_on.go`)。
+   函数体留在自己那个**未被插桩**的包里,门控读因此不再是调度点。调用方仍可自由内联(内联一个含调用的函数
+   是允许的)。
+2. **调用点用编译期常量门控**:`if weaveEnabled { weaveSchedPoint(…) }`,`weaveEnabled` 由 `weave_on.go`/
+   `weave_off.go` 按 build tag 给出——与 `internal/race.Enabled` 完全同一手法。`if false` 连同函数体在
+   **内联定价之前**就被删掉,所以普通构建的成本精确为零(不是"接近零")。
+3. **唯一例外:`internal/sync.Mutex`** 的钩子保持"始终编译 + 运行期 `weaveGloballyActive` 门控"(D8 原样),
+   因为 `Lock/TryLock/Unlock` 带着钩子仍在内联预算内。这保住了一条真实依赖:`internal/weave` 的引擎测试
+   (`TestMutexDPORFindsDeadlock`/`TestTryLockExplored`)在**不带 `-weave`** 时也能探索 mutex 交错。
+
+**代价与范围**:`RWMutex`(含 `Lock`/`TryLock`)、`Once`、`Cond`、`WaitGroup` 以及 `sync/atomic` 现在**只在
+`-weave` 下是调度点**。用户侧无损——没有 `-weave` 根本进不了探索器(`weaveExplore` 本身就是 `//go:build weave`),
+所以"不带 `-weave` 也有钩子"只服务于引擎自测。受影响的自测(`TestSyncPrimitivesExplorable`/`TestCondBroadcast`)
+仍然通过,只是不带 `-weave` 时覆盖变浅;完整覆盖走 `-weave` 那一遍。
+
+**顺带**:`RWMutex` 的读锁改用新 op `weaveOpRLock`/`weaveOpRUnlock`(trace 里显示 `rlock`/`runlock`、标签
+`rwmutex#N`)。动机有两条:`rwmutex_writer_starvation` 这个 demo 的全部要点就是"RLock 排在 writer 后面",
+而报告里 Lock/RLock 都印成 `lock` 根本读不出来;以及**复现命令**需要判断"这条 trace 是否只在 `-weave` 下存在"
+(见 D21),而 `lock` 同时来自始终编译的 Mutex 和仅 `-weave` 的 RWMutex,不拆就无法判断。两者暂时**冲突关系
+不变**(与 `opLock` 同等);把 RLock↔RLock 判为独立是一个健全的后续约简。
+
+**验证**:`TestIntendedInlining` 由 3 项失败转全绿;`go build std` 通过;`runtime`/`sync`/`sync/atomic`/
+`internal/synctest`/`testing` 全绿;`internal/weave` + `testing/synctest` 带与不带 `-weave` 全绿;
+`weavedemo` 23 个预期失败 + `unsupported` 全 PASS;`atomic_lost_update` 的 trace 中 6 步门控读噪声消失。
+
+### D21 — 探索模式下 `t.Skip` 是跳过,不是失败
+
+**问题**(审查发现,2026-07-29):`t.Skip` 与 `t.Fatal` 一样经 `runtime.Goexit` 离开,而 `testingWeaveTest`
+的 defer 只区分"panic"和"没跑完或 failed",于是**跳过被报成了失败交错**(`weave: found failing interleaving
+… test failed`)。这个 bug 一直被 `runTest` 的 `underWeave` skip 掩盖(那些用例本来就不在 `-weave` 下跑)。
+
+**决策**:defer 里先判 `t2.skipped && !t2.failed`,panic 一个 `weaveTestSkip` 哨兵;`weaveExplore` 识别它
+(`WeaveTestSkip() bool` 接口)后调 `t.SkipNow()` 并停止探索。跳过原因不必随哨兵传递——`common.log` 早就把它
+写进父 T 的输出了。同一判断也加在 `WEAVE_REPLAY` 分支上。
+
+**顺带修正复现命令**:`traceNeedsWeave` 原本只认 `read`/`write`,而"只在 `-weave` 构建里存在的 transition"
+现在还包括 atomic 与(D20 之后的)`rlock/runlock/once/cond */wg *`。漏判会打印一条**不带 `-weave` 的复现命令**,
+而 `weaveChoose` 对"计划 wid 不可运行"是静默回退,于是重放会静默失配成"replayed seed, no failure"。已按新
+清单补齐。
+
+**验证**:`GO_WANT_HELPER_PROCESS=1 go test -weave -run '^TestSkip$' testing/synctest` 由 FAIL 转为 SKIP+ok
+(`TestVerboseSkip` 同);`testing`/`testing/synctest` 全绿。
+
 ---
 
 ## 9. 待定 / 开放问题
 
+### 已评估并否决:自动包装任意测试(免去 `synctest.Test` 这层包装)
+
+**设想**(2026-07-29 评估):D12 已经免掉了 weave 专属 API,再往前一步是连 `synctest.Test(t, f)` 都不写——
+让 `go test -weave` 直接接管普通 `func TestX(t *testing.T)`。**结论:不做。**
+
+管道侧其实不难(约 2~2.5 天):钩子点是 `testing.tRunner`,现成的 `testingWeaveTest` 已经在做"建子 T、
+把 f 当 bubble main 内联跑、失败转 panic、在 bubble 外的父 T 上报告";唯一的硬性约束是 driver 必须从
+`testing/synctest` 下移到 `testing`(被测包若不 import `testing/synctest`,该包不进测试二进制,linkname 会
+链接失败),选择器用 `WEAVE_TESTS=<regexp>` 则 cmd/go 零改动。成本也比传闻低:因为依赖包不插桩,一个
+"json 编解码 + 两个 goroutine 争 map"的测试只要 118 条 schedule/0.01s,无并发的测试只要 1 条。
+
+**否决理由是语义,不是工程量。** 实测(把各类真实测试代码放进 bubble)四类卡点:
+`t.Run` panic、`t.Parallel` panic、真实 HTTP 因假时钟瞬间 dial 超时而失败、包级状态跨 schedule 泄漏导致
+算错。普查你的真实仓库:约 1/3 测试文件用 `t.Run`、haven 有 21/59 用 `t.Parallel`、约 60% 碰 net/http,
+而真正"有 goroutine 值得探索"的也只有 1/3。**默认自动包装等于把调试工具变成地雷。**
+
+**顺带回答了"bubble 是否必须"**:必须。把 bubble 拆成四件事——成员身份+继承(可替代,`weaveCtl` 挂到 g 上
+即可)、**假时钟**(替代不了,自己写就是重写 synctest,且没它就没有确定性与 seed 重放)、**封闭世界边界**
+(替代不了,`c.bubble`/`isFake` 是"任一时刻只有一个 goroutine 可运行"这条不变量的**执法机制**;去掉它,
+外部 goroutine 就能在令牌持有者运行时 ready 参与者,健全性静默丢失——这正是 D9 边界的物理基础)、
+synctest 的策略性禁令。关键反直觉点:**去掉 bubble 一个卡点都解决不了**——`t.Parallel` 阻塞在整个测试
+二进制共享的 `testState.startParallel` 上、`t.Run` 的 `tRunner` defer 要碰共享的 `tstate`/全局 `running`/
+父链输出锁,这两条是跟**受控调度本身**冲突而非跟 bubble 冲突;真实网络失败源于假时钟;包级状态泄漏与
+bubble 无关。
+
+**若将来重启**:两个不需要动 bubble 的放松点——(1) `t.Run` 靠 leaf-wrap **绕过**(谁调用 `t.Run` 就不包它,
+只包它的子测试);(2) 想要"真实 I/O + 受控调度"就加个逃生舱 `bubble.realTime`(保留 bubble、时钟走真实时间,
+只探索纯内存交错,放弃时间维度的确定性,约 0.5 天,不建议默认开)。
+
+- **把"推进假时钟"建模成一等的可枚举调度选项**(当前最值得做的能力缺口)。今天时钟只在全体 durably
+  blocked 时推进,所以"超时 vs 一直可运行的事件"这类竞争探不到(假阴性,见
+  `weavedemo/unsupported/timer_vs_event_false_negative`)。路径:把"推进到最近 deadline 并触发"做成
+  伪参与者/额外维度,复用现有 select-case 枚举与 DPOR 回溯。触及调度核心(`weaveRootWait` 的
+  advanceClock 逻辑)、搜索空间增大(需抢占上界兜底);好消息是**每条 schedule 都在全新 bubble 里跑
+  (`now` 重置为 `synctestBaseTime`、timers 全新),所以时钟状态不需要回溯/重放**。
 - 泡泡外并发的**显式检测报错** `uncontrolled concurrency detected`:如何在 synctest 跨泡泡检测
   基础上覆盖"共享地址被泡泡内外同时触碰"。
 - 基于 `weavewrite` 钩子的 **undo-log 自动重置**:回滚粒度、只覆盖插桩内存的边界、开销。

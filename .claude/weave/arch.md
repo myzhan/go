@@ -34,14 +34,15 @@ weave 是一个**单元级、封闭(hermetic)的并发交错验证器**:让一�
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **L2 是地基**:把未改写的 `chan`/`mutex`/`select`/`WaitGroup`/`Cond`/`Once` 变成受控调度点,
-  并保证任一时刻只有一个参与者在跑。**始终编译进 runtime、无 build tag**,普通 `go test` 直接可用。
+- **L2 是地基**:把未改写的 `chan`/`select`/`mutex`/`RWMutex`/`WaitGroup`/`Cond`/`Once`/`sync/atomic`
+  变成受控调度点,并保证任一时刻只有一个参与者在跑。runtime 侧(`runtime/weave.go` 的 chan/select/
+  park/ready/goexit)**始终编译、无 build tag**;库侧钩子分两档,见下面的"门控"。
 - **L1 是可选增强**:`-weave` 构建档把普通内存读写也变成调度点,让 DPOR 枚举数据竞态维度。
   仅在需要探索 plain 变量竞争(如无锁的丢更新)时才需要。
 - **L3 是引擎**:纯 Go,不依赖 runtime 内部;经 `//go:linkname` 由 L2 提供的原语驱动。
 - **L4 是入口**:**就是标准库 `testing/synctest`**——`-weave` 下 `synctest.Test` 改派到 L3 探索引擎
-  (`weave_off.go`/`weave.go` 按 `weave` build tag 分流),失败结果渲染成可读报告。不再有独立的
-  `testing/weave` 包(见 design.md D12)。
+  (`weave_off.go`/`weave.go` 按 `weave` build tag 分流),失败结果渲染成可读报告。没有 weave 专属
+  API(见 design.md D12)。
 
 ## 端到端数据流
 
@@ -99,22 +100,26 @@ runtime 暴露给 internal/weave(//go:linkname):
   weaveRunSchedule  → internal/weave.runSchedule   跑一条调度,带回 trace
   weaveYield        → internal/weave.Yield          显式调度点
   weaveWait         → internal/weave.Wait           等其余参与者退出
-runtime 暴露给 sync / internal/sync:
-  weaveSchedPoint       mutex/rwmutex/waitgroup/cond/once 入口记调度点
+runtime 暴露给 sync / internal/sync / sync/atomic:
+  weaveSchedPoint       mutex/rwmutex/waitgroup/cond/once/atomic 入口记调度点
   weaveGloballyActive   单次全局 load 门控(见下)
 ```
 
 ### 门控:非 weave 程序零成本
 
-两级门控保证普通程序几乎不付代价:
+三档门控,越靠外越便宜(详见 design.md D8 + D20):
 
-- `weaveActive()` = `gp.bubble != nil && gp.bubble.controlled`——热路径(chan/select)只多一次
-  可预测的 not-taken 分支,与 synctest 同 footprint。
-- `weaveGloballyActive`(受控 bubble 存在时才非 0)——供 `sync` 层做**单次全局 load** 门控,
-  避免在每次 `Mutex.Lock` 里取 `getg().bubble`。
+- **`weaveActive()`** = `gp.bubble != nil && controlled && gp != bubble.root`——runtime 热路径
+  (chan/select)只多一次可预测的 not-taken 分支,与 synctest 同 footprint。始终编译。
+- **`weaveGloballyActive`**(受控 bubble 存在时才非 0)——`internal/sync.Mutex` 用它做**单次全局
+  load** 门控,避免每次 `Lock` 去取 `getg().bubble`。始终编译,所以不带 `-weave` 也能探索 mutex。
+- **`weaveEnabled`**(build tag 常量,`weave_on.go`/`weave_off.go`)——`sync` 的 RWMutex/Once/Cond/
+  WaitGroup 与 `sync/atomic` 用它,普通构建里整段是死代码,成本**精确为零**。代价是这些原语只在
+  `-weave` 下是调度点。之所以必须这样:一次函数调用在内联成本模型里值 57 分,而 `RWMutex.RLock`
+  上游正好卡在预算 80,无条件钩子会让它在每个 Go 程序里失去内联。
 
-L2 因此**不需要 build tag**(而 -race 需要):L2 钩子只在 park/ready/newproc/goexit 等少数
-choke point,可廉价运行时门控。只有 L1 内存插桩遍布每次访问,才需要 `-weave` 构建档。
+L2 的 runtime 部分因此**不需要 build tag**(而 -race 需要):它的钩子只在 park/ready/newproc/goexit
+等少数 choke point,可廉价运行时门控。只有 L1 内存插桩遍布每次访问,才需要 `-weave` 构建档。
 
 ## 关键数据结构
 
@@ -131,8 +136,8 @@ choke point,可廉价运行时门控。只有 L1 内存插桩遍布每次访问,
 | 命令 | 覆盖 | 说明 |
 |---|---|---|
 | `go test`(无 flag) | 一次普通 `synctest.Test` 单跑(不探索) | 标准库行为不变 |
-| `go test -weave` | 同一 `synctest.Test` 用例 → 系统交错探索(含普通内存维度) | L1 插桩 + `synctest.Test` 改派 L3 |
-| `go test -weave` | 上述 + **普通内存读写**(plain 变量、结构体字段、切片元素…) | L1 内存插桩,探索数据竞态;与 `-race`/`-msan`/`-asan` 互斥 |
+| `go test -weave` | 同一 `synctest.Test` 用例 → 系统交错探索:chan/select/sync 原语/`sync/atomic` **+ 普通内存读写**(plain 变量、结构体字段、切片元素…) | `synctest.Test` 改派 L3 + L1 内存插桩;与 `-race`/`-msan`/`-asan` 互斥 |
 
-`-weave` 等价于对命令行包加 `-gcflags=-weave` 并定义 `weave` 构建标签(仿 `-race` 定义 `race`)。
-唯一尚未纳入的调度点是 `sync/atomic`(见 imp.md 的缺口说明)。
+`-weave` 对**命令行包**加 `-gcflags=-weave`(依赖包不插桩)并定义全构建生效的 `weave` 构建标签
+(仿 `-race` 定义 `race`)。剩余的调度点缺口:`sync/atomic` 的**自由函数**(`atomic.LoadInt64` 等
+编译器 intrinsic)与 `atomic.Value`,以及经 runtime 函数完成的访问(Go map)——见 imp.md 的缺口说明。

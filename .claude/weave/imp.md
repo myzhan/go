@@ -10,12 +10,13 @@
 
 ## 1. 现状速览(可用里程碑)
 
-**已达到可用**:未改写的真实 `chan`/`select`/`sync.Mutex`/`RWMutex`/`WaitGroup`/`Cond`/`Once` +
-普通内存(`-weave`)代码,可在 `synctest.Test`(`-weave`)内被系统性交错探索,失败给出逐步 trace + goroutine
-图例 + 可复现 seed。DPOR(含差分健全性验证 + 抢占计数上界)、select-case 枚举、非阻塞 channel
-操作、RNG/map 序确定化、spawned goroutine panic 捕获、`go test -weave` flag 均已落地。
+**已达到可用**:未改写的真实 `chan`/`select`/`sync.Mutex`/`RWMutex`/`WaitGroup`/`Cond`/`Once`/
+`sync/atomic`(类型化 API)+ 普通内存(`-weave`)代码,可在 `synctest.Test`(`-weave`)内被系统性交错探索,
+失败给出逐步 trace + goroutine 图例 + 可复现 seed。DPOR(含差分健全性验证 + 抢占计数上界)、select-case
+枚举、非阻塞 channel 操作、假时钟推进、RNG/map 序确定化、spawned goroutine panic 捕获、`go test -weave`
+flag 均已落地。
 
-**易用性增强(后续迭代)**:
+**易用性增强**:
 - **默认自动迭代加深抢占上界**:不设 `WEAVE_MAX_PREEMPTIONS` 时,从抢占=0 逐层加深到默认上限
   `defaultPreemptCeiling`(=2,`weaveExplore`/`exploreIterative`),而非旧的无界搜索——避免真实模型状态
   空间爆炸,并让反例用最少抢占(最易读)。设了该 env 则以其为上限。
@@ -29,9 +30,18 @@
 **`sync/atomic` 插桩(已部分落地,见 D18)**:`sync/atomic` 的**类型化 API**(`atomic.Int64/Uint64/
 Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/Or`)现已成为调度点——在
 `type.go` 方法里调 `weaveAtomic`(库级钩子,仿 `sync.Mutex`),故 `atomic.Load()+Store()` 之类非原子 RMW 能被
-探索。钩子按 `weave` build tag 分流:`-weave` 下是真钩子,普通构建下是空 no-op(`weave_off.go`),不拖累
-全体 Go 程序 atomic 性能、方法仍可内联。**尚缺**:自由函数(`atomic.LoadInt64` 等,是编译器 intrinsic,须仿
-`-race` 在 `-weave` 下关掉 intrinsic 再走带钩子实现)与 `atomic.Value`——留作后续。
+探索。**尚缺**:自由函数(`atomic.LoadInt64` 等,是编译器 intrinsic,须仿 `-race` 在 `-weave` 下关掉 intrinsic
+再走带钩子实现)与 `atomic.Value`——留作后续。
+
+**库级钩子的成本模型(D20)**:钩子的**作用域分两档**,别记混:
+- **始终编译 + 运行期门控**(不带 `-weave` 也是调度点):runtime 侧的 chan/select(D8,`runtime/weave.go` 无
+  build tag)+ `internal/sync.Mutex` 的 `Lock/TryLock/Unlock`。
+- **仅 `-weave`**(`weaveEnabled` 编译期常量 + build tag 分流,普通构建成本精确为零):`sync` 包的 `RWMutex`
+  (含读锁与写锁)、`Once`、`Cond`、`WaitGroup`,以及 `sync/atomic`。
+钩子函数体一律 `//go:noinline`,否则会被内联进被插桩的命令行包、连门控读都变成调度点(实测每个 atomic 操作
+多两个 `read`)。这一改把 `cmd/compile/internal/test.TestIntendedInlining` 长期存在的 3 个失败
+(`RWMutex.RLock`/`RUnlock`/`Once.Do` cost 超预算)彻底修掉。`RWMutex` 读锁另有独立 op
+`rlock`/`runlock`(报告里标签 `rwmutex#N`)。
 
 ---
 
@@ -87,16 +97,22 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 ### sync 原语 —— `src/sync/*` / `src/internal/sync/*`
 - `internal/sync.Mutex.Lock/Unlock/TryLock`、`sync.RWMutex.Lock/RLock/Unlock/RUnlock/TryLock/
   TryRLock`、`WaitGroup.Wait/Add`、`Cond.Wait/Signal/Broadcast`、`Once.Do` 入口经 linkname 调
-  `runtime.weaveSchedPoint`(op 对应;Try 系列复用 lock transition),用 `weaveGloballyActive` 做
-  **单次全局 load** 门控 → 非 weave 程序几乎零成本。
+  `runtime.weaveSchedPoint`(op 对应;`Try` 系列复用对应的 lock transition,读锁用 `rlock`/`runlock`)。
+- 门控分两档(见 §1 与 design D20):`internal/sync/weave.go` 是**始终编译**的运行期门控
+  (`weaveGloballyActive` 单次全局 load);`sync/weave.go` + `weave_on.go`/`weave_off.go` 是**编译期常量**
+  `weaveEnabled` 门控,普通构建里整段是死代码。两处的钩子体都 `//go:noinline`。
 
 ### 编译器 / cmd/go —— `cmd/compile` / `cmd/go`
 - `base.Flag.Weave`;`ir.Syms.Weaveread/Weavewrite/Weavewriteval/Weavereadrange/Weavewriterange`。
 - `gc/main.go` 对 `NoInstrument` 包强制关掉 Weave(杜绝 runtime 自插桩递归)。
 - `ssagen/ssa.go` 的 `instrument2` 加 weave 分支(复用 race 的 `s.load`/`s.store`/`instrumentFields`/
   `instrumentMove` 插入点);`weaveWriteVal` 把整型/bool 右值零扩展成 uint64 供值显示。
-- `cmd/go`:`-weave` flag(`cfg.BuildWeave`)→ `weaveInit`:等价 `-gcflags=-weave`,定义 `weave`
-  构建标签,并对 `-race`/`-msan`/`-asan` 互斥报错。
+- `cmd/go`:`-weave` flag(`cfg.BuildWeave`)→ `weaveInit`:定义 `weave` 构建标签,并对
+  `-race`/`-msan`/`-asan` 互斥报错。**注意作用域**:`-weave` 这个 gcflag 只加给**命令行包**
+  (`work/gc.go` 里 `cfg.BuildWeave && p.Internal.CmdlinePkg`,附加而非 shadow 用户 `-gcflags`),依赖包
+  **不插桩**——`cmd/go/testdata/script/build_weave.txt` 断言了 `-p sync` 不带 `-weave`。但 build tag 是
+  **全构建生效**的,所以库级钩子(atomic/sync)按 tag 在所有包里生效;且**可内联的依赖函数体会随内联被搬进
+  命令行包一起插桩**,这就是钩子体必须 `//go:noinline` 的原因(D20)。
 
 ### L3 引擎 —— `src/internal/weave/explore.go`
 - `Explore`/`ExploreBudget`/`ExploreBounded`(context bounding + wall-clock 超时)/`Replay`/`Run`。
@@ -109,18 +125,25 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 - `synctest.Test(t, f)` / `synctest.Wait`——`-weave` 下由 `weave.go`(`//go:build weave`)的
   `weaveExplore` 改派到 L3;`weave_off.go`(`//go:build !weave`)是 no-op(普通单跑)。`formatTrace`/
   `formatGoroutines`/`replayCommand` 等富报告渲染现居于 `testing/synctest/weave.go`;截断报 `INCOMPLETE`。
-- `testing.testingWeaveTest`(linkname 到 testing/synctest):把 f **内联作为 bubble root** 跑并把
-  `t.Fatal/Error`/panic 失败转成 panic 供引擎捕获(不用 `testingSynctestTest` 的子 goroutine,避免幽灵
-  root 等待者导致的伪死锁 + 模型放大)。
+- `testing.testingWeaveTest`(linkname 到 testing/synctest):把 f **内联作为 bubble 的主参与者**跑
+  (即 wid 0,不是 root/driver),并把 `t.Fatal/Error`/panic 失败转成 panic 供引擎捕获(不用
+  `testingSynctestTest` 的子 goroutine,避免幽灵 root 等待者导致的伪死锁 + 模型放大);`t.Skip` 走
+  `weaveTestSkip` 哨兵转成真正的跳过(D21)。
 - `runtime.synctestWait`:受控 bubble(`bubble.controlled`)内路由到 `weaveWait`。
-- **`testing/weave` 包已删除**(见 design.md D12)。
 
 ### 演示 —— `weavedemo/`(独立 module)
-- `weave_test.go`(丢更新/加锁/channel/check-then-act/死锁)、`asyncio_test.go`(异步 IO/
-  net.Pipe/context.WithCancel/超时泄漏)、`gcrepro_test.go`(GC 抢占压力,`-weave` 下跳过——见 §7)。
-- `supported/`(子 package,一用例一文件)——**weave 能稳定发现**的真实并发 bug(`-weave` 下确定失败并给
-  可复现 seed;plain 单跑行为不定——可能漏报、确定命中或 flaky,这正是 weave 相对单跑的价值。用例按自身合理性
-  编写,**不为迎合单跑调度而改**):
+- **根目录不放 `.go` 文件**(2026-07-29 重组):全部用例都在 `supported/` 与 `unsupported/` 两个子 package 里,
+  各自有 `doc_test.go` 说明该目录的契约。
+- `supported/`(一用例一文件)——**weave 处理正确**的用例,两类,文件头都写明属于哪一类:
+  - **`-weave` 下预期 FAIL**:weave 能稳定发现的真实并发 bug(确定失败并给可复现 seed;plain 单跑行为不定
+    ——可能漏报、确定命中或 flaky,这正是 weave 相对单跑的价值。用例按自身合理性编写,**不为迎合单跑调度而改**)。
+  - **预期 PASS**:`correct_*.go` 是正确代码/上面某个 bug 的修复版,weave 穷举后不报任何东西——防假阳性的
+    对照组(`correct_sync_basics`、`correct_asyncio`、`correct_netfake` 三个文件,后者附"怎么用 net.Pipe 造
+    可探索的假传输"的指南);`gcpreempt_test.go` 是 GC 抢占压力测试,`-weave` 下跳过(见 §7)。
+- **plain 模式的一个坑**:`supported/timeout_leaks_worker_test.go` 在单跑时必然命中泄漏,而"bubble 死锁"在
+  synctest 里是 **panic** 而非测试失败 → 整个测试二进制中止,声明在它之后的用例都不再运行。这恰好说明 weave 的
+  价值(同一个 bug 被报成带 trace 和 seed 的失败)。要在 plain 模式跑完整包,用 `-run` 排除它。
+- `-weave` 下预期失败的用例清单:
   `double_close_guard_race`(TOCTOU→panic 捕获)、`transfer_inconsistent_read`(跨双锁原子性违背)、
   `cond_lost_wakeup`(`sync.Cond` 丢唤醒→死锁)、`channel_order_assumption`(buffered channel 发送乱序)、
   `rwmutex_misuse_lost_update`(用 RLock 保护写→丢更新)、`select_priority_assumption`(select 无优先级,
@@ -136,17 +159,25 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
   `dining_philosophers`(3 方环形等待死锁,区别于 2 方 AB/BA)、`semaphore_leak_deadlock`(取消路径提前 return
   漏还信号量额度→后续 acquire 永久阻塞死锁)、`context_cancel_missed`(轮询 `ctx.Err()` 后再阻塞的 TOCTOU→漏掉
   中途取消→worker 泄漏;演示应 `select` 于 `ctx.Done()`)、`inconsistent_locking`(两处用**不同**的 mutex 保护同一
-  变量→无真正互斥→丢更新;演示"加锁≠线程安全,须同一把锁")。
+  变量→无真正互斥→丢更新;演示"加锁≠线程安全,须同一把锁")、以及 2026-07-29 从根目录移入的四个:
+  `lost_update`(最朴素的 `x = x+1` 丢更新)、`check_then_act_overdraw`(余额 check-then-act 透支)、
+  `mutex_abba_deadlock`(真 `sync.Mutex` 的 AB/BA,对照 channel 版与哲学家版)、
+  `timeout_leaks_worker`(超时分支放弃无缓冲 result → worker 永久阻塞泄漏,见上面的 plain 模式坑)。
+  共 23 个。
 - `unsupported/`(子 package,一用例一文件)——**weave 当前发现不了**的真实 bug(假阴性,`-weave` 下 PASS):
   `weak_memory_publication`
   (无同步发布可见性,弱内存重排未建模,仅 SC+程序序)、`benign_data_race`(良性竞争:weave 只报算错/死锁/
   泄漏/panic,不报缺同步,故 PASS,须靠 `-race` 互补)、`map_concurrent_write`(并发写同一 map;`mapassign`
   是无调度点的 runtime 调用→weave 不交错、漏报,与 atomic 缺口同类;因串行化不会真触发 fatal,`-race` 能抓)、
   `timer_vs_event_false_negative`(假时钟只在全体 durably blocked 时推进→超时 vs 常驻可运行事件漏探,
-  weave PASS 并打印对齐提示;由 `asyncio_test.go` 归类移入)、`double_checked_locking`(DCL:普通变量做
+  weave PASS 并打印对齐提示)、`double_checked_locking`(DCL:普通变量做
   fast-path 检查,发布指针先于字段写对读者可见→半构造对象;弱内存重排未建模,weave SC 视角认为正确故 PASS)。
-- 跑法:`cd weavedemo && ../bin/go test -weave -v ./...`(根 package 与 `supported/` 部分用例为**故意失败**
-  以演示 weave 抓 bug;`unsupported/` 全 PASS 作为边界文档)。
+- 跑法:`cd weavedemo && ../bin/go test -weave -v ./...`(`supported/` 里 23 个用例**故意失败**以演示 weave
+  抓 bug、`correct_*` 与 `gcpreempt` 预期 PASS;`unsupported/` 全 PASS 作为边界文档)。
+- **自动校验:`cd weavedemo && ./check.sh`**。因为用例是"预期失败/预期通过"混编,`go test` 的退出码判不了对错,
+  于是脚本**从每个用例的注释里推导期望**(doc comment 含 `EXPECTED TO FAIL` 即必须失败,其余必须 PASS/SKIP),
+  跑一遍 `-weave` 再逐个 diff。改动引擎后跑它:某个用例"不再失败"就意味着 weave 丢掉了发现那个 bug 的能力
+  ——这是 D16/D18/D19 这类覆盖唯一的自动守卫(weavedemo 是独立 module,不在任何 std 测试里)。当前 37 个用例全对。
 
 ---
 
@@ -168,13 +199,16 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 
 ## 4. 门控与成本(当前实现)
 
-> 注:早期做过 `weaveenabled` const + `weave_on.go`/`weave_off.go` 的 **build-tag DCE 方案**
-> (像 -race),**已废弃**。当前是单个始终编译的 `runtime/weave.go` + 运行时门控(见 design D8)。
+三档,越靠外越便宜(设计理由见 design D8 + **D20**):
 
-- 热路径(chan/select)先判 `weaveActive()`(`gp.bubble != nil && controlled`)——普通程序只多
-  一次可预测的 not-taken 分支。
-- sync 层用 `weaveGloballyActive`(受控 bubble 存在时才非 0)做单次全局 load,避免每次 `Lock`
-  取 `getg().bubble`。
+- **runtime 热路径(chan/select)**:`weaveActive()`(`gp.bubble != nil && controlled && gp != root`)
+  ——始终编译,普通程序只多一次可预测的 not-taken 分支。
+- **`internal/sync.Mutex`**:`weaveGloballyActive`(受控 bubble 存在时才非 0)做单次全局 load,避免
+  每次 `Lock` 取 `getg().bubble`。**始终编译**,所以不带 `-weave` 也能探索 mutex 交错(`internal/weave`
+  的引擎自测依赖这一点)。
+- **`sync` 的 RWMutex/Once/Cond/WaitGroup + `sync/atomic`**:build-tag 常量 `weaveEnabled`
+  (`weave_on.go`/`weave_off.go`)门控,普通构建里整段是死代码,成本**精确为零**;钩子体一律
+  `//go:noinline`,防止被内联进被插桩的命令行包后连门控读都变成调度点。
 - L1 内存插桩遍布每次访问,故仍需 `-weave` 构建档(与非 weave 构建零影响)。
 
 ---
@@ -205,7 +239,7 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 ## 6. 里程碑与状态
 
 > 说明:早期规划编号 M0–M6 与后续实现快照编号不完全一致,下表以**能力**归类,状态以当前代码为准。
-> 状态图例:✅ 完成 · 🚧 部分 · ⬜ 未开始。
+> 状态图例:✅ 完成 · 🚧 部分 · ⬜ 未开始 · ❌ 评估后否决。
 
 | 能力 | 状态 | 落点 |
 |---|---|---|
@@ -227,9 +261,15 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 | 探索预算 / wall-clock 超时 / 截断显式上报 | ✅ | `ExploreBounded`/`Truncated` |
 | `-weave` 与 `-race`/`-msan`/`-asan` 互斥 | ✅ | `weaveInit` + compile 校验 |
 | **atomic 插桩(类型化 API)** | ✅ | `sync/atomic` type.go 方法钩子(D18);自由函数/`atomic.Value` 待做 |
+| 库级钩子零成本化 + 修掉内联回归 | ✅ | `weaveEnabled` 编译期门控 + 钩子体 noinline(D20);`TestIntendedInlining` 转绿 |
+| `t.Skip` 在探索模式下正确跳过 | ✅ | `weaveTestSkip` 哨兵(D21) |
+| op 码跨 5 处声明的交叉校验 | ✅ | `internal/weave/optab_test.go` |
+| 演示用例行为的自动断言 | ✅ | `weavedemo/check.sh`(期望值从注释推导) |
+| **把"推进假时钟"变成可枚举调度选项** | ⬜ | 当前最值得做的能力缺口,见 design §9 |
 | 弱内存模型(atomic C11 重排 / read-from)| ⬜ | 依赖 atomic |
 | optimal-DPOR(wakeup tree)进一步剪枝 | ⬜ | 增强 |
 | 抢占看门狗(死循环兜底)| ⬜ | 见 §5.A.2 |
+| 自动包装任意测试(免 `synctest.Test`)| ❌ | **已评估并否决**,见 design §9 |
 | 泡泡外并发显式检测 + undo-log 跨 run 重置 | ⬜ | 见 design D9 |
 | 并行探索(多 worker 跑子树)、状态空间估计 | ⬜ | UX |
 | 受控 bubble 内假时钟推进(time.Sleep/After/timer/context.WithTimeout)| ✅ | `weaveRootWait`;`TestFakeClock*` |
@@ -269,7 +309,7 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
   在探索模式下语义不适用或超容量。它们靠 build-tag 常量 `underWeave`(`underweave_on_test.go` /
   `underweave_off_test.go`)在 `-weave` 时 `t.Skip`——如同标准库对 `-race` 用 `//go:build !race`。
   修后 `-weave` 下 `testing/synctest` 全绿。
-- **`-weave` 下重内存/热循环用例状态空间爆炸**:如 `weavedemo/gcrepro_test.go` 的 GC 抢占压力
+- **`-weave` 下重内存/热循环用例状态空间爆炸**:如 `weavedemo/supported/gcpreempt_test.go` 的 GC 抢占压力
   测试(200 轮 × 长 spin),`-weave` 下每次内存访问成调度点会撑到超时。它测的是令牌在 GC 抢占下
   的健壮性、非数据竞争,故用 `weave` 构建标签跳过、并 `-short` 降迭代。同理,包住重插桩库代码
   (msgpack 编解码、crypto/hash 等)的多个 goroutine 若同时可运行,也会爆预算;实测经验是**一次只
@@ -320,11 +360,22 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 
 **日常构建/测试**:
 ```sh
-cd src && ../bin/go test internal/weave/ testing/synctest/    # 核心引擎(无 -weave)
-cd src && ../bin/go test -weave internal/weave/                # 含内存插桩的健全性套件
-cd src && ../bin/go test runtime sync internal/synctest testing/synctest   # 回归
+cd src
+GOTOOLCHAIN=local ../bin/go test -count=1 internal/weave/ testing/synctest/  # 核心引擎(无 -weave)
+GOTOOLCHAIN=local ../bin/go test -count=1 -weave internal/weave/ testing/synctest/  # 含内存插桩
+GOTOOLCHAIN=local ../bin/go test -count=1 runtime sync sync/atomic internal/synctest testing  # 回归
+GOTOOLCHAIN=local ../bin/go test -count=1 -run TestIntendedInlining cmd/compile/internal/test # 内联预算
+cd ../weavedemo && ./check.sh                                  # 演示用例的行为断言
 ```
 工具链按需重编改动的 std 包,纯 Go 编辑无需 `make.bash`。
+
+**操作坑**:
+- **改了 `cmd/compile`(如 D19)必须重装编译器**:`cd src && GOTOOLCHAIN=local ../bin/go install cmd/compile`,
+  否则 `go test` 用的还是旧工具链、改动不生效。只改 runtime/std 包时 `go test` 会自动重编,不用重装。
+- **环境变量不进 `go test` 缓存** → 用 `WEAVE_*` 做 A/B 对比时必须加 `-count=1`。
+- 本机 shell 的 `cd` 被 zoxide 接管且会打印噪声:命令前加 `export _ZO_DOCTOR=0`,或用绝对路径。
+- **gopls 的诊断多是工作区噪声**("undefined: runSchedule"/"use of internal package"/"not in workspace"
+  ——因为 `src/` 不是它的 workspace module),以实际 `go build`/`go test` 结果为准。
 
 ---
 

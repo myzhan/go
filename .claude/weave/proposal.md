@@ -1,7 +1,12 @@
 # Design a deterministic concurrency testing framework for Go
 
 **Author:** weave contributors  
-**Status:** Draft  
+**Status:** 历史文档 —— 保留原始提案不动,作为动机与初衷的记录。
+
+> ⚠️ 本文描述的是**提案时的设想**,其中 API 部分已经不成立:`testing/weave` 包与
+> `weave.Test`/`weave.Wait` 都不存在了,用户直接写标准 `testing/synctest.Test` 并加 `go test -weave`
+> (见 [design.md](design.md) 的 ADR **D12**)。当前的实际形态以
+> [README.md](README.md) / [arch.md](arch.md) / [imp.md](imp.md) 为准。
 
 ## Problem
 
