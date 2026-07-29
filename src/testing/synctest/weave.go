@@ -262,6 +262,11 @@ func shellSingleQuote(s string) string {
 // so object labels (mutex#1, chan#2, ...) match between the trace and this list.
 func formatOutcome(res weave.Result, lab *addrLabeler) string {
 	if res.Failed {
+		// A test that failed via t.Error/Fatal carries its own message; show it
+		// directly rather than mislabeling it as a Go panic.
+		if tf, ok := res.Value.(interface{ WeaveTestFailure() string }); ok {
+			return tf.WeaveTestFailure()
+		}
 		return fmt.Sprintf("panic: %v", res.Value)
 	}
 	if !res.Deadlock {
