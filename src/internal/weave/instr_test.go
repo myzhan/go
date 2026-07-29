@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -504,6 +505,161 @@ func TestReadFaultRecoverable(t *testing.T) {
 		t.Fatalf("expected the faulting read to be captured as a failure, got %+v", res)
 	}
 	t.Logf("faulting read captured as a recoverable failure (not a process fatal)")
+}
+
+// A read-modify-write built from sync/atomic's typed Load + Store is not atomic as
+// a whole, so some interleaving must lose an update. Finding it requires the typed
+// atomic operations themselves to be scheduling points (ADR D18): the model touches
+// no plain memory between the Load and the Store, so compiler instrumentation alone
+// cannot break them apart. Regression for the atomic hook going missing (e.g. if the
+// weave build tag stopped reaching sync/atomic, or the hook were inlined away).
+func TestAtomicRMWLostUpdate(t *testing.T) {
+	res := Explore(func() {
+		var x atomic.Int64
+		go func() { x.Store(x.Load() + 1) }()
+		go func() { x.Store(x.Load() + 1) }()
+		Wait()
+		if x.Load() != 2 {
+			panic("lost atomic update")
+		}
+	})
+	if !res.Failed {
+		t.Fatalf("expected the non-atomic Load+Store RMW to lose an update; explored %d schedules (atomic hook missing?)", res.Runs)
+	}
+	sawAtomic := false
+	for _, s := range res.Trace {
+		if s.Op == "atomic load" || s.Op == "atomic store" {
+			sawAtomic = true
+		}
+	}
+	if !sawAtomic {
+		t.Fatalf("failing trace has no atomic transition, so the bug was found some other way: %+v", res.Trace)
+	}
+	t.Logf("atomic RMW lost update found after %d schedule(s)", res.Runs)
+}
+
+// Assigning a multi-field struct is not atomic, so a reader can observe a TORN
+// value: one field updated and the other not. Finding it requires -weave to store a
+// pointer-free multi-field struct field-by-field, with a scheduling point before
+// each field store (ADR D19) — a single whole-struct store would be one indivisible
+// transition. Regression for that ssagen change (note it only takes effect after
+// reinstalling the compiler: go install cmd/compile).
+func TestStructTearingObservable(t *testing.T) {
+	type point struct{ x, y int }
+	res := Explore(func() {
+		var p point // invariant: x == y, the two fields are written together
+		go func() { p = point{x: 5, y: 5} }()
+		go func() {
+			q := p
+			if q.x != q.y {
+				panic("torn struct read")
+			}
+		}()
+		Wait()
+	})
+	if !res.Failed {
+		t.Fatalf("expected a torn read of the two-field struct; explored %d schedules (field-by-field store missing? rebuild cmd/compile)", res.Runs)
+	}
+	t.Logf("struct tearing observed after %d schedule(s)", res.Runs)
+}
+
+// --- sync-primitive hooks (weave-only since ADR D20) -----------------------
+//
+// RWMutex/Once/Cond/WaitGroup hooks are compiled in under the "weave" build tag,
+// so these models are only meaningfully explored here. (Mutex and channel ops are
+// recorded unconditionally and are covered in internal_test.go.)
+
+// The newly recorded primitives (WaitGroup.Add/Done, sync.Once, sync.Cond) are
+// explorable end to end: correct uses of them are driven through every
+// interleaving without a spurious failure or deadlock.
+func TestSyncPrimitivesExplorable(t *testing.T) {
+	wg := Explore(func() {
+		var wg sync.WaitGroup
+		done := make(chan int, 2)
+		wg.Add(2)
+		go func() { done <- 1; wg.Done() }()
+		go func() { done <- 2; wg.Done() }()
+		wg.Wait()
+		<-done
+		<-done
+	})
+	if wg.Failed || wg.Deadlock {
+		t.Fatalf("WaitGroup model should be clean; got %+v", wg)
+	}
+
+	once := Explore(func() {
+		var once sync.Once
+		n := 0
+		f := func() { n++ }
+		done := make(chan bool, 2)
+		go func() { once.Do(f); done <- true }()
+		go func() { once.Do(f); done <- true }()
+		<-done
+		<-done
+		if n != 1 {
+			panic("Once ran f more than once")
+		}
+	})
+	if once.Failed || once.Deadlock {
+		t.Fatalf("Once model should be clean; got %+v", once)
+	}
+
+	cond := Explore(func() {
+		var mu sync.Mutex
+		c := sync.NewCond(&mu)
+		ready := false
+		go func() {
+			mu.Lock()
+			ready = true
+			c.Signal()
+			mu.Unlock()
+		}()
+		mu.Lock()
+		for !ready {
+			c.Wait()
+		}
+		mu.Unlock()
+	})
+	if cond.Failed || cond.Deadlock {
+		t.Fatalf("Cond model should be clean; got %+v", cond)
+	}
+	t.Logf("sync primitives explorable: wg=%d once=%d cond=%d schedules", wg.Runs, once.Runs, cond.Runs)
+}
+
+// Cond.Broadcast wakes every waiter, not just one. Two goroutines Wait on the
+// cond; the main participant sets the predicate and Broadcasts. Every
+// interleaving must wake both waiters (woke == 2) with no lost wakeup and no
+// spurious deadlock. (Cond ops are scheduling points only under -weave, see D20;
+// joining via weave.Wait keeps the state space small.)
+func TestCondBroadcast(t *testing.T) {
+	res := Explore(func() {
+		var mu sync.Mutex
+		c := sync.NewCond(&mu)
+		ready := false
+		woke := 0
+		waiter := func() {
+			mu.Lock()
+			for !ready {
+				c.Wait()
+			}
+			woke++
+			mu.Unlock()
+		}
+		go waiter()
+		go waiter()
+		mu.Lock()
+		ready = true
+		c.Broadcast()
+		mu.Unlock()
+		Wait()
+		if woke != 2 {
+			panic("Broadcast did not wake both waiters")
+		}
+	})
+	if res.Failed || res.Deadlock {
+		t.Fatalf("Cond.Broadcast model should be clean; got %+v", res)
+	}
+	t.Logf("Cond.Broadcast wakes all waiters cleanly across %d schedule(s)", res.Runs)
 }
 
 func equalStrings(a, b []string) bool {
