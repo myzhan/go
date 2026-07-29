@@ -533,6 +533,62 @@ atomic 密集模型的状态空间近乎翻倍(实测 `atomic_lost_update` 的 t
 **验证**:`GO_WANT_HELPER_PROCESS=1 go test -weave -run '^TestSkip$' testing/synctest` 由 FAIL 转为 SKIP+ok
 (`TestVerboseSkip` 同);`testing`/`testing/synctest` 全绿。
 
+### D22 — 把"推进假时钟"建模成一等的可枚举调度选项
+
+**问题**:synctest 的假时钟契约是"**只在全体 durably blocked 时推进**"。weave 忠实继承了它,后果是
+`select { case <-done: case <-time.After(d): }` 这类代码里,只要发事件的 goroutine 一直可运行,时钟就永远
+不动、超时永远不触发——"超时赢"这条交错**不是漏探,而是根本不在模型里**。这类 bug(超时分支放弃了无缓冲
+channel → 对端永久阻塞泄漏)在真实 Go 代码里极常见,却是 weave 长期的头号能力缺口。
+
+**决策**:把"推进时钟到最近 deadline 并触发到期定时器"做成**保留 wid 的伪参与者**
+(`weaveClockWid = 63`,op `weaveOpClockAdvance`)。它由此直接复用现有的 plan / seed / DPOR 回溯机制,
+不需要第三个选择维度。执行时仍由 **root** 完成推进(root 在参与者集合之外、不被插桩),被选中的调度点
+上当前参与者 park 并经 `weaveHandoffClock` 把令牌交给 root。
+
+**为什么工作量远小于预期**:每条 schedule 都跑在**全新的 bubble** 里(`weaveRunBubble` 把 `now` 重置为
+`synctestBaseTime`、timers 全新),所以**时钟状态完全不需要回溯或重放**——这曾被认为是这项工作最大的一块。
+
+**启用条件**(三条同时满足,把契约放宽幅度压到最小):
+1. 确有 pending timer;
+2. **有任一参与者阻塞**(`live > nrun`)。这就是那条放宽:"全体 durably blocked" → "有人阻塞"。理由:
+   goroutine 在等待时真实时间照样流逝,所以它的超时可能触发,哪怕兄弟 goroutine 还在跑。而**没人阻塞时
+   时钟不动**——这保住了大家真正依赖的那条性质(`start := time.Now(); 干活; Since(start)` 仍为 0);
+3. **不在普通内存读写的调度点上**。时钟推进不写用户内存,故与读写**可交换**:任何"推进夹在两次内存操作
+   之间"的调度,都等价于"推进落在相邻同步点"的那条,而后者是被探索的。所以跳过内存点不损失覆盖,同时
+   避免 `-weave` 的逐访问插桩把时钟维度乘一遍。
+
+**plain 侧零影响是结构性的,不需要开关**:`controlled: true` 全仓库只在 `weaveRunBubble` 一处出现,只有
+探索引擎会走到;假时钟推进有**两个互不相干的实现**——普通 synctest 在 `runtime/synctest.go` 的静止循环里
+推进,weave 在 `weaveRootWait` 里推进,本 ADR 只改后者。所有钩子都要求 `b.controlled`。所以不加 `-weave`
+时 `synctest` 行为**字节级不变**。
+
+**逃生阀 = 已有的抢占上界**:选择时钟**只要有任何真实参与者可运行就计一次抢占**(注意不是"前一个参与者
+仍可运行"——第一版按后者计费,实测发现前一个参与者恰好阻塞时时钟能在 c=0 免费插入,于是改成前者)。
+于是 `WEAVE_MAX_PREEMPTIONS=0` **精确等于** synctest 的 idle-only 契约:c=0 下时钟只能在无人可运行时被选中。
+反向也成立:**不推进时钟从不计抢占**(它不是被我们切走的 goroutine)。默认迭代加深上界是 2,所以这类 bug
+在默认配置下于第 1 层被发现。
+
+**DPOR 的一处特别处理**:时钟是**可选** transition——参与者迟早总会跑到、因而总会出现在某条 run 里,时钟
+却可能从未出现(默认策略只在别无选择时挑它)。而 DPOR 的回溯分析只能反转**已观察到的** transition,所以
+必须在"时钟可选但未选"的每一步显式补 backtrack,否则"超时赢"永远探不到。`conflict` 里时钟与所有同步操作
+**地址无关地**冲突(它自己不记地址,而 select 的就绪性可能取决于它检查的 timer channel),与普通内存独立
+(可交换性,见上)。
+
+**报告**:时钟步不带 `gN`(它不是 goroutine),渲染成 `clock advance +1s`;`buildGoroutines` 排除该 wid,
+图例不会凭空多一个 g63。原先"有未触发 timer"的提示改为**仅当任何 schedule 都没推进过时钟**才打印,并指向
+`WEAVE_MAX_PREEMPTIONS`。
+
+**代价**:参与者上限从 64 降到 63(第 64 个 id 留给时钟,超了照旧报 overflow/Truncated);含 pending timer
+的模型多一个选择维度(实测 demo 从 1 条 schedule 变 2 条)。
+
+**验证**:`TestClockAdvanceIsAScheduleChoice`(超时赢→worker 永久阻塞→死锁,并断言 trace 里有
+`clock advance`、wid 是保留值、推进量为 1s、图例里没有 g63)、`TestClockAdvanceCostsAPreemption`
+(c=0 干净且从未推进时钟,c=1 抓到)、`TestClockAdvanceSeedReplays`(含时钟步的 seed 确定性重放)、
+`TestClockWidReserved`(与 runtime 的保留 wid 一致);`TestFakeClock*` 四个全部行为不变;`internal/weave` +
+`testing/synctest` 带与不带 `-weave` 全绿(含差分健全性套件);`weavedemo` 里
+`timer_vs_event_false_negative` 从 `unsupported/` 退役,改写成 `supported/timer_vs_event`(真 `time.After` 版),
+`check.sh` 37→37 全对。
+
 ---
 
 ## 9. 待定 / 开放问题
@@ -566,12 +622,9 @@ bubble 无关。
 只包它的子测试);(2) 想要"真实 I/O + 受控调度"就加个逃生舱 `bubble.realTime`(保留 bubble、时钟走真实时间,
 只探索纯内存交错,放弃时间维度的确定性,约 0.5 天,不建议默认开)。
 
-- **把"推进假时钟"建模成一等的可枚举调度选项**(当前最值得做的能力缺口)。今天时钟只在全体 durably
-  blocked 时推进,所以"超时 vs 一直可运行的事件"这类竞争探不到(假阴性,见
-  `weavedemo/unsupported/timer_vs_event_false_negative`)。路径:把"推进到最近 deadline 并触发"做成
-  伪参与者/额外维度,复用现有 select-case 枚举与 DPOR 回溯。触及调度核心(`weaveRootWait` 的
-  advanceClock 逻辑)、搜索空间增大(需抢占上界兜底);好消息是**每条 schedule 都在全新 bubble 里跑
-  (`now` 重置为 `synctestBaseTime`、timers 全新),所以时钟状态不需要回溯/重放**。
+- ~~把"推进假时钟"建模成一等的可枚举调度选项~~ → **已完成,见 D22**。
+- 同一 deadline 上多个定时器的**触发顺序**仍不单独枚举(沿用 synctest 的 deadline 堆序);永不停止的
+  `time.Tick` 会无限推进时钟,受调度/时间预算约束(Truncated)。
 - 泡泡外并发的**显式检测报错** `uncontrolled concurrency detected`:如何在 synctest 跨泡泡检测
   基础上覆盖"共享地址被泡泡内外同时触碰"。
 - 基于 `weavewrite` 钩子的 **undo-log 自动重置**:回滚粒度、只覆盖插桩内存的边界、开销。

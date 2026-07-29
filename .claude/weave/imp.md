@@ -23,9 +23,10 @@ flag 均已落地。
 - **失败报告可读性**:轨迹里同步对象由裸地址改为稳定标签(`mutex#1`/`chan#2`/`cond#3`/`wg`/`once`/`mem`,
   `addrLabeler`);死锁报告额外逐 goroutine 列出等待对象(`gN blocked on lock mutex#4`,由每个参与者的
   最后 trace step 推断,`blockedWaits`)。
-- **假时钟假阴性提示**:某调度中所有参与者已退出却仍有未触发的 pending timer 时,`weaveControl.unfiredTimer`
-  经 `runSchedule` 回传聚合到 `Result.UnfiredTimer`,成功报告追加提示"把并发事件对齐到定时器边界",
-  帮用户发现"超时 vs 事件"这类因假时钟不推进而漏探的竞争。
+- **假时钟推进本身是可枚举的调度选项**(D22):有 pending timer 且**有任一参与者阻塞**时,"推进到最近
+  deadline 并触发定时器"作为伪参与者(`weaveClockWid`)参与选择,于是"超时 vs 常驻可运行事件"能被探到。
+  选它只要还有其他参与者可运行就计一次抢占,故 `WEAVE_MAX_PREEMPTIONS=0` 精确等于 synctest 的 idle-only
+  契约。`Result.UnfiredTimer` 的提示改为**仅当任何 schedule 都未推进过时钟**时才打印(`ClockAdvanced`)。
 
 **`sync/atomic` 插桩(已部分落地,见 D18)**:`sync/atomic` 的**类型化 API**(`atomic.Int64/Uint64/
 Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/Or`)现已成为调度点——在
@@ -53,7 +54,9 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
   写屏障、无分配。trace 缓冲 + select 维度 + `plan`/`selPlan` 重放向量 + 存活计数 + done/deadlock
   + 确定性 RNG 状态。
 - **令牌交接**:`weaveStart`/`weaveRegisterChild`/`weaveTake`(`weaveChoose` 选下一个:按 plan
-  重放或选最小 wid,并记录 transition)/`weaveGrant`/`weaveHandoff`。
+  重放或选最小 wid,并记录 transition)/`weaveGrant`/`weaveHandoff`。`weaveTake` 还会经
+  `weavePushClock` 把"推进假时钟"作为伪参与者放进候选集;若它被选中,当前参与者经 `weaveHandoffClock`
+  把令牌交给 root 去推进(D22)。
 - **中心钩子**:`weaveEnqueue`(ready 截获)、`weaveOnBlock`(park_m 交接/死锁)、`weaveOnGoexit`
   (退出交接/完成/死锁)。
 - **调度点原语**:`weaveSchedPoint(op, id)`(nosplit,非活跃即返回)→ `weaveSchedPointSlow`;
@@ -64,7 +67,9 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
   outcome/panic)、`weaveYield`→`Yield`、`weaveWait`→`Wait`;全局门控变量 `weaveGloballyActive`。
 - **op 码**(与 internal/weave 平行、顺序敏感):None/Read/Write/Lock/Unlock/ChanSend/ChanRecv/
   ChanClose/Select/WaitGroupWait/GoStart/GoExit/Preempt/WaitGroupAdd/CondWait/CondSignal/
-  CondBroadcast/Once/**ChanSendNB/ChanRecvNB**(非阻塞,调度点但不建 HB)。
+  CondBroadcast/Once/**ChanSendNB/ChanRecvNB**(非阻塞,调度点但不建 HB)/AtomicLoad/AtomicStore/
+  AtomicRMW/**RLock/RUnlock**(RWMutex 读锁)/**ClockAdvance**(假时钟推进,由伪参与者 `weaveClockWid`
+  承载,见 D22)。五处声明由 `internal/weave/optab_test.go` 交叉校验。
 - **panic 捕获**:`weaveGoWrapper` 用 `defer weaveRecoverChild` 把 spawned goroutine 的 panic 记到
   `weaveControl.panicValue`(不崩溃进程)。
 
@@ -82,8 +87,10 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 - `synctestBubble` 加 `controlled bool` + `weaveCtl *weaveControl`。
 - `changegstatus`/`incActive`/`decActive` 对受控 bubble no-op(控制器自管存活,run-token 不变量
   取代空闲计数)。
-- `synctestRun1(f, controlled)`:受控分支建 parked main + `weaveStart` + `weaveRootWait`;
-  `weaveRootWait` 现在就是 weave 版的假时钟推进循环(见 §5.B.1 与 design D11)。
+- 受控 bubble **不由 `synctestRun` 建**:`weaveRunBubble`(runtime/weave.go)自己建 bubble、把 f 作为
+  parked 主参与者 + `weaveStart` + `weaveRootWait`,因为它要挂上每条 schedule 各自的 `weaveControl`。
+  `weaveRootWait` 就是 weave 版的假时钟推进循环(见 §5.B.1 与 design D11/D22);普通 synctest 的静止
+  循环在 `synctestRun` 里,两者互不相干。
 
 ### chan / select —— `src/runtime/chan.go` / `select.go`
 - chan:`chansend`/`chanrecv`/`closechan` 在**加锁前**插 `weaveSchedPoint`。阻塞用
@@ -116,8 +123,8 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 
 ### L3 引擎 —— `src/internal/weave/explore.go`
 - `Explore`/`ExploreBudget`/`ExploreBounded`(context bounding + wall-clock 超时)/`Replay`/`Run`。
-- `conflict`(含 select addr-agnostic 特判 + NB 处理)、`channelHB`(向量钟,只建 channel 边、
-  忽略 NB)、`isChanOp`/`isSyncOp`。
+- `conflict`(含 select 与 clock-advance 的 addr-agnostic 特判 + NB 处理)、`channelHB`(向量钟,
+  只建 channel 边、忽略 NB)、`isChanOp`/`isSyncOp`。
 - source-DPOR 主循环:backtrack 集合 + select-case 枚举(`selD`/`selCase`);`exploreExhaustive`
   (odometer)做等价性对拍;`buildTrace`/`buildGoroutines`/`encodeSeed`/`decodeSeed`。
 
@@ -163,16 +170,15 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
   `lost_update`(最朴素的 `x = x+1` 丢更新)、`check_then_act_overdraw`(余额 check-then-act 透支)、
   `mutex_abba_deadlock`(真 `sync.Mutex` 的 AB/BA,对照 channel 版与哲学家版)、
   `timeout_leaks_worker`(超时分支放弃无缓冲 result → worker 永久阻塞泄漏,见上面的 plain 模式坑)。
-  共 23 个。
+  共 24 个(2026-07-29 起含 `timer_vs_event`——真 `time.After` 版的超时泄漏,D22 之前是 `unsupported/` 里的假阴性)。
 - `unsupported/`(子 package,一用例一文件)——**weave 当前发现不了**的真实 bug(假阴性,`-weave` 下 PASS):
   `weak_memory_publication`
   (无同步发布可见性,弱内存重排未建模,仅 SC+程序序)、`benign_data_race`(良性竞争:weave 只报算错/死锁/
   泄漏/panic,不报缺同步,故 PASS,须靠 `-race` 互补)、`map_concurrent_write`(并发写同一 map;`mapassign`
   是无调度点的 runtime 调用→weave 不交错、漏报,与 atomic 缺口同类;因串行化不会真触发 fatal,`-race` 能抓)、
-  `timer_vs_event_false_negative`(假时钟只在全体 durably blocked 时推进→超时 vs 常驻可运行事件漏探,
-  weave PASS 并打印对齐提示)、`double_checked_locking`(DCL:普通变量做
+  `double_checked_locking`(DCL:普通变量做
   fast-path 检查,发布指针先于字段写对读者可见→半构造对象;弱内存重排未建模,weave SC 视角认为正确故 PASS)。
-- 跑法:`cd weavedemo && ../bin/go test -weave -v ./...`(`supported/` 里 23 个用例**故意失败**以演示 weave
+- 跑法:`cd weavedemo && ../bin/go test -weave -v ./...`(`supported/` 里 24 个用例**故意失败**以演示 weave
   抓 bug、`correct_*` 与 `gcpreempt` 预期 PASS;`unsupported/` 全 PASS 作为边界文档)。
 - **自动校验:`cd weavedemo && ./check.sh`**。因为用例是"预期失败/预期通过"混编,`go test` 的退出码判不了对错,
   于是脚本**从每个用例的注释里推导期望**(doc comment 含 `EXPECTED TO FAIL` 即必须失败,其余必须 PASS/SKIP),
@@ -223,12 +229,13 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
    `INCOMPLETE`,而非静默 ok)。
 
 ### B. goroutine 离开受控世界(I/O / 真实时间)
-1. **真实时间/定时器**:受控 bubble 内**已支持假时钟推进**(D11)——`weaveRootWait` 在全组 durably
-   blocked 且有 pending timer 时推进 `bubble.now`、`timers.check` 触发到期定时器(经 `ready`→
-   `weaveEnqueue` 唤醒参与者)。`time.Sleep`/`time.After`/`NewTimer`/`context.WithTimeout` 均可正常
-   工作(`weaveOnBlock`/`weaveOnGoexit` 用 `timers.wakeTime()>0` 区分推进时钟 vs 真死锁)。回归
-   `internal/weave` 的 `TestFakeClock*`。小限制:同 deadline 定时器触发顺序不单独枚举;永不停止的
-   `time.Tick` 无限推进时钟 → 受预算约束(Truncated)。
+1. **真实时间/定时器**:受控 bubble 内**已支持假时钟推进**(D11)——`weaveRootWait` 推进 `bubble.now`、
+   `timers.check` 触发到期定时器(经 `ready`→`weaveEnqueue` 唤醒参与者)。
+   `time.Sleep`/`time.After`/`NewTimer`/`context.WithTimeout` 均可正常工作。**推进时机本身是可枚举的
+   调度选择**(D22):有 pending timer 且有任一参与者阻塞时,`weavePushClock` 把它作为候选放进 runnable
+   集;无人可运行时它是唯一候选,退化成 D11 的行为。回归 `internal/weave` 的 `TestFakeClock*` 与
+   `TestClockAdvance*`。小限制:同 deadline 定时器触发顺序不单独枚举;永不停止的 `time.Tick` 无限推进
+   时钟 → 受预算约束(Truncated)。
 2. **真实网络/文件 I/O**:须用内存 fake,继承 synctest 规矩。跨 bubble 通信保留 synctest 现有
    `fatal`(`send/recv on synctest channel from outside bubble`)。
 3. **泡泡外并发的显式检测**(`uncontrolled concurrency detected`)——**未实现**,roadmap 候选
@@ -248,7 +255,8 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 | 抢占计数上界(CHESS context bounding) | ✅ | `ExploreBounded` |
 | 默认自动迭代加深抢占上界(未设 env 时 0→2 逐层,替代无界) | ✅ | `exploreIterative`/`defaultPreemptCeiling` |
 | 失败报告对象标签化(mutex#/chan#/…)+ 死锁列出各 goroutine 等待对象 | ✅ | `addrLabeler`/`blockedWaits` |
-| 假时钟假阴性提示(退出时仍有未触发 timer)| ✅ | `weaveControl.unfiredTimer`→`Result.UnfiredTimer` |
+| 假时钟推进作为可枚举调度选项(超时 vs 事件)| ✅ | 伪参与者 `weaveClockWid` + `opClockAdvance`(D22) |
+| 未推进过时钟时的假阴性提示 | ✅ | `Result.UnfiredTimer` + `ClockAdvanced` |
 | L2 接入真实 chan/mutex/rwmutex/waitgroup/cond/once(零改写) | ✅ | runtime + sync |
 | L1 编译器内存插桩(`-weave`,含结构体/切片/值显示) | ✅ | cmd/compile + cmd/go |
 | channel happens-before(DPOR 对 channel 冲突健全) | ✅ | `channelHB` |
@@ -265,7 +273,6 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 | `t.Skip` 在探索模式下正确跳过 | ✅ | `weaveTestSkip` 哨兵(D21) |
 | op 码跨 5 处声明的交叉校验 | ✅ | `internal/weave/optab_test.go` |
 | 演示用例行为的自动断言 | ✅ | `weavedemo/check.sh`(期望值从注释推导) |
-| **把"推进假时钟"变成可枚举调度选项** | ⬜ | 当前最值得做的能力缺口,见 design §9 |
 | 弱内存模型(atomic C11 重排 / read-from)| ⬜ | 依赖 atomic |
 | optimal-DPOR(wakeup tree)进一步剪枝 | ⬜ | 增强 |
 | 抢占看门狗(死循环兜底)| ⬜ | 见 §5.A.2 |
@@ -298,10 +305,10 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 - **假时钟基准时间已修**(2026-07-22):weave 路径的 `weaveRunBubble` 曾漏设 `bubble.now`,导致 `-weave`
   下 `time.Now()` 返回 1970 而非普通 synctest 的 2000 基准(`TestNow` 失败)。修复:把 `synctestBaseTime`
   提为 runtime 包级 const,`weaveRunBubble` 建 bubble 时一并设 `now`,与普通 synctest 完全一致。
-- **假时钟假阴性("超时 vs 事件"竞争)**:假时钟只在**全体 durably blocked** 时推进,故若并发事件的
-  goroutine 一直可运行,基于 `time.After` 的超时**永不触发**,该类竞争探不到(假阴性)。规避是把事件
-  **对齐到定时器边界**(如让事件 goroutine `Sleep(超时时长)` 到同一虚拟时刻)。weave 现会在探索结束、
-  发现有从未触发的 pending timer 时**打印提示**引导这样做(`Result.UnfiredTimer`)。
+- **"超时 vs 事件"竞争已可探(D22)**:`-weave` 下推进假时钟是一个可枚举的调度选项(有 pending timer 且
+  有任一参与者阻塞时提供),所以不必再把事件"对齐到定时器边界"。注意两点:选择时钟计一次抢占,故默认
+  迭代加深要到第 1 层才会命中,`WEAVE_MAX_PREEMPTIONS=0` 则退回 idle-only;**不加 `-weave` 时 synctest
+  行为不变**(放宽只在受控 bubble 内)。仅同一 deadline 上多个定时器的相对触发顺序仍不枚举。
 - **`-weave` 下不适用的测试用 `underWeave` 跳过**:`testing/synctest` 里验证 testing-package **交互
   输出**的用例(TestFatal/Error/VerboseError/Skip/VerboseSkip/Helper——经 `runTest` fork 子进程断言
   非-weave 输出格式;TestContext——用闭包外共享状态断言 `t.Context()` 生命周期)以及重量级/压力用例

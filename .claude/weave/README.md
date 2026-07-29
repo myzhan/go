@@ -28,8 +28,9 @@ seed 重放 + 源码行号 + goroutine 图例 + 读写值显示均已落地。
 **用户接口**:没有 weave 专属 API——直接写标准 `testing/synctest.Test`,`-weave` 下自动进入探索(D12)。
 
 **易用性**:不设抢占上界时**默认自动迭代加深**(0→2,避免真实模型爆炸)、失败轨迹对象用**可读标签**
-(mutex#1/chan#2/rwmutex#3)、**死锁报告逐 goroutine 列出等待对象**、假时钟"超时 vs 事件"漏探时
-**打印对齐提示**。
+(mutex#1/chan#2/rwmutex#3)、**死锁报告逐 goroutine 列出等待对象**。**假时钟推进是可枚举的调度选项**
+(D22),所以"超时 vs 事件"竞争能被探到,trace 里显示 `clock advance +1s`;不加 `-weave` 时 synctest
+行为不变。
 
 **剩余缺口**:atomic 自由函数(`atomic.LoadInt64` 等编译器 intrinsic)与 `atomic.Value`;经 runtime
 函数完成的访问(Go map);弱内存重排。
@@ -48,7 +49,7 @@ cd src && ../bin/go test internal/weave/ testing/synctest/
 cd src && ../bin/go test -weave internal/weave/
 
 # 演示模块:全部是普通 testing/synctest 用例,加 -weave 即进入系统交错探索
-# supported/ 里 23 个为故意失败(展示 weave 抓 bug + 打印 seed),correct_* 预期 PASS;
+# supported/ 里 24 个为故意失败(展示 weave 抓 bug + 打印 seed),correct_* 预期 PASS;
 # unsupported/ 全 PASS(已知假阴性,作边界文档)。根目录不放 .go 文件。
 cd weavedemo && ../bin/go test -weave -v ./...
 
@@ -88,7 +89,7 @@ func TestCounter(t *testing.T) {
 约束(同 loom/synctest):模型闭包必须**可重跑**(共享状态在闭包内声明)、除调度外**确定性**
 (勿用 `rand`/依赖 map 迭代序)、所有 goroutine 必须能结束。时间/定时器由 synctest 假时钟驱动,
 `time.Sleep`/`time.After`/`context.WithTimeout` 在受控 bubble 内**可正常工作**(见 [design.md](design.md)
-D11);仍建议用 channel/`context.WithCancel` 等内存接缝让交错更显式。
+D11),且**推进时机本身会被枚举**,所以超时分支不会被漏掉(D22)。
 
 ## 搜索深度(抢占上界)
 
@@ -112,13 +113,20 @@ D11);仍建议用 channel/`context.WithCancel` 等内存接缝让交错更显式
 - **超时/重连**:用 `context`/channel 表达超时,而不是依赖真实时间;重连建模为"替换当前 conn +
   通知"(mutex/cond),weave 会探索"旧 conn 出错 vs 重连接管"的交错。
 
-### 假时钟与"超时 vs 事件"竞争的一个坑
+### 假时钟:"超时 vs 事件"竞争可以探到
 
-假时钟只在 bubble **全体 durably blocked** 时才推进(推进到最近的 pending timer)。因此若被测的
-并发事件对应的 goroutine **一直可运行**,假时钟不会推进,基于 `time.After` 的超时**永远不会触发**,
-"超时 vs 事件"这一类竞争就探不到(假阴性)。要探这类竞争,把并发事件**对齐到定时器边界**——例如
-让事件 goroutine 先 `time.Sleep(超时时长)` 到与超时同一虚拟时刻,两者便在同一时刻竞争,weave 即可
-交错二者。(weave 在探索结束若发现有从未触发的定时器,会打印提示引导你这样做。)
+`-weave` 下,**推进假时钟本身就是一个可枚举的调度选项**(ADR D22):只要有 pending timer 且**有任一
+goroutine 阻塞**,weave 就会把"推进到最近 deadline 并触发定时器"当作一个候选 transition 去枚举。所以
+`select { case <-done: case <-time.After(d): }` 里"超时赢"那条分支能被探到,失败 trace 里会出现:
 
-把"推进时钟到最近 deadline 并触发"本身建模成**一等的可枚举调度选项**可以根治它;这是当前最值得做的
-能力缺口,见 design.md §9。
+```
+  7: clock advance +1s
+```
+
+这比 synctest 本身的契约(**只在全体 durably blocked 时**才推进)更宽,是刻意的——否则只要发事件的
+goroutine 一直可运行,超时就永远不触发,那条交错根本不在模型里。两点值得知道:
+
+- **不加 `-weave` 时 synctest 行为完全不变**:放宽只发生在受控 bubble 内(结构性保证,见 D22)。
+- **想退回 idle-only** 就用 `WEAVE_MAX_PREEMPTIONS=0`:选择时钟只要有其他 goroutine 可运行就计一次抢占,
+  所以 c=0 精确等于 synctest 的原契约。反过来,若某个用例的超时分支需要更多抢占才能到达,提高这个上界。
+- 仍未建模:同一 deadline 上多个定时器的**相对触发顺序**(沿用 deadline 堆序)。

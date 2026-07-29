@@ -93,6 +93,17 @@ per-step trace 缓冲、`plan`/`selPlan`(重放向量)、存活计数、done/dea
 一层协作式调度。令牌交接在三个中心点完成(无需逐原语改代码):`ready`(同步唤醒→入 runnable 集
 而非 OS-runnable)、`park_m`(真实阻塞→交接令牌)、`goexit`/`Yield`(退出/显式让出→交接)。
 
+### 时钟是一个伪参与者
+
+假时钟的**推进时机**也是一个调度选择,而不是自动行为。控制器在候选集里放一个保留 wid
+(`weaveClockWid`)的合成条目,表示"推进到最近 deadline 并触发到期定时器";它和真实参与者一起进入
+`weaveChoose`,于是复用同一套 plan / seed / DPOR 回溯,不需要额外的选择维度。被选中时由 **root** 执行
+推进(root 在参与者集合之外、不被插桩),当前参与者经 `weaveHandoffClock` 把令牌交给它。
+
+这样"超时 vs 事件"竞争才在模型里:synctest 的契约是全体 durably blocked 才推进时钟,而只要发事件的
+goroutine 一直可运行,超时就永远不触发。放宽只发生在受控 bubble 内,`-weave` 之外的 synctest 行为不变;
+选择时钟计一次抢占,所以 `WEAVE_MAX_PREEMPTIONS=0` 精确退回原契约。详见 design.md 的 D22。
+
 ### linkname 边界(runtime ↔ internal/weave)
 
 ```
