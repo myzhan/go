@@ -1,21 +1,4 @@
-// This file shows how to make network logic testable under weave by faking the
-// transport with an in-memory, bubble-aware net.Conn. Real sockets leave the
-// synctest bubble (weave cannot control or explore them), so — as with
-// loom/Coyote/CHESS — the transport must be built from in-memory seams
-// (channels / sync primitives) that weave treats as scheduling points.
-//
-// Use net.Pipe as the fake transport. It is already bubble-aware (implemented
-// with channels) and, crucially, COMPACT: its Read/Write is a synchronous
-// rendezvous, one scheduling point per hand-off. That keeps the explored state
-// space small.
-//
-// Avoid hand-rolling a *buffered* conn out of sync.Cond + a []byte buffer: under
-// -weave every slice/flag access becomes a scheduling point, so the fake's own
-// internals explode the search (a one-byte echo can exceed the schedule budget).
-// If you truly need buffering, build it from a buffered channel (one scheduling
-// point per message), not cond+slice. For most request/response and reconnect
-// protocols, net.Pipe is enough.
-package weavedemo
+package supported
 
 import (
 	"encoding/binary"
@@ -24,6 +7,24 @@ import (
 	"testing"
 	"testing/synctest"
 )
+
+// This file shows how to make network logic testable under weave by faking the
+// transport with an in-memory, bubble-aware net.Conn, and is EXPECTED TO PASS in
+// both modes. Real sockets leave the synctest bubble (weave cannot control or
+// explore them), so — as with loom/Coyote/CHESS — the transport must be built from
+// in-memory seams (channels / sync primitives) that weave treats as scheduling
+// points.
+//
+// Use net.Pipe as the fake transport. It is already bubble-aware (implemented with
+// channels) and, crucially, COMPACT: its Read/Write is a synchronous rendezvous,
+// one scheduling point per hand-off. That keeps the explored state space small.
+//
+// Avoid hand-rolling a *buffered* conn out of sync.Cond + a []byte buffer: under
+// -weave every slice/flag access becomes a scheduling point, so the fake's own
+// internals explode the search (a one-byte echo can exceed the schedule budget).
+// If you truly need buffering, build it from a buffered channel (one scheduling
+// point per message), not cond+slice. For most request/response and reconnect
+// protocols, net.Pipe is enough.
 
 // writeFrame / readFrame are a tiny length-prefixed message protocol, the kind
 // of framing real network code uses. They run unchanged over the net.Pipe fake.

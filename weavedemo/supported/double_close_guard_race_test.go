@@ -1,9 +1,3 @@
-// Package supported collects concurrency bugs that weave ALREADY finds today,
-// one bug per file. Each is an ordinary testing/synctest test that PASSES in a
-// single synctest schedule but is EXPECTED TO FAIL under
-// `../../bin/go test -weave ./...` — that failure is weave reporting the bug
-// (a captured panic, an inconsistent read, or a deadlock) with the interleaving
-// and a WEAVE_REPLAY seed.
 package supported
 
 import (

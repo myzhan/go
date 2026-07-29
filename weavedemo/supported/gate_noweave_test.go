@@ -1,5 +1,5 @@
 //go:build !weave
 
-package weavedemo
+package supported
 
 const builtWithWeave = false

@@ -1,6 +1,6 @@
 //go:build weave
 
-package weavedemo
+package supported
 
 // builtWithWeave is true when the package is built with -weave (memory
 // instrumentation). The GC-preemption stress test skips in this mode because

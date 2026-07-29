@@ -1,4 +1,4 @@
-package weavedemo
+package supported
 
 import (
 	"runtime"

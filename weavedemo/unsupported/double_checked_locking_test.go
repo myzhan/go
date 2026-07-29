@@ -16,8 +16,8 @@ import (
 // order, so `instance = &cfg{val: 42}` always makes the field write precede (and
 // be visible with) the pointer publication. No explored interleaving yields a
 // non-nil pointer with val != 42, so weave PASSES. This is the same weak-memory
-// blind spot as ../unsupported/weak_memory_publication, in its most famous
-// real-world guise. What DOES flag it is `-race` (the fast-path read of instance
+// blind spot as weak_memory_publication_test.go, in its most famous real-world
+// guise. What DOES flag it is `-race` (the fast-path read of instance
 // is a genuine data race); the fix is sync.Once or an atomic pointer.
 func TestDoubleCheckedLocking(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
