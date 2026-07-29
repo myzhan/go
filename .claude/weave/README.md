@@ -26,8 +26,9 @@ select-case 枚举、非阻塞 channel 操作、RNG/map 序确定化、panic 捕
 goroutine 图例 + 读写值显示均已落地。**易用性**:不设抢占上界时**默认自动迭代加深**(0→2,避免真实
 模型爆炸)、失败轨迹对象用**可读标签**(mutex#1/chan#2)、**死锁报告逐 goroutine 列出等待对象**、
 假时钟"超时 vs 事件"漏探时**打印对齐提示**。**API 已精简**:不再有 `testing/weave`/`weave.Test`——直接用
-标准 `testing/synctest.Test`,`-weave` 下自动进入探索(ADR D12)。**唯一大缺口**:`sync/atomic`
-插桩(无锁代码探索不了)。
+标准 `testing/synctest.Test`,`-weave` 下自动进入探索(ADR D12)。`sync/atomic` **类型化 API**
+(`atomic.Int64/Bool/Pointer` 等的方法)已插桩为调度点(ADR D18,库级钩子 + build-tag no-op 保内联),
+无锁 RMW 能探索了;**剩余缺口**:atomic 自由函数(`atomic.LoadInt64` 等 intrinsic)与 `atomic.Value`。
 
 详细能力清单与里程碑见 [imp.md](imp.md) §1、§6。
 

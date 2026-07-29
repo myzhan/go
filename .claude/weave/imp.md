@@ -26,9 +26,12 @@
   经 `runSchedule` 回传聚合到 `Result.UnfiredTimer`,成功报告追加提示"把并发事件对齐到定时器边界",
   帮用户发现"超时 vs 事件"这类因假时钟不推进而漏探的竞争。
 
-**唯一大缺口**:`sync/atomic` 插桩——atomic 目前既非调度点也不记录,用 atomic 的无锁代码探索
-不了。正解仿 `-race` 用 instrumented std 重建,工程量大,为免拖累全体 Go 程序 atomic 性能未
-草率合入,留作独立专注实现。
+**`sync/atomic` 插桩(已部分落地,见 D18)**:`sync/atomic` 的**类型化 API**(`atomic.Int64/Uint64/
+Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/Or`)现已成为调度点——在
+`type.go` 方法里调 `weaveAtomic`(库级钩子,仿 `sync.Mutex`),故 `atomic.Load()+Store()` 之类非原子 RMW 能被
+探索。钩子按 `weave` build tag 分流:`-weave` 下是真钩子,普通构建下是空 no-op(`weave_off.go`),不拖累
+全体 Go 程序 atomic 性能、方法仍可内联。**尚缺**:自由函数(`atomic.LoadInt64` 等,是编译器 intrinsic,须仿
+`-race` 在 `-weave` 下关掉 intrinsic 再走带钩子实现)与 `atomic.Value`——留作后续。
 
 ---
 
@@ -115,7 +118,35 @@
 ### 演示 —— `weavedemo/`(独立 module)
 - `weave_test.go`(丢更新/加锁/channel/check-then-act/死锁)、`asyncio_test.go`(异步 IO/
   net.Pipe/context.WithCancel/超时泄漏)、`gcrepro_test.go`(GC 抢占压力,`-weave` 下跳过——见 §7)。
-- 跑法:`cd weavedemo && ../bin/go test -weave -v`(部分用例为**故意失败**以演示 weave 抓 bug)。
+- `supported/`(子 package,一用例一文件)——**weave 能稳定发现**的真实并发 bug(`-weave` 下确定失败并给
+  可复现 seed;plain 单跑行为不定——可能漏报、确定命中或 flaky,这正是 weave 相对单跑的价值。用例按自身合理性
+  编写,**不为迎合单跑调度而改**):
+  `double_close_guard_race`(TOCTOU→panic 捕获)、`transfer_inconsistent_read`(跨双锁原子性违背)、
+  `cond_lost_wakeup`(`sync.Cond` 丢唤醒→死锁)、`channel_order_assumption`(buffered channel 发送乱序)、
+  `rwmutex_misuse_lost_update`(用 RLock 保护写→丢更新)、`select_priority_assumption`(select 无优先级,
+  两 case 就绪时走错分支)、`multi_producer_append`(无锁 append 丢元素)、`rwmutex_writer_starvation`
+  (持 RLock 再取 RLock,中间写者排队→自死锁)、`lockfree_stack_lost_push`(无锁栈用 Store 代替 CAS 丢节点;
+  **weave 靠节点 `next` 的普通字段写这个调度点抓到**——反衬 atomic 盲区仅限"纯 atomic 无普通内存穿插")、
+  `channel_lock_deadlock`(**用 buffered channel 当锁的 AB/BA 死锁**;曾经漏报,现由 channelHB 的 token-recycling
+  taint 修复后能抓到——见 design.md D16)、`semaphore_oversubscribe`(check-then-act 并发限流器超发)、
+  `waitgroup_add_in_goroutine`(`wg.Add` 在 goroutine 内→Wait 提前返回;`go vet` 也能静态抓,weave 动态给轨迹)、
+  `atomic_lost_update`(`atomic.Load()+Store()` 非原子 RMW;曾经漏报,现由类型化 atomic 插桩后能抓到——见 D18)、
+  `struct_tearing`(整体结构体赋值 vs 读,不变量 x==y;曾经漏报,现由 `-weave` 下多字段结构体逐字段存储后能抓到
+  撕裂读 {5,0}——见 D19)、`slice_index_oob`(并发 `s=s[:1]` vs `s[2]`:slice 头竞争→越界 panic 捕获,全新失败类别)、
+  `dining_philosophers`(3 方环形等待死锁,区别于 2 方 AB/BA)、`semaphore_leak_deadlock`(取消路径提前 return
+  漏还信号量额度→后续 acquire 永久阻塞死锁)、`context_cancel_missed`(轮询 `ctx.Err()` 后再阻塞的 TOCTOU→漏掉
+  中途取消→worker 泄漏;演示应 `select` 于 `ctx.Done()`)、`inconsistent_locking`(两处用**不同**的 mutex 保护同一
+  变量→无真正互斥→丢更新;演示"加锁≠线程安全,须同一把锁")。
+- `unsupported/`(子 package,一用例一文件)——**weave 当前发现不了**的真实 bug(假阴性,`-weave` 下 PASS):
+  `weak_memory_publication`
+  (无同步发布可见性,弱内存重排未建模,仅 SC+程序序)、`benign_data_race`(良性竞争:weave 只报算错/死锁/
+  泄漏/panic,不报缺同步,故 PASS,须靠 `-race` 互补)、`map_concurrent_write`(并发写同一 map;`mapassign`
+  是无调度点的 runtime 调用→weave 不交错、漏报,与 atomic 缺口同类;因串行化不会真触发 fatal,`-race` 能抓)、
+  `timer_vs_event_false_negative`(假时钟只在全体 durably blocked 时推进→超时 vs 常驻可运行事件漏探,
+  weave PASS 并打印对齐提示;由 `asyncio_test.go` 归类移入)、`double_checked_locking`(DCL:普通变量做
+  fast-path 检查,发布指针先于字段写对读者可见→半构造对象;弱内存重排未建模,weave SC 视角认为正确故 PASS)。
+- 跑法:`cd weavedemo && ../bin/go test -weave -v ./...`(根 package 与 `supported/` 部分用例为**故意失败**
+  以演示 weave 抓 bug;`unsupported/` 全 PASS 作为边界文档)。
 
 ---
 
@@ -195,7 +226,7 @@
 | 失败 seed 重放 + 源码行号 + goroutine 图例 + 读写值 | ✅ | explore + testing/synctest |
 | 探索预算 / wall-clock 超时 / 截断显式上报 | ✅ | `ExploreBounded`/`Truncated` |
 | `-weave` 与 `-race`/`-msan`/`-asan` 互斥 | ✅ | `weaveInit` + compile 校验 |
-| **atomic 插桩** | ⬜ | 最大缺口,见 §1 |
+| **atomic 插桩(类型化 API)** | ✅ | `sync/atomic` type.go 方法钩子(D18);自由函数/`atomic.Value` 待做 |
 | 弱内存模型(atomic C11 重排 / read-from)| ⬜ | 依赖 atomic |
 | optimal-DPOR(wakeup tree)进一步剪枝 | ⬜ | 增强 |
 | 抢占看门狗(死循环兜底)| ⬜ | 见 §5.A.2 |

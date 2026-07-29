@@ -98,8 +98,8 @@ bubble 归属在创建时继承,跨 package 自动生效,对被测代码透明�
 - **值显示**:读插桩传 size,运行时按类型读内存显示读到的值;写插桩把整型/bool 右值零扩展后传
   `weavewriteval` 显示写入的新值(排除 uintptr 等)。用于失败 trace 可读性。
 
-**现状**:内存插桩已完成;`sync/atomic` 尚未纳入(唯一大缺口,见 imp.md)。故 design 早期"默认
-只插 atomic、内存作可选高强度档"的设想与现实相反——现实是内存已做、atomic 待做。
+**现状**:内存插桩已完成;`sync/atomic` **类型化 API** 已纳入(库级钩子,见 D18),自由函数与 `atomic.Value`
+待做。故 design 早期"默认只插 atomic、内存作可选高强度档"的设想与现实相反——现实是内存先做、atomic 后补。
 
 ### 3.3 L3:DPOR 探索引擎
 
@@ -403,6 +403,75 @@ ABBA 死锁尤其难读。等待对象**直接从 trace 每个参与者的最后
 3. **非并发测试跳过**:`testing/synctest` 里验证 testing-package 交互输出(fork 子进程断言非-weave 格式)
    或重量级/压力(net/http 集成、100 定时器)的用例,在 `-weave` 下语义不适用/超容量,用 build-tag 常量
    `underWeave` 跳过(仿标准库对 `-race` 的 `//go:build !race`)。修后 `-weave` 下 `testing/synctest` 全绿。
+
+### D16 — channelHB 对"channel 当锁"的 token-recycling taint(DPOR 健全性修复)
+
+**问题**:`channelHB`(explore.go)用"第 k 个 send happens-before 第 k 个 recv"的 FIFO 配对做 DPOR 的
+happens-before。对**当锁/信号量用的 channel**(同一 goroutine `<-ch` 获取、`ch<-` 释放,循环复用同一 token),
+这个配对**不随交错稳定**:某个 recv 到底配对哪个 send 取决于调度。用它做 HB 会把两个竞争同一 channel 的
+receiver **虚假地定序**,从而剪掉到达死锁的那个反转——`weavedemo` 里用 capacity-1 channel 当锁的 AB/BA
+死锁因此被漏报(而同构的 `sync.Mutex` 版能抓到,因为 mutex 本就被 channelHB 排除、无 HB 边)。
+
+**决策**:若某个 channel 上**存在一个 participant 既 send 又 recv**(token 复用 / 锁语义),则把该 channel
+taint(与 NB op / select 同样处理),其 FIFO 序不再当作 HB。生产者/消费者 channel(send/recv 参与者不相交)
+不受影响,HB 剪枝照旧。**健全性**:少一条 HB 边只会让 DPOR 多探反转、绝不漏探(与既有 taint 同理),故安全;
+代价是锁式 channel 的搜索变宽(有抢占上界兜底)。
+
+**验证**:`internal/weave` 全部差分健全性/等价用例(`TestChannelDPOREquivalence` 要求 DPOR 运行数 ≤ 穷举、
+`TestDPORSoundnessSuite` 要求终态集合相等)仍通过;`weavedemo/supported/channel_lock_deadlock` 现能被抓到
+(从 `unsupported/` 移入 `supported/`)。
+
+### D17 — 失败报告显示测试断言原文(不再是通用 sentinel)
+
+**问题**:模型用 `t.Error/Fatal`(而非 `panic`)失败时,`testingWeaveTest`(testing.go)用 `runtime.Goexit`
+后在 defer 里 panic 一个通用 sentinel `weave: schedule failed`,weave 报告里失败原因就成了这句无信息的话
+(而 `panic("msg")` 的用例能显示 `msg`)。丢了 `t.Fatal` 的真实信息(如 "lost update")。**根因**:synctest 子
+`t`(`isSynctest`)的日志经 `destination()` 重定向到父 `t`,故子 `t.output` 为空,且 `-v` chatty 模式会直接
+streaming 不缓冲——照搬 output 拿不到。
+
+**决策**:在 `common.log` 里,当 `isErr && c.isSynctest` 时把该行(此时是未加 framing 的纯文本 `file:line: msg`)
+另存到子 `t` 的 `weaveFailLog`;`testingWeaveTest` 失败分支改 panic 一个携带该文本的 `*weaveTestFailure`
+(其导出方法 `WeaveTestFailure() string` 让 `testing/synctest` 能识别)。`formatOutcome` 对实现该接口的失败值
+**直接显示原文、不加 "panic:" 前缀**(真正的 panic 仍显示 `panic: v`)。此改惠及所有基于 `t.Fatal/Error` 的用例。
+
+**验证**:`testing`/`testing/synctest`/`internal/weave` 全绿;`weavedemo` 里 `TestLostUpdate` 等报告从
+"panic: weave: schedule failed" 变为 "weave_test.go:40: lost update"。
+
+### D18 — `sync/atomic` 类型化 API 作为调度点(库级钩子,非编译器)
+
+**问题**:`sync/atomic` 操作既非调度点也不记录,故用 atomic 的无锁代码(如 `atomic.Load()+Store()`
+组成的非原子 RMW)探索不到——曾列为"唯一大缺口"。早期设想以为"atomic 是编译器 intrinsic,须走编译器
+插桩"。
+
+**决策**:`sync/atomic` 的**类型化方法**(`Int64`/`Uint64`/`Int32`/`Uint32`/`Uintptr`/`Bool`/`Pointer[T]` 的
+`Load/Store/Swap/Add/CompareAndSwap/And/Or`)其实是**普通 Go 方法**(体内调用 intrinsic 函数),可在 `type.go`
+方法入口调 `weaveAtomic(op, &x.v)` 把每个操作变成调度点——完全类比 `sync.Mutex` 经 internal/sync 的库级钩子,
+**无需改编译器**。op 分 Load/Store/RMW 三类;DPOR 里按对象地址冲突、两个 atomic load 视为独立、不建 HB(同
+mutex)。**保内联**:钩子按 `weave` build tag 分流——`-weave` 下 `weave_on.go` 是真钩子,普通构建下
+`weave_off.go` 是空 no-op,编译器内联掉,故普通程序 atomic 零开销、方法仍可内联(不碰 inl_test 的既有约束)。
+
+**范围**:类型化 API 已覆盖(典型无锁代码都用它)。**未覆盖**:自由函数(`atomic.LoadInt64` 等,是编译器
+intrinsic,须仿 `-race` 在 `-weave` 下关掉 intrinsic 再走带钩子实现)与 `atomic.Value`——留作后续。
+
+**验证**:`sync/atomic`/`sync`/`internal/weave`/`testing/synctest` 全绿;`go build std` 通过;`TestIntendedInlining`
+无新增回归(atomic 方法仍内联);`weavedemo/supported/atomic_lost_update` 现能被抓到(从 `unsupported/` 移入)。
+
+### D19 — `-weave` 下多字段结构体赋值按字段存储(建模非原子写→撕裂读)
+
+**问题**:多字节结构体赋值 `p = point{5,5}` 在语言层**不是原子的**(编译成多条 store,另一 goroutine 可读到
+半更新的 `{5,0}`)。但 weave 之前把它记为**一个** `weavewriterange` 调度点 + **一条整体 store**,故读者插不进
+两次字段写之间,撕裂读探不到(假阴性)。
+
+**决策**:在 `cmd/compile` 的 `ssagen.storeType` 里,当 `base.Flag.Weave` 且目标是**无指针、多字段的结构体**
+(`skip==0`)时,不发"整体 range 钩子 + 整体 store",而是**逐字段递归 `storeType`**:每个标量字段各得一个
+`weavewrite` 钩子 + 一条字段 store。这样每次字段写都是独立调度点,读者可在字段写之间交错读到撕裂值。复用了
+既有的 `storeTypeScalars` 字段分解(写屏障路径本就这么拆),正确性有保证。**门控**:仅 `base.Flag.Weave`;普通
+构建与 `-race`/`-msan`/`-asan` 走原来的整体 store,**codegen 字节不变**。**范围**:限无指针结构体(避免写屏障复杂度);
+含指针的结构体、slice/string 头、数组元素的撕裂留作后续。**注意**:改 `cmd/compile` 需重装编译器
+(`go install cmd/compile`),`go test` 不会自动重建工具链。
+
+**验证**:`internal/weave`(含 `TestStructWholeWriteVsFieldRead`)/`testing/synctest` 全绿;普通构建 `go build std`
++ `sync`/`strconv`/`encoding/json` 测试通过;`weavedemo/supported/struct_tearing` 现能被抓到(从 `unsupported/` 移入)。
 
 ---
 
