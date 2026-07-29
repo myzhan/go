@@ -34,6 +34,8 @@ const (
 	opAtomicLoad // sync/atomic load; scheduling point, conflicts by address, no HB
 	opAtomicStore
 	opAtomicRMW // atomic read-modify-write (Add/Swap/CAS/And/Or)
+	opRLock     // RWMutex read lock (shared); conflicts like opLock for now
+	opRUnlock   // RWMutex read unlock
 )
 
 // Step is one transition in a recorded interleaving.
@@ -324,7 +326,8 @@ func isChanOp(op uint8) bool {
 
 func isSyncOp(op uint8) bool {
 	switch op {
-	case opLock, opUnlock, opChanSend, opChanRecv, opChanClose, opChanSendNB, opChanRecvNB,
+	case opLock, opUnlock, opRLock, opRUnlock, opChanSend, opChanRecv, opChanClose,
+		opChanSendNB, opChanRecvNB,
 		opSelect, opWaitGroupWait, opWaitGroupAdd, opCondWait, opCondSignal, opCondBroadcast, opOnce,
 		opAtomicLoad, opAtomicStore, opAtomicRMW:
 		return true
@@ -687,6 +690,10 @@ func opName(op uint8) string {
 		return "lock"
 	case opUnlock:
 		return "unlock"
+	case opRLock:
+		return "rlock"
+	case opRUnlock:
+		return "runlock"
 	case opChanSend:
 		return "chan send"
 	case opChanRecv:

@@ -51,7 +51,9 @@ type Once struct {
 // If f panics, Do considers it to have returned; future calls of Do return
 // without calling f.
 func (o *Once) Do(f func()) {
-	weaveSchedPoint(weaveOpOnce, unsafe.Pointer(o))
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpOnce, unsafe.Pointer(o))
+	}
 	// Note: Here is an incorrect implementation of Do:
 	//
 	//	if o.done.CompareAndSwap(false, true) {

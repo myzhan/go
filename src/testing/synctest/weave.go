@@ -54,6 +54,8 @@ func weaveExplore(t *testing.T, f func(*testing.T)) bool {
 	if seed := os.Getenv("WEAVE_REPLAY"); seed != "" {
 		res := weave.Replay(seed, body)
 		switch {
+		case weaveSkipped(res):
+			t.SkipNow()
 		case !replayInconclusive(res):
 			t.Logf("weave: replayed seed %s, no failure", seed)
 		case res.Truncated:
@@ -89,6 +91,10 @@ func weaveExplore(t *testing.T, f func(*testing.T)) bool {
 	}
 	res := exploreIterative(body, budget, ceiling, timeout)
 	switch {
+	case weaveSkipped(res):
+		// The model skipped itself; there is nothing to explore. The skip reason was
+		// already logged, so just skip the real test.
+		t.SkipNow()
 	case res.Failed, res.Deadlock:
 		lab := newAddrLabeler()
 		t.Errorf("weave: found failing interleaving after %d schedule(s):\n%s%s%s\n"+
@@ -186,6 +192,17 @@ func resolveTimeout(env string) time.Duration {
 	return d
 }
 
+// weaveSkipped reports whether the model skipped itself (t.Skip/SkipNow inside the
+// bubble). Skips travel out as a panic because they run runtime.Goexit, so without
+// this check they would be reported as a failing interleaving.
+func weaveSkipped(res weave.Result) bool {
+	if !res.Failed {
+		return false
+	}
+	s, ok := res.Value.(interface{ WeaveTestSkip() bool })
+	return ok && s.WeaveTestSkip()
+}
+
 // replayInconclusive reports whether a replayed result must fail the test rather
 // than be reported as a clean pass: a panic or deadlock is a reproduced failure,
 // and a truncated replay did not run to completion (capacity overflow), so
@@ -207,13 +224,22 @@ func replayCommand(seed, name string, trace []weave.Step) string {
 	return fmt.Sprintf("WEAVE_REPLAY=%s go test%s -run %s", shellSingleQuote(seed), flag, shellSingleQuote(runPattern(name)))
 }
 
-// traceNeedsWeave reports whether the failing interleaving contains a memory
-// read/write transition. Those exist only under -weave (memory instrumentation),
-// and the schedule points differ between the two modes, so such a failure
-// reproduces only under -weave.
+// traceNeedsWeave reports whether the failing interleaving contains a transition
+// that only exists in a -weave build, in which case the seed reproduces only under
+// -weave (the scheduling points, and hence the choice vector, differ between the
+// two modes). Those are memory read/write transitions (compiler instrumentation)
+// plus every hook that is compiled in under the "weave" build tag: sync/atomic and
+// the sync package's RWMutex-read/Once/Cond/WaitGroup hooks. Channel, select and
+// plain Mutex transitions exist in both modes — internal/sync's mutex hook is
+// always compiled (see internal/sync/weave.go).
 func traceNeedsWeave(trace []weave.Step) bool {
 	for _, s := range trace {
-		if s.Op == "read" || s.Op == "write" {
+		switch s.Op {
+		case "read", "write", // compiler instrumentation
+			"atomic load", "atomic store", "atomic rmw", // sync/atomic hook
+			"rlock", "runlock", "once", // sync package hooks
+			"cond wait", "cond signal", "cond broadcast",
+			"wg wait", "wg add":
 			return true
 		}
 	}
@@ -322,7 +348,7 @@ func blockedWaits(steps []weave.Step) []blockedWait {
 // memory access) are excluded.
 func isBlockingOp(op string) bool {
 	switch op {
-	case "lock", "chan send", "chan recv", "cond wait", "wg wait":
+	case "lock", "rlock", "chan send", "chan recv", "cond wait", "wg wait":
 		return true
 	}
 	return false
@@ -418,6 +444,8 @@ func opKind(op string) string {
 	switch {
 	case op == "lock" || op == "unlock":
 		return "mutex"
+	case op == "rlock" || op == "runlock":
+		return "rwmutex"
 	case strings.HasPrefix(op, "chan"):
 		return "chan"
 	case strings.HasPrefix(op, "cond"):

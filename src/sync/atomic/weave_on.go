@@ -15,12 +15,25 @@ import "unsafe"
 // the operation as a weave transition (yielding to the controlled scheduler) and
 // is a no-op outside a controlled bubble. This mirrors internal/sync's mutex hook.
 //
+// weaveEnabled gates the hook call sites in type.go at compile time, so ordinary
+// builds pay nothing at all (see weave_off.go).
+const weaveEnabled = true
+
 //go:linkname weaveGloballyActive runtime.weaveGloballyActive
 var weaveGloballyActive uint32
 
 //go:linkname runtime_weaveSchedPoint runtime.weaveSchedPoint
 func runtime_weaveSchedPoint(op uint8, addr unsafe.Pointer)
 
+// weaveAtomic is deliberately noinline: -weave instruments memory accesses in the
+// command-line packages only, but an inlined body is instrumented in whatever
+// package it lands in — and the typed atomic methods DO inline into their callers.
+// Keeping this body out of the caller keeps the weaveGloballyActive load from
+// itself becoming a scheduling point, which otherwise bracketed every atomic
+// operation with two spurious "read" transitions and roughly doubled the state
+// space of atomic-heavy models.
+//
+//go:noinline
 //go:nosplit
 func weaveAtomic(op uint8, addr unsafe.Pointer) {
 	if weaveGloballyActive != 0 {

@@ -60,8 +60,8 @@ const (
 // See package [sync.Mutex] documentation.
 func (m *Mutex) Lock() {
 	// weave: record the lock acquisition as a scheduling point/transition so the
-	// interleaving explorer can reason about it. Gated by a single global load;
-	// no-op outside a weave controlled bubble.
+	// interleaving explorer can reason about it. Compiled away entirely outside
+	// -weave builds.
 	if weaveGloballyActive != 0 {
 		runtime_weaveSchedPoint(weaveOpLock, unsafe.Pointer(m))
 	}
@@ -82,7 +82,7 @@ func (m *Mutex) Lock() {
 func (m *Mutex) TryLock() bool {
 	// weave: TryLock observes the contended state, so its success/failure is
 	// schedule-dependent; record it as a scheduling point (conservatively reusing
-	// the lock transition). No-op outside a weave controlled bubble.
+	// the lock transition). Compiled away entirely outside -weave builds.
 	if weaveGloballyActive != 0 {
 		runtime_weaveSchedPoint(weaveOpLock, unsafe.Pointer(m))
 	}
@@ -197,8 +197,8 @@ func (m *Mutex) lockSlow() {
 //
 // See package [sync.Mutex] documentation.
 func (m *Mutex) Unlock() {
-	// weave: record the unlock as a scheduling point/transition. Gated by a
-	// single global load; no-op outside a weave controlled bubble.
+	// weave: record the unlock as a scheduling point/transition. Compiled away
+	// entirely outside -weave builds.
 	if weaveGloballyActive != 0 {
 		runtime_weaveSchedPoint(weaveOpUnlock, unsafe.Pointer(m))
 	}

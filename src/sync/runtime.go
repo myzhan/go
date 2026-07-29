@@ -6,36 +6,8 @@ package sync
 
 import "unsafe"
 
-// weave scheduling-point support (see runtime/weave.go). weaveGloballyActive is
-// nonzero only while a weave controlled bubble exists, so these hooks cost a
-// single global load in the common case. runtime_weaveSchedPoint records the
-// operation as a weave transition; it is a no-op outside a controlled bubble.
-
-//go:linkname weaveGloballyActive runtime.weaveGloballyActive
-var weaveGloballyActive uint32
-
-// weave operation codes, kept in sync with runtime weaveOp.
-const (
-	weaveOpLock          = 3
-	weaveOpUnlock        = 4
-	weaveOpWaitGroupWait = 9
-	weaveOpWaitGroupAdd  = 13
-	weaveOpCondWait      = 14
-	weaveOpCondSignal    = 15
-	weaveOpCondBroadcast = 16
-	weaveOpOnce          = 17
-)
-
-//go:linkname runtime_weaveSchedPoint runtime.weaveSchedPoint
-func runtime_weaveSchedPoint(op uint8, addr unsafe.Pointer)
-
-// weaveSchedPoint records a synchronization operation on obj as a weave
-// scheduling point, gated cheaply for non-weave programs.
-func weaveSchedPoint(op uint8, obj unsafe.Pointer) {
-	if weaveGloballyActive != 0 {
-		runtime_weaveSchedPoint(op, obj)
-	}
-}
+// weave scheduling-point support (see runtime/weave.go) lives in weave.go /
+// weave_on.go / weave_off.go.
 
 // defined in package runtime
 

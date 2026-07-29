@@ -8,9 +8,17 @@ package atomic
 
 import "unsafe"
 
-// weaveAtomic is a no-op in ordinary (non -weave) builds. It is empty so the
-// compiler inlines it away, leaving the typed atomic methods exactly as fast and
-// as inlinable as before — weave instrumentation costs nothing when weave is off.
+// weaveEnabled is false in ordinary builds, so every `if weaveEnabled { ... }`
+// hook in type.go is dead code the compiler removes before the inliner even
+// prices the method — the same trick internal/race uses for -race (race.Enabled).
+// An empty function body is not enough: a *call* to it still costs 57 in the
+// inline budget, and since the typed atomic methods are themselves inlined into
+// hot callers (sync.RWMutex.RLock, ...), that cost leaked out and pushed those
+// callers over their own budget.
+const weaveEnabled = false
+
+// weaveAtomic is never reached in ordinary builds (see weaveEnabled); it exists so
+// the hook call sites still type-check.
 //
 //go:nosplit
 func weaveAtomic(op uint8, addr unsafe.Pointer) {}

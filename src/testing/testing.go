@@ -2331,6 +2331,17 @@ type weaveTestFailure struct{ msg string }
 func (e *weaveTestFailure) Error() string            { return e.msg }
 func (e *weaveTestFailure) WeaveTestFailure() string { return e.msg }
 
+// weaveTestSkip is the counterpart for a test that skipped itself. t.Skip also
+// runs runtime.Goexit, so without distinguishing it a skip looks exactly like a
+// t.Fatal and weave reported it as a failing interleaving. The exported method
+// lets testing/synctest turn it back into a skip of the real test. The reason the
+// test gave was already written to the parent's output by common.log, so no
+// message needs to travel with it.
+type weaveTestSkip struct{}
+
+func (e *weaveTestSkip) Error() string       { return "test skipped" }
+func (e *weaveTestSkip) WeaveTestSkip() bool { return true }
+
 // weaveFailureText returns the test's retained failure messages (trimmed),
 // suitable for surfacing in a weave failure report.
 func (c *common) weaveFailureText() string {
@@ -2387,6 +2398,11 @@ func testingWeaveTest(t *T, f func(*T)) {
 		switch {
 		case rec != nil:
 			panic(rec) // preserve f's panic; weave records the failing schedule
+		case t2.skipped && !t2.failed:
+			// f called t.Skip/SkipNow: not a failing interleaving. Surface it as a
+			// skip so the driver can skip the real test instead of reporting a bogus
+			// "found failing interleaving".
+			panic(&weaveTestSkip{})
 		case !completed || t2.failed:
 			// f ran runtime.Goexit (Fatal/FailNow) or marked the test failed.
 			// Surface the test's own failure output so weave reports the real
