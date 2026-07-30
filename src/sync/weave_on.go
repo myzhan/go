@@ -9,7 +9,7 @@ package sync
 import "unsafe" // also for linkname
 
 // weaveGloballyActive is nonzero only while a weave controlled bubble exists, so
-// the hooks cost a single global load in the common case. runtime_weaveSchedPoint
+// the hooks cost a single global load in the common case. runtime_weaveSchedPointSkip
 // records the operation as a weave transition; it is a no-op outside a controlled
 // bubble.
 //

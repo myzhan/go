@@ -11,7 +11,7 @@ import "unsafe"
 // Under -weave, every typed atomic operation is a scheduling point, so weave can
 // interleave lock-free code — e.g. a non-atomic Load()+Store() read-modify-write.
 // weaveGloballyActive is nonzero while a weave controlled bubble exists; when it
-// is zero the hook is skipped with a single load. runtime_weaveSchedPoint records
+// is zero the hook is skipped with a single load. runtime_weaveSchedPointSkip records
 // the operation as a weave transition (yielding to the controlled scheduler) and
 // is a no-op outside a controlled bubble. This mirrors internal/sync's mutex hook.
 //

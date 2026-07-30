@@ -63,9 +63,10 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
   把令牌交给 root 去推进(D22)。
 - **中心钩子**:`weaveEnqueue`(ready 截获)、`weaveOnBlock`(park_m 交接/死锁)、`weaveOnGoexit`
   (退出交接/完成/死锁)。
-- **调度点原语**:`weaveSchedPoint(op, id)`(nosplit,非活跃即返回)→ `weaveSchedPointSlow`;带源码
-  位置的两个变体(D23):`weaveSchedPointAt`(调用方已知 caller PC,chan/select 用)与
-  `weaveSchedPointSkip`(库级钩子用,确认是参与者后才 unwind 指定帧数)。内存 hook
+- **调度点原语**(两个入口,一个核心):`weaveSchedPointAt(op, id, pc)`——非活跃即返回,`pc` 是操作的
+  源码位置(chan/select 传 caller PC,显式 yield 传 0);`weaveSchedPointSkip(op, id, skip)`——库级钩子
+  (sync/atomic 等)用,确认是参与者后才 unwind `skip` 帧拿到用户那一行。两者都汇入 `weaveSchedPointSlow`。
+  (原先还有个裸 `weaveSchedPoint`,是 `At` 的 pc=0 特例,只剩 yield 一个调用者,已合并掉。)内存 hook
   `weaveread`/`weavewrite`/`weavewriteval`/`weavereadrange`/`weavewriterange`。
 - **root 等待**:`weaveRootWait`/`weaveRootPark`(`rootParked` 标志在 park 的 unlockf 里、root 已
   `_Gwaiting` 后才置位,关闭 wake-before-park 竞态)。
@@ -136,6 +137,10 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
   只建 channel 边、忽略 NB)、`isChanOp`/`isSyncOp`。
 - source-DPOR 主循环:backtrack 集合 + select-case 枚举(`selD`/`selCase`);`exploreExhaustive`
   (odometer)做等价性对拍;`buildTrace`/`buildGoroutines`/`encodeSeed`/`decodeSeed`。
+- **`internal/weave` 只依赖 `runtime + time`,是有意的**(见 `go/build/deps_test.go`):seed 编解码与报告
+  文本里那些手写的 `appendInt`/`appendStep`/`baseName`/`encodeInts`/`decodeInts`(约 100 行)就是为此
+  存在——**别为省这几行去 import `fmt`/`strconv`/`path/filepath`**。引擎跑在 driver goroutine 上,保持
+  低依赖是设计取舍;那点重复不复杂,且有引擎测试兜底。(2026-07 精简评估的结论。)
 
 ### L4 API —— `src/testing/synctest/`(标准库,无 weave 专属包)
 - `synctest.Test(t, f)` / `synctest.Wait`——`-weave` 下由 `weave.go`(`//go:build weave`)的

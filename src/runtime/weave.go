@@ -560,23 +560,11 @@ func weaveOnGoexit(bubble *synctestBubble) {
 	}
 }
 
-// weaveSchedPoint is an explicit scheduling point. Returns immediately unless
-// the caller is a participant in a controlled bubble.
-//
-// The //go:linkname makes it accessible to internal/sync for mutex recording.
-//
-//go:linkname weaveSchedPoint
-//go:nosplit
-func weaveSchedPoint(op weaveOp, id unsafe.Pointer) {
-	if !weaveActive() {
-		return
-	}
-	weaveSchedPointSlow(op, id, 0, 0, 0, false)
-}
-
-// weaveSchedPointAt is weaveSchedPoint with the source position of the operation,
-// so the failing trace can show a file:line for it and not just an object label.
-// Callers inside the runtime that already know their caller's PC use this.
+// weaveSchedPointAt is an explicit scheduling point at a known source position, so
+// the failing trace can show a file:line for it and not just an object label. It
+// returns immediately unless the caller is a participant in a controlled bubble.
+// Callers inside the runtime that already know their caller's PC (chan, select) use
+// this; pass pc==0 when there is no meaningful position (an explicit yield).
 //
 //go:nosplit
 func weaveSchedPointAt(op weaveOp, id unsafe.Pointer, pc uintptr) {
@@ -984,7 +972,7 @@ func weaveSelectChoose(nready int32) int32 {
 //
 //go:linkname weaveYield internal/weave.Yield
 func weaveYield() {
-	weaveSchedPoint(weaveOpNone, nil)
+	weaveSchedPointAt(weaveOpNone, nil, 0) // no object, no source position
 }
 
 // weaveWait blocks the calling participant until every other participant in the
