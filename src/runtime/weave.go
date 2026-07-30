@@ -218,9 +218,11 @@ func weaveChoose(ctl *weaveControl) int {
 			if ctl.traceSize != nil {
 				ctl.traceSize[ctl.step] = int64(ctl.runnableSize[idx])
 			}
-			// A source PC is only meaningful for memory read/write ops; other
-			// transitions (run/exit/chan/mutex) reuse the g and would show a
-			// stale PC.
+			// Every operation that knows where it came from records it: memory hooks
+			// get the PC from the compiler-inserted call, chan/select pass their
+			// caller's, and the library hooks unwind to it (weaveSchedPointSkip). Ops
+			// with no position — a bare resume, an exit — record 0 and print without a
+			// file:line.
 			if o := ctl.runnableOp[idx]; o == uint8(weaveOpClockAdvance) {
 				// No PC (no participant performs it), but carry how far the clock
 				// moves so the report can show "clock advance +1s".
@@ -245,7 +247,9 @@ func weaveChoose(ctl *weaveControl) int {
 					}
 				}
 			} else {
-				ctl.tracePC[ctl.step] = 0
+				// Every other operation: keep whatever position its caller supplied
+				// (0 for a bare resume or an exit, which have none), and no value.
+				ctl.tracePC[ctl.step] = uint64(ctl.runnablePC[idx])
 				if ctl.traceVal != nil {
 					ctl.traceVal[ctl.step] = 0
 					ctl.traceValSet[ctl.step] = 0
@@ -568,6 +572,44 @@ func weaveSchedPoint(op weaveOp, id unsafe.Pointer) {
 		return
 	}
 	weaveSchedPointSlow(op, id, 0, 0, 0, false)
+}
+
+// weaveSchedPointAt is weaveSchedPoint with the source position of the operation,
+// so the failing trace can show a file:line for it and not just an object label.
+// Callers inside the runtime that already know their caller's PC use this.
+//
+//go:nosplit
+func weaveSchedPointAt(op weaveOp, id unsafe.Pointer, pc uintptr) {
+	if !weaveActive() {
+		return
+	}
+	weaveSchedPointSlow(op, id, 0, pc, 0, false)
+}
+
+// weaveSchedPointSkip is weaveSchedPoint for the library-level hooks (sync,
+// internal/sync, sync/atomic), which are called from inside the primitive rather
+// than from the user's code: it unwinds skip frames to find the source position the
+// user would recognize. The unwind happens only once the caller is known to be a
+// participant of a controlled bubble, so ordinary programs never pay for it.
+//
+// The //go:linkname makes it accessible to those packages.
+//
+//go:linkname weaveSchedPointSkip
+//go:nosplit
+func weaveSchedPointSkip(op weaveOp, id unsafe.Pointer, skip int) {
+	if !weaveActive() {
+		return
+	}
+	weaveSchedPointSkipSlow(op, id, skip)
+}
+
+func weaveSchedPointSkipSlow(op weaveOp, id unsafe.Pointer, skip int) {
+	var buf [1]uintptr
+	pc := uintptr(0)
+	if callers(skip, buf[:]) > 0 {
+		pc = buf[0]
+	}
+	weaveSchedPointSlow(op, id, 0, pc, 0, false)
 }
 
 func weaveSchedPointSlow(op weaveOp, id unsafe.Pointer, size, pc uintptr, val uint64, valSet bool) {

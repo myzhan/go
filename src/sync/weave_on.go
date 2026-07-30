@@ -20,8 +20,8 @@ const weaveEnabled = true
 //go:linkname weaveGloballyActive runtime.weaveGloballyActive
 var weaveGloballyActive uint32
 
-//go:linkname runtime_weaveSchedPoint runtime.weaveSchedPoint
-func runtime_weaveSchedPoint(op uint8, addr unsafe.Pointer)
+//go:linkname runtime_weaveSchedPointSkip runtime.weaveSchedPointSkip
+func runtime_weaveSchedPointSkip(op uint8, addr unsafe.Pointer, skip int)
 
 // weaveSchedPoint records a synchronization operation on obj as a weave
 // scheduling point.
@@ -32,9 +32,13 @@ func runtime_weaveSchedPoint(op uint8, addr unsafe.Pointer)
 // weaveGloballyActive load from itself becoming a scheduling point (which would
 // add a spurious transition to every sync operation and inflate the state space).
 //
+// The skip count reaches past this helper and the primitive that called it (Lock,
+// Do, Wait, ...) to the line the user wrote, so a failing trace points at their code
+// rather than at sync's.
+//
 //go:noinline
 func weaveSchedPoint(op uint8, obj unsafe.Pointer) {
 	if weaveGloballyActive != 0 {
-		runtime_weaveSchedPoint(op, obj)
+		runtime_weaveSchedPointSkip(op, obj, 4)
 	}
 }

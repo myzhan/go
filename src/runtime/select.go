@@ -274,7 +274,7 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		// Make the select a weave scheduling point before locking any channel, so
 		// other goroutines may run first (possibly changing which cases are ready).
 		// Parking here is safe because no channel lock is held yet.
-		weaveSchedPoint(weaveOpSelect, nil)
+		weaveSchedPointAt(weaveOpSelect, nil, sys.GetCallerPC())
 	}
 
 	// lock all the channels involved in the select

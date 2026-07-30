@@ -200,9 +200,9 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	// succeeds or fails reflects the explored interleaving. Must be before
 	// acquiring c.lock.
 	if block {
-		weaveSchedPoint(weaveOpChanSend, unsafe.Pointer(c))
+		weaveSchedPointAt(weaveOpChanSend, unsafe.Pointer(c), callerpc)
 	} else {
-		weaveSchedPoint(weaveOpChanSendNB, unsafe.Pointer(c))
+		weaveSchedPointAt(weaveOpChanSendNB, unsafe.Pointer(c), callerpc)
 	}
 
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
@@ -432,7 +432,7 @@ func closechan(c *hchan) {
 
 	// Record the close as a weave scheduling point/transition (no-op outside a
 	// controlled bubble). Must be before acquiring c.lock.
-	weaveSchedPoint(weaveOpChanClose, unsafe.Pointer(c))
+	weaveSchedPointAt(weaveOpChanClose, unsafe.Pointer(c), sys.GetCallerPC())
 
 	lock(&c.lock)
 	if c.closed != 0 {
@@ -521,12 +521,12 @@ func empty(c *hchan) bool {
 //
 //go:nosplit
 func chanrecv1(c *hchan, elem unsafe.Pointer) {
-	chanrecv(c, elem, true)
+	chanrecv(c, elem, true, sys.GetCallerPC())
 }
 
 //go:nosplit
 func chanrecv2(c *hchan, elem unsafe.Pointer) (received bool) {
-	_, received = chanrecv(c, elem, true)
+	_, received = chanrecv(c, elem, true, sys.GetCallerPC())
 	return
 }
 
@@ -536,7 +536,9 @@ func chanrecv2(c *hchan, elem unsafe.Pointer) (received bool) {
 // Otherwise, if c is closed, zeros *ep and returns (true, false).
 // Otherwise, fills in *ep with an element and returns (true, true).
 // A non-nil ep must point to the heap or the caller's stack.
-func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
+// callerpc is the source position of the receive, used by weave to give the
+// transition a file:line in a failing interleaving.
+func chanrecv(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) (selected, received bool) {
 	// raceenabled: don't need to check ep, as it is always on the stack
 	// or is new memory allocated by reflect.
 
@@ -566,9 +568,9 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	// then succeeds or fails reflects the explored interleaving. Must be before
 	// acquiring c.lock.
 	if block {
-		weaveSchedPoint(weaveOpChanRecv, unsafe.Pointer(c))
+		weaveSchedPointAt(weaveOpChanRecv, unsafe.Pointer(c), callerpc)
 	} else {
-		weaveSchedPoint(weaveOpChanRecvNB, unsafe.Pointer(c))
+		weaveSchedPointAt(weaveOpChanRecvNB, unsafe.Pointer(c), callerpc)
 	}
 
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
@@ -828,7 +830,7 @@ func selectnbsend(c *hchan, elem unsafe.Pointer) (selected bool) {
 //		... bar
 //	}
 func selectnbrecv(elem unsafe.Pointer, c *hchan) (selected, received bool) {
-	return chanrecv(c, elem, false)
+	return chanrecv(c, elem, false, sys.GetCallerPC())
 }
 
 //go:linkname reflect_chansend reflect.chansend0
@@ -838,7 +840,7 @@ func reflect_chansend(c *hchan, elem unsafe.Pointer, nb bool) (selected bool) {
 
 //go:linkname reflect_chanrecv reflect.chanrecv
 func reflect_chanrecv(c *hchan, nb bool, elem unsafe.Pointer) (selected bool, received bool) {
-	return chanrecv(c, elem, !nb)
+	return chanrecv(c, elem, !nb, sys.GetCallerPC())
 }
 
 func chanlen(c *hchan) int {

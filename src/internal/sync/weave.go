@@ -26,5 +26,5 @@ const (
 	weaveOpUnlock = 4
 )
 
-//go:linkname runtime_weaveSchedPoint runtime.weaveSchedPoint
-func runtime_weaveSchedPoint(op uint8, addr unsafe.Pointer)
+//go:linkname runtime_weaveSchedPointSkip runtime.weaveSchedPointSkip
+func runtime_weaveSchedPointSkip(op uint8, addr unsafe.Pointer, skip int)

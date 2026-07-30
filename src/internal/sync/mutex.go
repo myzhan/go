@@ -63,7 +63,7 @@ func (m *Mutex) Lock() {
 	// interleaving explorer can reason about it. Compiled away entirely outside
 	// -weave builds.
 	if weaveGloballyActive != 0 {
-		runtime_weaveSchedPoint(weaveOpLock, unsafe.Pointer(m))
+		runtime_weaveSchedPointSkip(weaveOpLock, unsafe.Pointer(m), 4)
 	}
 	// Fast path: grab unlocked mutex.
 	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
@@ -84,7 +84,7 @@ func (m *Mutex) TryLock() bool {
 	// schedule-dependent; record it as a scheduling point (conservatively reusing
 	// the lock transition). Compiled away entirely outside -weave builds.
 	if weaveGloballyActive != 0 {
-		runtime_weaveSchedPoint(weaveOpLock, unsafe.Pointer(m))
+		runtime_weaveSchedPointSkip(weaveOpLock, unsafe.Pointer(m), 4)
 	}
 	old := m.state
 	if old&(mutexLocked|mutexStarving) != 0 {
@@ -200,7 +200,7 @@ func (m *Mutex) Unlock() {
 	// weave: record the unlock as a scheduling point/transition. Compiled away
 	// entirely outside -weave builds.
 	if weaveGloballyActive != 0 {
-		runtime_weaveSchedPoint(weaveOpUnlock, unsafe.Pointer(m))
+		runtime_weaveSchedPointSkip(weaveOpUnlock, unsafe.Pointer(m), 4)
 	}
 	if race.Enabled {
 		_ = m.state

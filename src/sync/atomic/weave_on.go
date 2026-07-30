@@ -22,8 +22,8 @@ const weaveEnabled = true
 //go:linkname weaveGloballyActive runtime.weaveGloballyActive
 var weaveGloballyActive uint32
 
-//go:linkname runtime_weaveSchedPoint runtime.weaveSchedPoint
-func runtime_weaveSchedPoint(op uint8, addr unsafe.Pointer)
+//go:linkname runtime_weaveSchedPointSkip runtime.weaveSchedPointSkip
+func runtime_weaveSchedPointSkip(op uint8, addr unsafe.Pointer, skip int)
 
 // weaveAtomic is deliberately noinline: -weave instruments memory accesses in the
 // command-line packages only, but an inlined body is instrumented in whatever
@@ -37,6 +37,7 @@ func runtime_weaveSchedPoint(op uint8, addr unsafe.Pointer)
 //go:nosplit
 func weaveAtomic(op uint8, addr unsafe.Pointer) {
 	if weaveGloballyActive != 0 {
-		runtime_weaveSchedPoint(op, addr)
+		// Reach past this helper and the typed method to the caller's line.
+		runtime_weaveSchedPointSkip(op, addr, 4)
 	}
 }
