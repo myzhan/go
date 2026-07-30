@@ -181,6 +181,42 @@ type testSkip struct{}
 
 func (testSkip) WeaveTestSkip() bool { return true }
 
+// Iterative deepening is what makes an unset WEAVE_MAX_PREEMPTIONS usable: it searches
+// 0,1,...,ceiling preemptions in order and stops at the first level that finds
+// something, so the counterexample uses the fewest preemptions and is the easiest to
+// read. If the levels ran in the wrong order, or a level's result were not returned as
+// soon as it failed, reports would silently get harder to understand rather than
+// wrong — the kind of regression nothing else here would notice.
+func TestExploreIterativeStopsAtTheShallowestLevel(t *testing.T) {
+	// This lost update needs a preemption: with none, each goroutine runs its
+	// read-modify-write to completion and the sum is always 2.
+	body := func() {
+		x := 0
+		inc := func() { x = x + 1 }
+		go inc()
+		go inc()
+		weave.Wait()
+		if x != 2 {
+			panic("lost update")
+		}
+	}
+	if got := exploreIterative(body, weave.DefaultMaxSchedules, 0, 0); got.Failed {
+		t.Errorf("ceiling 0 must not reach a bug that needs a preemption: %+v", got)
+	}
+	deep := exploreIterative(body, weave.DefaultMaxSchedules, 2, 0)
+	if !deep.Failed {
+		t.Fatalf("ceiling 2 should find the lost update: %+v", deep)
+	}
+	// Level 1 finds it, so the deeper level must never have run: its schedule count
+	// would dwarf the shallow one.
+	only1 := weave.ExploreBounded(body, weave.DefaultMaxSchedules, 1, 0)
+	if deep.Runs > only1.Runs*2 {
+		t.Errorf("iterative deepening explored %d schedules where level 1 alone needed %d: "+
+			"it did not stop at the shallowest level that finds the bug", deep.Runs, only1.Runs)
+	}
+	t.Logf("stopped at the shallowest level: %d schedules (level 1 alone: %d)", deep.Runs, only1.Runs)
+}
+
 // The wall-clock backstop exists so a state-space explosion reports INCOMPLETE rather
 // than running to the schedule budget; an unset or unparseable value must not disable
 // it by accident, while an explicit zero must.

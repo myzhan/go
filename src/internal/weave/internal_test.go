@@ -344,6 +344,79 @@ func TestReproducibleFailureStillReported(t *testing.T) {
 	t.Logf("confirmed failure reported after %d schedule(s), including the confirming rerun", res.Runs)
 }
 
+// select's poll order must be deterministic inside a controlled bubble. The runtime
+// normally shuffles it (cheaprandn) so that a select over several ready cases is fair;
+// weave skips the shuffle, because the explorer identifies a case by its index in the
+// ready set, and a shuffled order would make the same choice mean a different case
+// from one run to the next. Everything downstream depends on it: seeds would stop
+// reproducing and the enumeration would revisit cases while missing others.
+//
+// Breaking this produces FLAKINESS, not a failure, which is why it needs a test that
+// repeats: a shuffled order would pick a different case in roughly half of the runs
+// below.
+func TestSelectPollOrderIsDeterministic(t *testing.T) {
+	const runs = 20
+	seen := map[int]int{}
+	for range runs {
+		Run(func() {
+			a := make(chan int, 1)
+			b := make(chan int, 1)
+			a <- 1
+			b <- 2
+			var got int
+			select { // both cases ready, so the poll order decides which one fires
+			case got = <-a:
+			case got = <-b:
+			}
+			selectChoice = got
+		})
+		seen[selectChoice]++
+	}
+	// Which case the default policy lands on is not the point (it depends on how the
+	// compiler lays the cases out); that it lands on the SAME one every time is.
+	if len(seen) != 1 {
+		t.Fatalf("the default schedule chose different ready cases across %d runs (%v): "+
+			"the poll order is not deterministic, so seeds will not reproduce", runs, seen)
+	}
+	t.Logf("the default schedule chose the same ready case in all %d runs (%v)", runs, seen)
+}
+
+// selectChoice carries the chosen value out of the model above. Written by the model,
+// read only after Run returns.
+var selectChoice int
+
+// A pending timer that never fired is only worth mentioning when the clock was never
+// advanced anywhere — advancing it is a scheduling choice now (D22), so the note is
+// gated on ClockAdvanced. These are the two flags the driver's hint is built from, and
+// getting the gate backwards would either spam every timer model with advice it does
+// not need or silently swallow the one case where the advice matters.
+func TestUnfiredTimerAndClockAdvancedFlags(t *testing.T) {
+	model := func() {
+		done := make(chan int, 1) // buffered: the timeout path leaks nothing
+		go func() { done <- 1 }()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+	}
+	// At zero preemptions the clock cannot preempt the runnable sender, so the timer
+	// is still pending when everyone exits: exactly the case worth a hint.
+	bounded := ExploreBounded(model, DefaultMaxSchedules, 0, 0)
+	if !bounded.UnfiredTimer {
+		t.Errorf("a timer left pending at exit should be flagged; got %+v", bounded)
+	}
+	if bounded.ClockAdvanced {
+		t.Errorf("at zero preemptions the clock must never advance; got %+v", bounded)
+	}
+	// Unbounded, some schedule does advance it, so there is nothing to advise about.
+	full := Explore(model)
+	if !full.ClockAdvanced {
+		t.Errorf("some schedule should have advanced the clock; got %+v", full)
+	}
+	t.Logf("hint inputs behave: bounded{unfired=%v advanced=%v} unbounded{advanced=%v}",
+		bounded.UnfiredTimer, bounded.ClockAdvanced, full.ClockAdvanced)
+}
+
 // A seed is a vector of forced choices, so a run that does not follow it is not the
 // interleaving the seed describes — the seed came from a different build of the test,
 // or the model is not reproducible. weaveChoose falls back to the lowest runnable

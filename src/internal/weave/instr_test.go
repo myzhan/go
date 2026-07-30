@@ -706,6 +706,38 @@ func TestTransitionsCarryCallerPosition(t *testing.T) {
 	}
 }
 
+// A scheduling point must not park the goroutine while it holds a runtime lock or has
+// the P pinned: gopark -> schedule would hit "schedule: holding locks", which is a
+// process-fatal rather than a test failure. weaveSchedPointSlow returns early when
+// gp.m.locks != 0 for that reason — and it is semantically right, since such regions
+// are non-preemptible in real execution too.
+//
+// Reaching the situation takes some care. sync.Pool's Put runs inside procPin, and
+// once the per-P private slot is taken the value goes to the shared queue, whose
+// headTail is a TYPED atomic — so the atomic hook fires with the P pinned. The default
+// schedule keeps running the current goroutine there and never parks, and DPOR only
+// forces a switch where transitions CONFLICT, so both participants have to contend on
+// the same pool: then the reversal of their headTail operations is explored and one of
+// them parks with the P pinned. (That is also the shape this was found in — concurrent
+// requests sharing a pool.) Removing the guard turns this test into a crashed binary.
+func TestSchedulingPointsSkipHeldLockRegions(t *testing.T) {
+	res := Explore(func() {
+		var pool sync.Pool
+		use := func() {
+			pool.Put(new(int)) // fills the per-P private slot
+			pool.Put(new(int)) // goes to the shared queue: typed atomic, P pinned
+			_ = pool.Get()
+		}
+		go use()
+		go use()
+		Wait()
+	})
+	if res.Failed || res.Deadlock {
+		t.Fatalf("model is correct; got %+v", res)
+	}
+	t.Logf("explored %d schedule(s) across pinned regions without a fatal", res.Runs)
+}
+
 // Every primitive weave claims to instrument must actually leave its own transition
 // in the trace. The models elsewhere in this file assert OUTCOMES, and an outcome can
 // usually be reached some other way — under -weave every memory access is a
