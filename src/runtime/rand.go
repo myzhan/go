@@ -161,6 +161,16 @@ func rand32() uint32 {
 //go:nosplit
 //go:linkname rand
 func rand() uint64 {
+	// In a weave controlled bubble, return a deterministic sequence so that
+	// map iteration order, maphash seeds, etc. are reproducible. Gated by a
+	// single global load; the root/driver goroutine is excluded so it never
+	// races the running participant on the shared state.
+	if weaveGloballyActive != 0 {
+		gp := getg()
+		if b := gp.bubble; b != nil && b.controlled && gp != b.root {
+			return weaveRand(b)
+		}
+	}
 	// Note: We avoid acquirem here so that in the fast path
 	// there is just a getg, an inlined c.Next, and a return.
 	// The performance difference on a 16-core AMD is

@@ -80,6 +80,12 @@ and test commands:
 		Supported only on darwin/amd64, darwin/arm64, freebsd/amd64, linux/amd64,
 		linux/arm64 (only for 48-bit VMA), linux/ppc64le, linux/riscv64 and
 		windows/amd64.
+	-weave
+		instrument memory accesses in the packages being built so that ordinary
+		reads and writes become scheduling points for the weave interleaving
+		explorer, which runs testing/synctest tests under systematic schedule
+		exploration. Channel and mutex operations are always scheduling points;
+		-weave is only needed to explore data races on plain variables.
 	-msan
 		enable interoperation with memory sanitizer.
 		Supported only on linux/amd64, linux/arm64, linux/loong64, freebsd/amd64
@@ -350,6 +356,7 @@ func AddBuildFlags(cmd *base.Command, mask BuildFlagMask) {
 	cmd.Flag.StringVar(&cfg.BuildPGO, "pgo", "auto", "")
 	cmd.Flag.StringVar(&cfg.BuildPkgdir, "pkgdir", "", "")
 	cmd.Flag.BoolVar(&cfg.BuildRace, "race", false, "")
+	cmd.Flag.BoolVar(&cfg.BuildWeave, "weave", false, "")
 	cmd.Flag.Var((*tagsFlag)(&cfg.BuildContext.BuildTags), "tags", "")
 	cmd.Flag.Var((*base.StringsFlag)(&cfg.BuildToolexec), "toolexec", "")
 	cmd.Flag.BoolVar(&cfg.BuildTrimpath, "trimpath", false, "")

@@ -124,6 +124,12 @@
 //		Supported only on darwin/amd64, darwin/arm64, freebsd/amd64, linux/amd64,
 //		linux/arm64 (only for 48-bit VMA), linux/ppc64le, linux/riscv64 and
 //		windows/amd64.
+//	-weave
+//		instrument memory accesses in the packages being built so that ordinary
+//		reads and writes become scheduling points for the weave interleaving
+//		explorer, which runs testing/synctest tests under systematic schedule
+//		exploration. Channel and mutex operations are always scheduling points;
+//		-weave is only needed to explore data races on plain variables.
 //	-msan
 //		enable interoperation with memory sanitizer.
 //		Supported only on linux/amd64, linux/arm64, linux/loong64, freebsd/amd64

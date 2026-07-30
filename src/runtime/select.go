@@ -104,6 +104,22 @@ func block() {
 	gopark(nil, nil, waitReasonSelectNoCases, traceBlockForever, 1) // forever
 }
 
+// weaveCaseReady reports whether a select case could proceed right now, without
+// committing to it or disturbing any queue. recv tells whether cas is a receive.
+// The caller must hold the channel locks (sellock).
+//
+// It uses waitq.weaveHasClaimable rather than a bare `first != nil` so a stale,
+// already-woken select sudog still lingering on a queue is not mistaken for a
+// ready partner: dequeue would skip it, and treating it as ready makes the commit
+// fail and can spuriously report a deadlock.
+func weaveCaseReady(cas *scase, recv bool) bool {
+	c := cas.c
+	if recv {
+		return c.sendq.weaveHasClaimable() || c.qcount > 0 || c.closed != 0
+	}
+	return c.closed != 0 || c.recvq.weaveHasClaimable() || c.qcount < c.dataqsiz
+}
+
 // selectgo implements the select statement.
 //
 // cas0 points to an array of type [ncases]scase, and order0 points to
@@ -167,6 +183,9 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	// generate permuted order
 	norder := 0
 	allSynctest := true
+	// In a weave controlled bubble the poll order must be deterministic so that
+	// select's choice among ready cases is reproducible (and, later, explorable).
+	weaveControlled := weaveActive()
 	for i := range scases {
 		cas := &scases[i]
 
@@ -188,7 +207,10 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 			cas.c.timer.maybeRunChan(cas.c)
 		}
 
-		j := cheaprandn(uint32(norder + 1))
+		j := norder
+		if !weaveControlled {
+			j = int(cheaprandn(uint32(norder + 1)))
+		}
 		pollorder[norder] = pollorder[j]
 		pollorder[j] = uint16(i)
 		norder++
@@ -248,6 +270,13 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		}
 	}
 
+	if weaveControlled {
+		// Make the select a weave scheduling point before locking any channel, so
+		// other goroutines may run first (possibly changing which cases are ready).
+		// Parking here is safe because no channel lock is held yet.
+		weaveSchedPointAt(weaveOpSelect, nil, sys.GetCallerPC())
+	}
+
 	// lock all the channels involved in the select
 	sellock(scases, lockorder)
 
@@ -267,35 +296,91 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	var caseSuccess bool
 	var caseReleaseTime int64 = -1
 	var recvOK bool
-	for _, casei := range pollorder {
-		casi = int(casei)
-		cas = &scases[casi]
-		c = cas.c
+	if weaveControlled {
+		// Count the ready cases without committing (non-destructive peek), let the
+		// explorer choose one of them, then walk the poll order again to find it. Two
+		// passes rather than a []int of ready cases: we hold every channel's lock
+		// here, and growing a slice would allocate inside that non-preemptible
+		// region. The channels stay locked and no yield happens between peek and
+		// commit, so readiness is stable across the two passes.
+		nready := int32(0)
+		for _, casei := range pollorder {
+			if weaveCaseReady(&scases[int(casei)], int(casei) >= nsends) {
+				nready++
+			}
+		}
+		if nready > 0 {
+			pick := weaveSelectChoose(nready)
+			casi = -1
+			for _, casei := range pollorder {
+				if weaveCaseReady(&scases[int(casei)], int(casei) >= nsends) {
+					if pick == 0 {
+						casi = int(casei)
+						break
+					}
+					pick--
+				}
+			}
+			cas = &scases[casi]
+			c = cas.c
+			if casi >= nsends {
+				sg = c.sendq.dequeue()
+				if sg != nil {
+					goto recv
+				}
+				if c.qcount > 0 {
+					goto bufrecv
+				}
+				if c.closed != 0 {
+					goto rclose
+				}
+			} else {
+				if raceenabled {
+					racereadpc(c.raceaddr(), casePC(casi), chansendpc)
+				}
+				if c.closed != 0 {
+					goto sclose
+				}
+				sg = c.recvq.dequeue()
+				if sg != nil {
+					goto send
+				}
+				if c.qcount < c.dataqsiz {
+					goto bufsend
+				}
+			}
+		}
+	} else {
+		for _, casei := range pollorder {
+			casi = int(casei)
+			cas = &scases[casi]
+			c = cas.c
 
-		if casi >= nsends {
-			sg = c.sendq.dequeue()
-			if sg != nil {
-				goto recv
-			}
-			if c.qcount > 0 {
-				goto bufrecv
-			}
-			if c.closed != 0 {
-				goto rclose
-			}
-		} else {
-			if raceenabled {
-				racereadpc(c.raceaddr(), casePC(casi), chansendpc)
-			}
-			if c.closed != 0 {
-				goto sclose
-			}
-			sg = c.recvq.dequeue()
-			if sg != nil {
-				goto send
-			}
-			if c.qcount < c.dataqsiz {
-				goto bufsend
+			if casi >= nsends {
+				sg = c.sendq.dequeue()
+				if sg != nil {
+					goto recv
+				}
+				if c.qcount > 0 {
+					goto bufrecv
+				}
+				if c.closed != 0 {
+					goto rclose
+				}
+			} else {
+				if raceenabled {
+					racereadpc(c.raceaddr(), casePC(casi), chansendpc)
+				}
+				if c.closed != 0 {
+					goto sclose
+				}
+				sg = c.recvq.dequeue()
+				if sg != nil {
+					goto send
+				}
+				if c.qcount < c.dataqsiz {
+					goto bufsend
+				}
 			}
 		}
 	}

@@ -4,9 +4,11 @@
 
 package sync
 
-import _ "unsafe"
+import _ "unsafe" // for linkname
 
 // defined in package runtime
+
+// weave scheduling-point support lives in weave.go / weave_on.go / weave_off.go.
 
 // SemacquireMutex is like Semacquire, but for profiling contended
 // Mutexes and RWMutexes.

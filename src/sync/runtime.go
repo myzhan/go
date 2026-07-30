@@ -6,6 +6,9 @@ package sync
 
 import "unsafe"
 
+// weave scheduling-point support (see runtime/weave.go) lives in weave.go /
+// weave_on.go / weave_off.go.
+
 // defined in package runtime
 
 // Semacquire waits until *s > 0 and then atomically decrements it.

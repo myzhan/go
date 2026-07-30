@@ -165,6 +165,11 @@ func InitConfig() {
 	ir.Syms.Racereadrange = typecheck.LookupRuntimeFunc("racereadrange")
 	ir.Syms.Racewrite = typecheck.LookupRuntimeFunc("racewrite")
 	ir.Syms.Racewriterange = typecheck.LookupRuntimeFunc("racewriterange")
+	ir.Syms.Weaveread = typecheck.LookupRuntimeFunc("weaveread")
+	ir.Syms.Weavereadrange = typecheck.LookupRuntimeFunc("weavereadrange")
+	ir.Syms.Weavewrite = typecheck.LookupRuntimeFunc("weavewrite")
+	ir.Syms.Weavewriteval = typecheck.LookupRuntimeFunc("weavewriteval")
+	ir.Syms.Weavewriterange = typecheck.LookupRuntimeFunc("weavewriterange")
 	ir.Syms.TypeAssert = typecheck.LookupRuntimeFunc("typeAssert")
 	ir.Syms.WBZero = typecheck.LookupRuntimeFunc("wbZero")
 	ir.Syms.WBMove = typecheck.LookupRuntimeFunc("wbMove")
@@ -1466,7 +1471,7 @@ const (
 )
 
 func (s *state) instrument(t *types.Type, addr *ssa.Value, kind instrumentKind) {
-	s.instrument2(t, addr, nil, kind)
+	s.instrument2(t, addr, nil, nil, kind)
 }
 
 // instrumentFields instruments a read/write operation on addr.
@@ -1488,14 +1493,14 @@ func (s *state) instrumentFields(t *types.Type, addr *ssa.Value, kind instrument
 
 func (s *state) instrumentMove(t *types.Type, dst, src *ssa.Value) {
 	if base.Flag.MSan {
-		s.instrument2(t, dst, src, instrumentMove)
+		s.instrument2(t, dst, src, nil, instrumentMove)
 	} else {
 		s.instrument(t, src, instrumentRead)
 		s.instrument(t, dst, instrumentWrite)
 	}
 }
 
-func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrumentKind) {
+func (s *state) instrument2(t *types.Type, addr, addr2, writeVal *ssa.Value, kind instrumentKind) {
 	if !s.instrumentMemory {
 		return
 	}
@@ -1510,6 +1515,7 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 	}
 
 	var fn *obj.LSym
+	var weaveVal *ssa.Value // for weave: the value being written (int/bool stores)
 	needWidth := false
 
 	if addr2 != nil && kind != instrumentMove {
@@ -1562,6 +1568,39 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 			panic("unreachable")
 		}
 		needWidth = true
+	} else if base.Flag.Weave && t.NumComponents(types.CountBlankFields) > 1 {
+		// Composite objects: instrument the whole range, since a write might
+		// touch any subobject.
+		switch kind {
+		case instrumentRead:
+			fn = ir.Syms.Weavereadrange
+		case instrumentWrite:
+			fn = ir.Syms.Weavewriterange
+		default:
+			panic("unreachable")
+		}
+		needWidth = true
+	} else if base.Flag.Weave {
+		// Pass the width so the runtime can read the scalar value at the access
+		// for display in a failing interleaving.
+		switch kind {
+		case instrumentRead:
+			fn = ir.Syms.Weaveread
+		case instrumentWrite:
+			// For an integer/bool store we know the value being written, so pass
+			// it: the trace then shows the new value. Skip uintptr (its stores are
+			// mostly compiler-internal pointer values) and other scalar types, and
+			// fall back to a valueless write hook.
+			if writeVal != nil && (t.IsBoolean() || (t.IsInteger() && t.Kind() != types.TUINTPTR)) {
+				fn = ir.Syms.Weavewriteval
+				weaveVal = s.weaveWriteVal(t, writeVal)
+			} else {
+				fn = ir.Syms.Weavewrite
+			}
+		default:
+			panic("unreachable")
+		}
+		needWidth = true
 	} else {
 		panic("unreachable")
 	}
@@ -1573,7 +1612,31 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 	if needWidth {
 		args = append(args, s.constInt(types.Types[types.TUINTPTR], w))
 	}
+	if weaveVal != nil {
+		args = append(args, weaveVal)
+	}
 	s.rtcall(fn, true, nil, args...)
+}
+
+// weaveWriteVal converts an integer or boolean value being stored to a uint64
+// so it can be passed to runtime.weavewriteval for display in a failing
+// interleaving.
+func (s *state) weaveWriteVal(t *types.Type, v *ssa.Value) *ssa.Value {
+	u64 := types.Types[types.TUINT64]
+	if t.IsBoolean() {
+		v = s.newValue1(ssa.OpCvtBoolToUint8, types.Types[types.TUINT8], v)
+		return s.newValue1(ssa.OpZeroExt8to64, u64, v)
+	}
+	switch t.Size() {
+	case 1:
+		return s.newValue1(ssa.OpZeroExt8to64, u64, v)
+	case 2:
+		return s.newValue1(ssa.OpZeroExt16to64, u64, v)
+	case 4:
+		return s.newValue1(ssa.OpZeroExt32to64, u64, v)
+	default: // 8
+		return s.newValue1(ssa.OpCopy, u64, v)
+	}
 }
 
 func (s *state) load(t *types.Type, src *ssa.Value) *ssa.Value {
@@ -5650,7 +5713,26 @@ func (s *state) rtcall(fn *obj.LSym, returns bool, results []*types.Type, args .
 
 // do *left = right for type t.
 func (s *state) storeType(t *types.Type, left, right *ssa.Value, skip skipMask, leftIsStmt bool) {
-	s.instrument(t, left, instrumentWrite)
+	// Under -weave, store a pointer-free multi-field struct field-by-field, with a
+	// scheduling point before each field store, so a concurrent reader can observe
+	// a torn (partially-written) struct. This models the fact that a multi-word
+	// struct assignment is not atomic. Normal builds and the race/msan/asan
+	// sanitizers keep the single whole-struct store (one range hook).
+	if base.Flag.Weave && skip == 0 && isStructNotSIMD(t) && !t.HasPointers() &&
+		t.NumComponents(types.CountBlankFields) > 1 {
+		n := t.NumFields()
+		for i := 0; i < n; i++ {
+			ft := t.FieldType(i)
+			addr := s.newValue1I(ssa.OpOffPtr, ft.PtrTo(), t.FieldOff(i), left)
+			val := s.newValue1I(ssa.OpStructSelect, ft, int64(i), right)
+			// Recurse: a scalar field gets its own weavewrite hook + store; a nested
+			// struct field decomposes again.
+			s.storeType(ft, addr, val, 0, false)
+		}
+		return
+	}
+
+	s.instrument2(t, left, nil, right, instrumentWrite)
 
 	if skip == 0 && (!t.HasPointers() || ssa.IsStackAddr(left)) {
 		// Known to not have write barrier. Store the whole type.

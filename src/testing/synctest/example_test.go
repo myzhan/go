@@ -95,6 +95,11 @@ func TestContextWithTimeout(t *testing.T) {
 }
 
 func TestHTTPTransport100Continue(t *testing.T) {
+	if underWeave {
+		// net/http's Transport spins up many internal goroutines, locks and timers;
+		// systematic exploration of that is far beyond a unit-level model.
+		t.Skip("net/http integration; too large for weave exploration")
+	}
 	synctest.Test(t, func(*testing.T) {
 		// Create an in-process fake network connection.
 		// We cannot use a loopback network connection for this test,

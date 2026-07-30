@@ -572,6 +572,26 @@ type g struct {
 	coroarg *coro // argument during coroutine transfers
 	bubble  *synctestBubble
 
+	// weaveWid is this goroutine's stable participant id within a controlled
+	// weave bubble (assigned in enrollment order, deterministic given the
+	// schedule prefix). Used by the exploration engine to identify processes
+	// across runs. Only meaningful when bubble != nil && bubble.controlled.
+	weaveWid int32
+	// weaveBlocked is set while this participant is blocked on a real
+	// synchronization operation that the weave controller handed off (see
+	// park_m). It distinguishes a controller-managed sync wakeup (which must be
+	// captured by the controller in ready) from an internal resume such as after
+	// async preemption (which must proceed normally).
+	weaveBlocked bool
+	// The pending operation's source PC and observed scalar value are kept in the
+	// bubble's weaveControl runnable arrays (per-bubble, allocated only during a
+	// weave run) rather than on g, so ordinary goroutines carry no such fields.
+	//
+	// weaveFn is the real function a wrapped weave participant should run. The
+	// participant starts in weaveGoWrapper, which recovers panics so a panic in a
+	// spawned goroutine becomes a reported failure instead of crashing.
+	weaveFn *funcval
+
 	// xRegs stores the extended register state if this G has been
 	// asynchronously preempted.
 	xRegs xRegPerG
@@ -1268,6 +1288,7 @@ const (
 	waitReasonSynctestSelect                          // "select (durable)"
 	waitReasonSynctestWaitGroupWait                   // "sync.WaitGroup.Wait (durable)"
 	waitReasonCleanupWait                             // "cleanup wait"
+	waitReasonWeaveScheduled                          // "weave scheduled"
 )
 
 var waitReasonStrings = [...]string{
@@ -1318,6 +1339,7 @@ var waitReasonStrings = [...]string{
 	waitReasonSynctestSelect:        "select (durable)",
 	waitReasonSynctestWaitGroupWait: "sync.WaitGroup.Wait (durable)",
 	waitReasonCleanupWait:           "cleanup wait",
+	waitReasonWeaveScheduled:        "weave scheduled",
 }
 
 func (w waitReason) String() string {

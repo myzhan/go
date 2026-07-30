@@ -65,6 +65,9 @@ const rwmutexMaxReaders = 1 << 30
 // call excludes new readers from acquiring the lock. See the
 // documentation on the [RWMutex] type.
 func (rw *RWMutex) RLock() {
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpRLock, unsafe.Pointer(rw))
+	}
 	if race.Enabled {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()
@@ -85,6 +88,9 @@ func (rw *RWMutex) RLock() {
 // and use of TryRLock is often a sign of a deeper problem
 // in a particular use of mutexes.
 func (rw *RWMutex) TryRLock() bool {
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpRLock, unsafe.Pointer(rw))
+	}
 	if race.Enabled {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()
@@ -112,6 +118,9 @@ func (rw *RWMutex) TryRLock() bool {
 // It is a run-time error if rw is not locked for reading
 // on entry to RUnlock.
 func (rw *RWMutex) RUnlock() {
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpRUnlock, unsafe.Pointer(rw))
+	}
 	if race.Enabled {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.ReleaseMerge(unsafe.Pointer(&rw.writerSem))
@@ -142,6 +151,9 @@ func (rw *RWMutex) rUnlockSlow(r int32) {
 // If the lock is already locked for reading or writing,
 // Lock blocks until the lock is available.
 func (rw *RWMutex) Lock() {
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpLock, unsafe.Pointer(rw))
+	}
 	if race.Enabled {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()
@@ -167,6 +179,9 @@ func (rw *RWMutex) Lock() {
 // and use of TryLock is often a sign of a deeper problem
 // in a particular use of mutexes.
 func (rw *RWMutex) TryLock() bool {
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpLock, unsafe.Pointer(rw))
+	}
 	if race.Enabled {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()
@@ -199,6 +214,9 @@ func (rw *RWMutex) TryLock() bool {
 // goroutine. One goroutine may [RWMutex.RLock] ([RWMutex.Lock]) a RWMutex and then
 // arrange for another goroutine to [RWMutex.RUnlock] ([RWMutex.Unlock]) it.
 func (rw *RWMutex) Unlock() {
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpUnlock, unsafe.Pointer(rw))
+	}
 	if race.Enabled {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Release(unsafe.Pointer(&rw.readerSem))

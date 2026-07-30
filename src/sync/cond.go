@@ -65,6 +65,9 @@ func NewCond(l Locker) *Cond {
 //	... make use of condition ...
 //	c.L.Unlock()
 func (c *Cond) Wait() {
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpCondWait, unsafe.Pointer(c))
+	}
 	c.checker.check()
 	t := runtime_notifyListAdd(&c.notify)
 	c.L.Unlock()
@@ -80,6 +83,9 @@ func (c *Cond) Wait() {
 // Signal() does not affect goroutine scheduling priority; if other goroutines
 // are attempting to lock c.L, they may be awoken before a "waiting" goroutine.
 func (c *Cond) Signal() {
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpCondSignal, unsafe.Pointer(c))
+	}
 	c.checker.check()
 	runtime_notifyListNotifyOne(&c.notify)
 }
@@ -91,6 +97,9 @@ func (c *Cond) Signal() {
 // be aware that holding the lock across a call to Broadcast
 // will extend the amount of time that the lock is held.
 func (c *Cond) Broadcast() {
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpCondBroadcast, unsafe.Pointer(c))
+	}
 	c.checker.check()
 	runtime_notifyListNotifyAll(&c.notify)
 }

@@ -59,6 +59,7 @@ func BuildInit(ld *modload.Loader) {
 
 	modload.Init(ld)
 	instrumentInit()
+	weaveInit()
 	buildModeInit()
 	initCompilerConcurrencyPool()
 	cfgChangedEnv = makeCfgChangedEnv()
@@ -127,6 +128,34 @@ func fuzzInstrumentFlags() []string {
 		return nil
 	}
 	return []string{"-d=libfuzzer"}
+}
+
+// weaveInit implements -weave: it instruments memory accesses in the
+// command-line packages (equivalent to -gcflags=-weave) so ordinary reads and
+// writes become weave scheduling points. Runtime hooks for channels and mutexes
+// are always present, so many weave tests need no flag; -weave is only required
+// to explore data races on plain variables.
+func weaveInit() {
+	if !cfg.BuildWeave {
+		return
+	}
+	// -weave shares the compiler's single memory-instrumentation pass with the
+	// sanitizers, so it cannot be combined with them.
+	if cfg.BuildRace || cfg.BuildMSan || cfg.BuildASan {
+		fmt.Fprintf(os.Stderr, "go: may not use -weave with -race, -msan, or -asan simultaneously\n")
+		base.SetExitStatus(2)
+		base.Exit()
+	}
+	// The actual "-weave" gcflag is appended per package in (*builder).gcflags,
+	// but only for command-line packages — not their dependencies. Instrumenting
+	// sync/runtime internals would turn their private memory operations into
+	// scheduling points and break the soundness of transition reduction, so the
+	// instrumentation scope is deliberately limited (and applied additively, never
+	// shadowing the user's -gcflags).
+	//
+	// Define the "weave" build tag (like -race defines "race"), so tests can gate
+	// weave-only code with //go:build weave.
+	cfg.BuildContext.BuildTags = append(cfg.BuildContext.BuildTags, "weave")
 }
 
 func instrumentInit() {

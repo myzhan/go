@@ -194,6 +194,17 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		fatal("send on synctest channel from outside bubble")
 	}
 
+	// Record the send as a weave scheduling point/transition (no-op outside a
+	// controlled bubble). Must be before the non-blocking fast path below, so that
+	// a non-blocking send (a select with a default) also yields; whether it then
+	// succeeds or fails reflects the explored interleaving. Must be before
+	// acquiring c.lock.
+	if block {
+		weaveSchedPointAt(weaveOpChanSend, unsafe.Pointer(c), callerpc)
+	} else {
+		weaveSchedPointAt(weaveOpChanSendNB, unsafe.Pointer(c), callerpc)
+	}
+
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
 	//
 	// After observing that the channel is not closed, we observe that the channel is
@@ -419,6 +430,10 @@ func closechan(c *hchan) {
 		fatal("close of synctest channel from outside bubble")
 	}
 
+	// Record the close as a weave scheduling point/transition (no-op outside a
+	// controlled bubble). Must be before acquiring c.lock.
+	weaveSchedPointAt(weaveOpChanClose, unsafe.Pointer(c), sys.GetCallerPC())
+
 	lock(&c.lock)
 	if c.closed != 0 {
 		unlock(&c.lock)
@@ -506,12 +521,12 @@ func empty(c *hchan) bool {
 //
 //go:nosplit
 func chanrecv1(c *hchan, elem unsafe.Pointer) {
-	chanrecv(c, elem, true)
+	chanrecv(c, elem, true, sys.GetCallerPC())
 }
 
 //go:nosplit
 func chanrecv2(c *hchan, elem unsafe.Pointer) (received bool) {
-	_, received = chanrecv(c, elem, true)
+	_, received = chanrecv(c, elem, true, sys.GetCallerPC())
 	return
 }
 
@@ -521,7 +536,9 @@ func chanrecv2(c *hchan, elem unsafe.Pointer) (received bool) {
 // Otherwise, if c is closed, zeros *ep and returns (true, false).
 // Otherwise, fills in *ep with an element and returns (true, true).
 // A non-nil ep must point to the heap or the caller's stack.
-func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
+// callerpc is the source position of the receive, used by weave to give the
+// transition a file:line in a failing interleaving.
+func chanrecv(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) (selected, received bool) {
 	// raceenabled: don't need to check ep, as it is always on the stack
 	// or is new memory allocated by reflect.
 
@@ -543,6 +560,17 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 
 	if c.timer != nil {
 		c.timer.maybeRunChan(c)
+	}
+
+	// Record the receive as a weave scheduling point/transition (no-op outside a
+	// controlled bubble). Must be before the non-blocking fast path below, so that
+	// a non-blocking receive (a select with a default) also yields; whether it
+	// then succeeds or fails reflects the explored interleaving. Must be before
+	// acquiring c.lock.
+	if block {
+		weaveSchedPointAt(weaveOpChanRecv, unsafe.Pointer(c), callerpc)
+	} else {
+		weaveSchedPointAt(weaveOpChanRecvNB, unsafe.Pointer(c), callerpc)
 	}
 
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
@@ -802,7 +830,7 @@ func selectnbsend(c *hchan, elem unsafe.Pointer) (selected bool) {
 //		... bar
 //	}
 func selectnbrecv(elem unsafe.Pointer, c *hchan) (selected, received bool) {
-	return chanrecv(c, elem, false)
+	return chanrecv(c, elem, false, sys.GetCallerPC())
 }
 
 //go:linkname reflect_chansend reflect.chansend0
@@ -812,7 +840,7 @@ func reflect_chansend(c *hchan, elem unsafe.Pointer, nb bool) (selected bool) {
 
 //go:linkname reflect_chanrecv reflect.chanrecv
 func reflect_chanrecv(c *hchan, nb bool, elem unsafe.Pointer) (selected bool, received bool) {
-	return chanrecv(c, elem, !nb)
+	return chanrecv(c, elem, !nb, sys.GetCallerPC())
 }
 
 func chanlen(c *hchan) int {
@@ -902,6 +930,22 @@ func (q *waitq) dequeue() *sudog {
 
 		return sgp
 	}
+}
+
+// weaveHasClaimable reports whether the queue holds a waiter that dequeue would
+// actually return: any non-select sudog, or a select sudog whose goroutine has
+// not already been claimed by another of its cases. It does not modify the queue
+// or claim anyone, so weave's select-readiness peek matches what the subsequent
+// commit (dequeue) will find, avoiding treating a stale, already-woken select
+// sudog as a ready partner (which would make the select commit fail and spuriously
+// report a deadlock).
+func (q *waitq) weaveHasClaimable() bool {
+	for sgp := q.first; sgp != nil; sgp = sgp.next {
+		if !sgp.isSelect || sgp.g.selectDone.Load() == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *hchan) raceaddr() unsafe.Pointer {

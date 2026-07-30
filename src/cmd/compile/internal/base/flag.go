@@ -126,6 +126,7 @@ type CmdFlags struct {
 	TraceProfile       string       "help:\"write an execution trace to `file`\""
 	TrimPath           string       "help:\"remove `prefix` from recorded source file paths\""
 	WB                 bool         "help:\"enable write barrier\"" // TODO: remove
+	Weave              bool         "help:\"instrument memory accesses as weave scheduling points\""
 	PgoProfile         string       "help:\"read profile or pre-process profile from `file`\""
 	ErrorURL           bool         "help:\"print explanatory URL with error message if applicable\""
 
@@ -348,6 +349,12 @@ func ParseFlags() {
 		log.Fatal("cannot use both -race and -asan")
 	case Flag.MSan && Flag.ASan:
 		log.Fatal("cannot use both -msan and -asan")
+	case Flag.Weave && Flag.Race:
+		log.Fatal("cannot use both -weave and -race")
+	case Flag.Weave && Flag.MSan:
+		log.Fatal("cannot use both -weave and -msan")
+	case Flag.Weave && Flag.ASan:
+		log.Fatal("cannot use both -weave and -asan")
 	}
 	if Flag.Race || Flag.MSan || Flag.ASan {
 		// -race, -msan and -asan imply -d=checkptr for now.

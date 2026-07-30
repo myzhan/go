@@ -160,6 +160,12 @@ var depsRules = `
 	< context
 	< TIME;
 
+	# internal/weave is the runtime bridge + exploration engine for weave's
+	# controlled scheduler (see runtime/weave.go and testing/synctest). It attaches
+	# runtime primitives via linkname and uses time for the exploration budget.
+	RUNTIME, time
+	< internal/weave;
+
 	TIME, io, path, slices
 	< io/fs;
 
@@ -766,7 +772,7 @@ var depsRules = `
 	FMT
 	< internal/txtar;
 
-	internal/synctest, testing
+	internal/synctest, internal/weave, testing, path/filepath
 	< testing/synctest;
 
 	testing

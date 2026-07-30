@@ -1131,6 +1131,27 @@ const (
 
 // Mark gp ready to run.
 func ready(gp *g, traceskip int, next bool) {
+	// In a controlled bubble, a participant woken from a synchronization block
+	// (weaveBlocked, set in park_m) is captured by the controller instead of
+	// being made OS-runnable; it stays parked until granted the run token.
+	// Resumes that are not controller-managed sync wakeups (e.g. after async
+	// preemption or GC assist) have weaveBlocked==false and proceed normally, so
+	// the still-running token holder continues. Controller grants use weaveGrant,
+	// which bypasses this path entirely.
+	//
+	// A GC stack scan can synchronously preempt the running token holder into
+	// _Gpreempted; suspendG then flips it to _Gwaiting with waitReasonPreempted
+	// and resumeG reschedules it through ready. That is not a sync wakeup: the
+	// participant still logically holds the run token and must resume in place,
+	// never be captured into the runnable set (doing so loses the token and
+	// hangs the run). waitReasonPreempted is the reliable fingerprint of such a
+	// GC resume, so exclude it here regardless of the racy weaveBlocked flag.
+	if weaveControlledParticipant(gp) && gp.weaveBlocked && gp.waitreason != waitReasonPreempted {
+		gp.weaveBlocked = false
+		weaveEnqueue(gp)
+		return
+	}
+
 	status := readgstatus(gp)
 
 	// Mark runnable.
@@ -4294,11 +4315,30 @@ func park_m(gp *g) {
 
 	dropg()
 
+	// In a controlled bubble, a participant blocking on a real synchronization
+	// operation (anything other than an explicit weave yield) hands the run
+	// token to the next runnable participant (weaveOnBlock, below). Mark it
+	// weaveBlocked *before* waitunlockf makes it reachable by a waker: once the
+	// unlock function runs (releasing e.g. a channel or mutex), another M can
+	// dequeue and ready() this g concurrently. ready() uses weaveBlocked to
+	// decide whether to capture the g into the controller's runnable set rather
+	// than make it OS-runnable; if the flag were set only after waitunlockf, a
+	// racing wake would miss it, make the g OS-runnable behind the controller's
+	// back, and break the single-token invariant (spurious deadlock).
+	weaveWillBlock := bubble != nil && bubble.controlled && gp != bubble.root && gp.waitreason != waitReasonWeaveScheduled
+	if weaveWillBlock {
+		gp.weaveBlocked = true
+	}
+
 	if fn := mp.waitunlockf; fn != nil {
 		ok := fn(gp, mp.waitlock)
 		mp.waitunlockf = nil
 		mp.waitlock = nil
 		if !ok {
+			if weaveWillBlock {
+				// Park aborted; the g keeps running, so it is not blocked.
+				gp.weaveBlocked = false
+			}
 			trace := traceAcquire()
 			casgstatus(gp, _Gwaiting, _Grunnable)
 			if bubble != nil {
@@ -4314,6 +4354,12 @@ func park_m(gp *g) {
 
 	if bubble != nil {
 		bubble.decActive()
+	}
+
+	// Hand the run token to the next runnable participant now that this one has
+	// blocked (weaveBlocked was set above, before the park became observable).
+	if weaveWillBlock {
+		weaveOnBlock(bubble)
 	}
 
 	schedule()
@@ -4511,7 +4557,18 @@ func goexit0(gp *g) {
 		// Since this is running on g0, our registers are already zeroed from going through
 		// mcall in secret mode.
 	}
+	// Capture the controlled bubble before gdestroy clears gp.bubble, so we can
+	// hand the run token to the next participant after this one has fully exited.
+	// Only participants are accounted for: the root/driver never exits inside the
+	// bubble, and counting it as one would corrupt the controller's live count.
+	var weaveBubble *synctestBubble
+	if weaveControlledParticipant(gp) {
+		weaveBubble = gp.bubble
+	}
 	gdestroy(gp)
+	if weaveBubble != nil {
+		weaveOnGoexit(weaveBubble)
+	}
 	schedule()
 }
 
@@ -5334,6 +5391,24 @@ func malg(stacksize int32) *g {
 func newproc(fn *funcval) {
 	gp := getg()
 	pc := sys.GetCallerPC()
+	if weaveActive() {
+		// In a controlled bubble, the child starts parked (in weaveGoWrapper, so
+		// its panics are captured) and waits for the controller to grant it the
+		// run token; the parent keeps running.
+		bubble := gp.bubble
+		if bubble.weaveCtl.overflow {
+			// The run already overflowed the controller's capacity and is being
+			// torn down as truncated; do not spawn further participants (they could
+			// only be dropped and leaked). Skipping creation is safe because the
+			// run's result is already inconclusive.
+			return
+		}
+		systemstack(func() {
+			newg := weaveNewParticipant(gp, pc, fn)
+			weaveRegisterChild(bubble, newg)
+		})
+		return
+	}
 	systemstack(func() {
 		newg := newproc1(fn, gp, pc, false, waitReasonZero)
 

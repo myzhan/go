@@ -75,6 +75,9 @@ const waitGroupBubbleFlag = 0x8000_0000
 // new Add calls must happen after all previous Wait calls have returned.
 // See the WaitGroup example.
 func (wg *WaitGroup) Add(delta int) {
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpWaitGroupAdd, unsafe.Pointer(wg))
+	}
 	if race.Enabled {
 		if delta < 0 {
 			// Synchronize decrements with Wait.
@@ -158,6 +161,9 @@ func (wg *WaitGroup) Done() {
 
 // Wait blocks until the [WaitGroup] task counter is zero.
 func (wg *WaitGroup) Wait() {
+	if weaveEnabled {
+		weaveSchedPoint(weaveOpWaitGroupWait, unsafe.Pointer(wg))
+	}
 	if race.Enabled {
 		race.Disable()
 	}

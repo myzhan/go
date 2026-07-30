@@ -22,6 +22,13 @@ type synctestBubble struct {
 	waiting bool   // true if a goroutine is calling synctest.Wait
 	done    bool   // true if main has exited
 
+	// controlled is set when this bubble is under weave's controlled
+	// scheduler, which serializes the bubble's goroutines and enumerates
+	// their interleavings. See runtime/weave.go. When false, weave's hooks
+	// are inert and the bubble behaves exactly as a plain synctest bubble.
+	controlled bool
+	weaveCtl   *weaveControl // weave run-token state; non-nil iff controlled
+
 	// The bubble is active (not blocked) so long as running > 0 || active > 0.
 	//
 	// running is the number of goroutines which are not "durably blocked":
@@ -41,6 +48,12 @@ type synctestBubble struct {
 // changegstatus is called when the non-lock status of a g changes.
 // It is never called with a Gscanstatus.
 func (bubble *synctestBubble) changegstatus(gp *g, oldval, newval uint32) {
+	if bubble.controlled {
+		// Controlled bubbles are scheduled by the weave controller, which tracks
+		// participant liveness itself and does not use synctest's running/idle
+		// accounting.
+		return
+	}
 	// Determine whether this change in status affects the idleness of the bubble.
 	// If this isn't a goroutine starting, stopping, durably blocking,
 	// or waking up after durably blocking, then return immediately without
@@ -109,6 +122,9 @@ func (bubble *synctestBubble) changegstatus(gp *g, oldval, newval uint32) {
 // incActive increments the active-count for the bubble.
 // A bubble does not become durably blocked while the active-count is non-zero.
 func (bubble *synctestBubble) incActive() {
+	if bubble.controlled {
+		return
+	}
 	lock(&bubble.mu)
 	bubble.active++
 	unlock(&bubble.mu)
@@ -116,6 +132,9 @@ func (bubble *synctestBubble) incActive() {
 
 // decActive decrements the active-count for the bubble.
 func (bubble *synctestBubble) decActive() {
+	if bubble.controlled {
+		return
+	}
 	lock(&bubble.mu)
 	bubble.active--
 	if bubble.active < 0 {
@@ -167,6 +186,17 @@ func (bubble *synctestBubble) raceaddr() unsafe.Pointer {
 
 var bubbleGen atomic.Uint64 // bubble ID counter
 
+// synctestBaseTime is the fake-clock start time for every bubble (both plain
+// synctest and weave-controlled), so time.Now() is deterministic and identical
+// across the two modes.
+const synctestBaseTime = 946684800000000000 // midnight UTC 2000-01-01
+
+// synctestRun runs f in a new bubble.
+//
+// A weave-controlled bubble is NOT created here: weave drives one schedule per
+// exploration through weaveRunBubble (runtime/weave.go), which builds the bubble
+// itself so it can attach the per-schedule weaveControl.
+//
 //go:linkname synctestRun internal/synctest.Run
 func synctestRun(f func()) {
 	gp := getg()
@@ -179,7 +209,6 @@ func synctestRun(f func()) {
 		running: 1,
 		root:    gp,
 	}
-	const synctestBaseTime = 946684800000000000 // midnight UTC 2000-01-01
 	bubble.now = synctestBaseTime
 	lockInit(&bubble.mu, lockRankSynctest)
 	lockInit(&bubble.timers.mu, lockRankTimers)
@@ -280,6 +309,15 @@ func synctestWait() {
 	gp := getg()
 	if gp.bubble == nil {
 		panic("goroutine is not in a bubble")
+	}
+	if gp.bubble.controlled {
+		// Under weave's controlled scheduler the bubble's running/active
+		// accounting is owned by the run token, so the ordinary synctest wait
+		// (synctestwait_c) would trip its "running == 0 && active == 0" assertion.
+		// Route to weave's barrier instead: wait until every other participant
+		// has finished. This makes synctest.Wait() work unchanged under -weave.
+		weaveWait()
+		return
 	}
 	lock(&gp.bubble.mu)
 	// We use a bubble.waiting bool to detect simultaneous calls to Wait rather than
