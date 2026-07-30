@@ -137,6 +137,17 @@ func TestExploreIndependent(t *testing.T) {
 	if res.Deadlock || res.Failed {
 		t.Fatalf("unexpected failure: %+v", res)
 	}
+	// The x accesses are invisible without -weave, so the only transitions are the
+	// independent Yields and goroutine start/exit. DPOR must recognize there is
+	// nothing to reverse and explore a single representative schedule; asserting that
+	// (not just "no failure") is what makes this a reduction test rather than a
+	// liveness one. That one schedule is run up to three times by the reproducibility
+	// probe (a clean default schedule is replayed to check the model is stable), so
+	// the bound is 3; a second, spurious interleaving would push Runs past it.
+	if res.Runs > 3 {
+		t.Fatalf("independent operations have no conflict to reverse, so DPOR should explore a "+
+			"single schedule (run up to 3x by the reproducibility probe); explored %d", res.Runs)
+	}
 	t.Logf("independent ops: DPOR explored %d schedule(s)", res.Runs)
 }
 

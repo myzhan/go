@@ -506,7 +506,13 @@ func TestReadFaultRecoverable(t *testing.T) {
 	if !res.Failed {
 		t.Fatalf("expected the faulting read to be captured as a failure, got %+v", res)
 	}
-	t.Logf("faulting read captured as a recoverable failure (not a process fatal)")
+	// The point is not merely that something failed, but that the nil dereference was
+	// recovered into a reportable value instead of taking down the process — so the
+	// captured value must be the runtime error, not some unrelated panic.
+	if _, ok := res.Value.(error); !ok {
+		t.Fatalf("expected the recovered value to be the runtime fault error, got %T: %v", res.Value, res.Value)
+	}
+	t.Logf("faulting read captured as a recoverable failure (%v), not a process fatal", res.Value)
 }
 
 // A read-modify-write built from sync/atomic's typed Load + Store is not atomic as

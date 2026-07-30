@@ -630,10 +630,19 @@ func TestReplayReproduces(t *testing.T) {
 	t.Logf("seed %q reproduces the failing interleaving deterministically", res.Seed)
 }
 
-// Map iteration order is determinized inside a controlled bubble, so a model
-// whose behavior depends on it produces the same outcome every run.
+// Map iteration order is determinized inside a controlled bubble, so a model whose
+// behavior depends on it behaves the same every run.
+//
+// Asserted by observing the actual first key rather than by whether a panic fires.
+// The earlier version compared a.Failed to b.Failed for a model that panicked when
+// the first key was a hard-coded 3 — but determinization pins the first key to 12
+// here, so that panic never fired and the comparison was false != false regardless
+// of whether determinization worked at all. Collect the first key across every
+// schedule instead and require exactly one distinct value: if the order were still
+// random, the schedules would disagree.
 func TestMapIterationDeterministic(t *testing.T) {
-	model := func() {
+	seen := map[int]bool{}
+	res := Explore(func() {
 		m := map[int]int{}
 		for i := 0; i < 16; i++ {
 			m[i] = i
@@ -643,16 +652,25 @@ func TestMapIterationDeterministic(t *testing.T) {
 			first = k
 			break
 		}
-		if first == 3 { // arbitrary; the point is it's the same every run
-			panic("map-order-dependent")
+		seen[first] = true // write-only outer state; records what each schedule saw
+		Wait()
+	})
+	if res.Failed || res.Deadlock {
+		t.Fatalf("model is correct; got %+v", res)
+	}
+	if res.Runs < 2 {
+		t.Fatalf("only %d schedule ran, so a single map order cannot be distinguished from a "+
+			"determinized one", res.Runs)
+	}
+	if len(seen) != 1 {
+		keys := make([]int, 0, len(seen))
+		for k := range seen {
+			keys = append(keys, k)
 		}
+		t.Fatalf("map iteration order is not determinized: %d schedules saw different first "+
+			"keys %v; a model depending on map order would be nondeterministic", res.Runs, keys)
 	}
-	a := Explore(model)
-	b := Explore(model)
-	if a.Failed != b.Failed {
-		t.Fatalf("map iteration nondeterministic across runs: %v vs %v", a.Failed, b.Failed)
-	}
-	t.Logf("map iteration deterministic across runs (failed=%v)", a.Failed)
+	t.Logf("map iteration determinized: every one of %d schedule(s) saw the same first key", res.Runs)
 }
 
 // A correct model with a large state space is explored fully by default, but a
