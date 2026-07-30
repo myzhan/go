@@ -87,9 +87,14 @@ func TestCounter(t *testing.T) {
 `go test`(不带 -weave)= 一次普通 synctest 单跑;`go test -weave` = 同一用例的系统交错探索。
 
 约束(同 loom/synctest):模型闭包必须**可重跑**(共享状态在闭包内声明)、除调度外**确定性**
-(勿用 `rand`/依赖 map 迭代序)、所有 goroutine 必须能结束。时间/定时器由 synctest 假时钟驱动,
-`time.Sleep`/`time.After`/`context.WithTimeout` 在受控 bubble 内**可正常工作**(见 [design.md](design.md)
-D11),且**推进时机本身会被枚举**,所以超时分支不会被漏掉(D22)。
+(勿用 `rand`/依赖 map 迭代序)、所有 goroutine 必须能结束。
+
+前两条现在**有机器检查**(ADR D23):模型若"读到上一遍写的值",报告会指出**读点与写点**两个 `file:line`;
+报出反例前还会用同一条选择向量**复现一次**,复现不了就不报,免得你去追一个幻影。注意**只写不读**的外部
+状态(收集结果、累加指标)是正常的,不会有任何提示。
+
+时间/定时器由 synctest 假时钟驱动,`time.Sleep`/`time.After`/`context.WithTimeout` 在受控 bubble 内
+**可正常工作**(见 [design.md](design.md) D11),且**推进时机本身会被枚举**,所以超时分支不会被漏掉(D22)。
 
 ## 搜索深度(抢占上界)
 

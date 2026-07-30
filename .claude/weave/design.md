@@ -243,8 +243,9 @@ GC 抢占恢复丢令牌的竞态(见 D10),以及一轮代码评审报出的一�
 weave 是**单元级、封闭的并发验证器**,不是全程序工具。控制范围 = synctest 泡泡 = "从测试闭包
 派生的 goroutine"。这个边界的正确处理见 ADR D9:
 
-- **A 类(状态跨 run 残留)**:同进程重跑 `f`,可变全局会带脏状态进下一遍。可用基于 `weavewrite`
-  钩子的 undo-log 自动回滚缓解(roadmap 候选)。
+- **A 类(状态跨 run 残留)**:同进程重跑 `f`,闭包外的可变状态会带脏状态进下一遍。**已处理:检测而非
+  回滚**(D23)——undo-log 回滚被否决(覆盖不全、还原不了对象图),改为在"读到了前一遍写的值"时给出证据
+  (含读点与写点的 `file:line`),并在报出反例前先复现一次。
 - **B 类(泡泡外并发)**:init 期单例、全局池、真 I/O、真时钟、cgo 线程生在泡泡外,对 weave 不
   可见。这堵墙**非 weave 独有**(loom/Shuttle/Coyote/CHESS 全撞同一堵),是"系统化交错探索"方法
   的内禀边界。**不追求控制整个进程,也不改成 rr 类重放系统**;正确姿势是用**依赖注入 / fake**
@@ -305,8 +306,9 @@ Cond/WaitGroup 与 `sync/atomic` 的钩子后来改成了 build-tag 常量(`weav
 
 ### D9 — "全局状态 / 泡泡外并发"是品类边界
 拆成两个可解性不同的子问题(详见 §7):
-- **A(状态跨 run 残留)**:可用 `weavewrite` 钩子的 undo-log 自动回滚缓解。为何不用 `fork()` 拿
-  干净快照:Go 多线程下 fork 不安全,这条路基本封死;undo-log 是更现实的等价物。
+- **A(状态跨 run 残留)**:**已处理为检测**(D23)。回滚路线(undo-log,或 `fork()` 取干净快照——后者
+  在 Go 多线程下不安全,基本封死)被否决:插桩覆盖不到依赖包与 runtime,按字节还原也还不了对象图。改为
+  在"读到了前一遍写的值"时给出带读点/写点的证据,并在报出反例前先复现一次。
 - **B(泡泡外并发)**:用户态不可根治,是方法内禀边界。**决策**:(1) 不控制整个进程、不改成 rr;
   (2) 最高优先级工程回应是把 B 从"静默出错"变"显式报错"`uncontrolled concurrency detected`
   (roadmap 候选,复用 synctest 跨泡泡检测);(3) 定位澄清:weave 是单元级 hermetic 验证器,
@@ -589,6 +591,67 @@ channel → 对端永久阻塞泄漏)在真实 Go 代码里极常见,却是 weav
 `timer_vs_event_false_negative` 从 `unsupported/` 退役,改写成 `supported/timer_vs_event`(真 `time.After` 版),
 `check.sh` 37→37 全对。
 
+### D23 — 跨 schedule 残留状态:检测而非回滚,且只当证据
+
+**问题**(D9 A 类):weave 要把同一个闭包跑 N 遍,凡是闭包**外面**的可变状态都会带进下一遍。于是"每遍
+是同一个模型"这个前提没了:探索结果既可能漏报,也可能报出一个由累积脏状态造成的**假反例**,seed 还可能
+重放不出来。今天这条约束**只写在文档里**,没有任何东西强制。
+
+**先否决 undo-log**:原设想是用 `weavewrite` 钩子记 (地址,旧值) 每遍回滚。不做,理由三条:插桩只覆盖
+命令行包,依赖包/runtime(map、channel 缓冲、timer 堆)的写看不见 → 回滚必然是**部分的**,而部分回滚比
+不回滚更危险;回滚指针只还原指针本身,它指向的对象与第一遍分配的垃圾都还在(按字节还原 ≠ 还原对象图);
+成本压在本来就最热的路径上。**改为检测**。
+
+**关键的判据选择**:不为"写了外部状态"报警——粒度大的用例改一堆外部变量是完全正常的,那样报会大幅
+限制适用范围。有害的是"**后一遍的行为依赖了前一遍写的东西**"。于是把外部写分三类,只管第三类:
+只写不读(无害)、读了但没人写(无害)、**读到了前一遍写的值**(有害)。
+
+**落地四件**:
+
+1. **重放分歧检测(M1)**。DPOR 每条 run 都要重放一段前缀,这本身就是免费探针:快照该前缀,跑完比对。
+   前缀之外的漂移则靠**全轨迹探针**——把默认调度多跑一遍、比对整条轨迹。
+2. **首读值证据(M2)**。判据落到值上:某地址在本遍**尚未被写就先读**,且读到的值与第一遍不同。它天然
+   只命中第三类;而且**不需要区分全局/堆/栈**——闭包捕获的外层局部变量只分配一次、被闭包持有、Go 的 GC
+   不移动对象,所以地址稳定;run 内新分配的对象一律零初始化,于是"值不同"这个条件自动把它们排除。
+   报告同时给出**读点与上一遍的写点**两个 `file:line`。
+3. **失败复现确认(M3)**。报出反例之前,用同一条完整选择向量重跑一遍;不复现就**不报 trace**,改说
+   "找到过但复现不了",因为一个无法复现的交错不是发现。顺带兜住引擎自身的 bug。
+4. **所有 op 都记 caller PC**。原先只有 read/write 有源码行,`lock`/`chan`/`once` 只有对象标签。chan/select
+   直接传调用者 PC(`chansend` 本就有 `callerpc`,`chanrecv` 新增一个,`selectgo`/`closechan` 由用户代码
+   直接调用故 `GetCallerPC` 即可);mutex/once/cond/wg/atomic 走库级钩子,需要跳一帧,由
+   `runtime.weaveSchedPointSkip` 在**确认是参与者之后**才做 unwind。**这一改惠及所有 weave 报告**。
+
+**三处被实测推翻的设计**(记下来,免得重走):
+
+- **只比强制前缀不够**。`sync.Once` 那个用例完全抓不到,因为分歧点落在强制选择点**之后** → 补全轨迹探针。
+- **加预热会把一次性状态一起藏掉**。三个 `testing/synctest` 自测立刻报分歧,根因是模型里的 `fmt.Sprint`
+  触发 `sync.Pool` **首次使用**注册(`lock`),第二遍走快路径(`atomic store`)——标准库自身的预热。丢弃
+  第一遍能消掉这类噪声,但 `sync.Once` 的变化恰好只发生在第 1↔2 遍之间,一并被藏。→ 改成**两级**:
+  第 1↔2 遍记为软证据(`WarmupDiverged`),第 2↔3 遍才算真分歧。
+- **指针值不是证据**。首读值比对的第一版报了 `unsupported/double_checked_locking` ——那个模型读的是
+  一个自己还没写过的**指针**,它每遍都不同,但差异来自"指向的是新分配的对象",与状态是否跨 schedule
+  传递无关(顺带还在格式化指针大小的值时把 demo 二进制 panic 了,因为 `appendInt` 只有 12 字节缓冲)。
+  → 只对**小标量**(`< 1<<32`:计数器、标志、长度、小 id)取证;指针、哈希、纳秒时间戳一律跳过。
+  回归 `TestPointerValuesAreNotCarriedState`。
+- **op 序列比对被 `t.Log` 击穿,且分歧不能当硬错误**。`t.Log` 写的是**父 T 的输出缓冲**,每条 schedule
+  都在追加,所以带 `t.Log` 的模型**天生**跨 run 不可重跑(标准库自己的示例就这么写)。两个结论:比对口径
+  收窄为**只比 wid 序列**(DPOR 强制的正是 wid;"同一 goroutine 做了不同的库内部操作"正是噪声所在);
+  分歧**降级为证据**,不再让测试失败,只用于给报出的反例附注解、以及成功时的一条 `-v` 提示。
+
+**唯一保留的硬错误**:`WEAVE_REPLAY` 的失配。seed 没跟着走是无歧义的,而且 `weaveChoose` 对"计划 wid
+不可运行"本来是**静默回退**——正是让错配 seed 静默报 "no failure" 的根因,现在会明确报出来。
+
+**已知漏的一类**:从全局指针可达的**堆对象**上的数值型跨 run 依赖(`var cfg = &Config{}` 改 `cfg.count`),
+若不改变控制流则漏。漏的方向是"保守不报警",与"不误伤正常用例"的取向一致。
+
+**验证**:`TestNonReproducibleModelDetected`(包级 `sync.Once` → 软证据,指出步号)、
+`TestAccumulatingOuterStateReported`(每遍都变 → 分歧证据)、`TestWriteOnlyOuterStateIsFine` /
+`TestWriteOnlyCarriedStateIsSilent`(只写不读 → 52 条 schedule 一声不响)、
+`TestCarriedStateNamesBothPositions`(读点与写点都点名)、`TestPointerValuesAreNotCarriedState`
+(指针值不取证)、`TestUnreproducibleFailureIsNotReported` /
+`TestReproducibleFailureStillReported`(该拦的拦、该报的报)、`TestTransitionsCarryCallerPosition`
+(锁死库级钩子的跳帧数,否则所有报告会开始指向 `sync/mutex.go`)。全套双模式绿,`check.sh` 37/37 不变。
+
 ---
 
 ## 9. 待定 / 开放问题
@@ -627,6 +690,5 @@ bubble 无关。
   `time.Tick` 会无限推进时钟,受调度/时间预算约束(Truncated)。
 - 泡泡外并发的**显式检测报错** `uncontrolled concurrency detected`:如何在 synctest 跨泡泡检测
   基础上覆盖"共享地址被泡泡内外同时触碰"。
-- 基于 `weavewrite` 钩子的 **undo-log 自动重置**:回滚粒度、只覆盖插桩内存的边界、开销。
 - 弱内存(atomic C11 重排 / read-from 枚举)与 DPOR 的组合,复杂度可控性待验证。
 - 状态空间预算/超时的默认策略与用户可调项;是否提供并行探索(多 worker 跑不同子树)。

@@ -20,6 +20,10 @@ flag 均已落地。
 - **默认自动迭代加深抢占上界**:不设 `WEAVE_MAX_PREEMPTIONS` 时,从抢占=0 逐层加深到默认上限
   `defaultPreemptCeiling`(=2,`weaveExplore`/`exploreIterative`),而非旧的无界搜索——避免真实模型状态
   空间爆炸,并让反例用最少抢占(最易读)。设了该 env 则以其为上限。
+- **每个 transition 都带源码位置**(D23):不只内存读写,`lock`/`chan send`/`once`/`atomic` 等也指到
+  **用户写的那一行**(库级钩子跳一帧,由 `runtime.weaveSchedPointSkip` 在确认是参与者后才 unwind)。
+- **跨 schedule 残留状态会被指出**(D23):模型读到前一遍写的值时,报告附上**读点与写点**两个 `file:line`;
+  只写不读的外部状态一声不响。报出反例前还会用同一条选择向量**复现一次**,不复现就不报。
 - **失败报告可读性**:轨迹里同步对象由裸地址改为稳定标签(`mutex#1`/`chan#2`/`cond#3`/`wg`/`once`/`mem`,
   `addrLabeler`);死锁报告额外逐 goroutine 列出等待对象(`gN blocked on lock mutex#4`,由每个参与者的
   最后 trace step 推断,`blockedWaits`)。
@@ -59,8 +63,10 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
   把令牌交给 root 去推进(D22)。
 - **中心钩子**:`weaveEnqueue`(ready 截获)、`weaveOnBlock`(park_m 交接/死锁)、`weaveOnGoexit`
   (退出交接/完成/死锁)。
-- **调度点原语**:`weaveSchedPoint(op, id)`(nosplit,非活跃即返回)→ `weaveSchedPointSlow`;
-  内存 hook `weaveread`/`weavewrite`/`weavewriteval`/`weavereadrange`/`weavewriterange`。
+- **调度点原语**:`weaveSchedPoint(op, id)`(nosplit,非活跃即返回)→ `weaveSchedPointSlow`;带源码
+  位置的两个变体(D23):`weaveSchedPointAt`(调用方已知 caller PC,chan/select 用)与
+  `weaveSchedPointSkip`(库级钩子用,确认是参与者后才 unwind 指定帧数)。内存 hook
+  `weaveread`/`weavewrite`/`weavewriteval`/`weavereadrange`/`weavewriterange`。
 - **root 等待**:`weaveRootWait`/`weaveRootPark`(`rootParked` 标志在 park 的 unlockf 里、root 已
   `_Gwaiting` 后才置位,关闭 wake-before-park 竞态)。
 - **linkname 面**:`weaveRunSchedule`→`internal/weave.runSchedule`(跑一条调度,带回 steps/nsel/
@@ -123,6 +129,9 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 
 ### L3 引擎 —— `src/internal/weave/explore.go`
 - `Explore`/`ExploreBudget`/`ExploreBounded`(context bounding + wall-clock 超时)/`Replay`/`Run`。
+- 跨 run 一致性(D23):`checkPrefix`(重放分歧,含"默认调度跑三遍"的两级探针)、`checkCarriedState`
+  (首读值证据)、`confirm`(报出反例前复现一次);产物是 `Result` 的 `Diverged`/`WarmupDiverged`/
+  `CarriedState`/`NotConfirmed` 四组字段,**除 Replay 的失配外都只作证据**。
 - `conflict`(含 select 与 clock-advance 的 addr-agnostic 特判 + NB 处理)、`channelHB`(向量钟,
   只建 channel 边、忽略 NB)、`isChanOp`/`isSyncOp`。
 - source-DPOR 主循环:backtrack 集合 + select-case 枚举(`selD`/`selCase`);`exploreExhaustive`
@@ -273,6 +282,8 @@ Int32/Uint32/Uintptr/Bool/Pointer` 的 `Load/Store/Swap/Add/CompareAndSwap/And/O
 | `t.Skip` 在探索模式下正确跳过 | ✅ | `weaveTestSkip` 哨兵(D21) |
 | op 码跨 5 处声明的交叉校验 | ✅ | `internal/weave/optab_test.go` |
 | 演示用例行为的自动断言 | ✅ | `weavedemo/check.sh`(期望值从注释推导) |
+| 跨 schedule 残留状态的检测(非回滚)| ✅ | 重放分歧 + 首读值证据 + 失败复现确认(D23) |
+| 所有 op 都带源码位置 | ✅ | `weaveSchedPointAt`/`weaveSchedPointSkip`(D23) |
 | 弱内存模型(atomic C11 重排 / read-from)| ⬜ | 依赖 atomic |
 | optimal-DPOR(wakeup tree)进一步剪枝 | ⬜ | 增强 |
 | 抢占看门狗(死循环兜底)| ⬜ | 见 §5.A.2 |
