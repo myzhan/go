@@ -79,6 +79,48 @@ type Result struct {
 	Trace      []Step      // the failing/deadlocking interleaving
 	Goroutines []Goroutine // participants in the failing interleaving, by wid
 
+	// Diverged is set when replaying the same choices did not reproduce the same
+	// participant sequence, i.e. the model does not behave identically across runs.
+	// Exploration works by replaying earlier choices, so this undermines everything
+	// the search concludes — but it is EVIDENCE, not a verdict, and the driver must
+	// not fail a test on it alone. Anything the model does through the *testing.T it
+	// was handed appends to the parent test's output, so a model that merely logs is
+	// non-reproducible by construction. DivergedReason names the step and what
+	// differed, for citing in whatever report is actually made.
+	//
+	// Replay is the exception: there a mismatch means the seed does not describe this
+	// model at all, which is unambiguous and reported as an error.
+	Diverged       bool
+	DivergedReason string
+
+	// NotConfirmed is set when a reported failure did not happen again on rerunning
+	// the very same choices. The counterexample is then not something the reader can
+	// act on: either it depends on state an earlier schedule left behind, or weave
+	// itself has a bug. Reported instead of the trace, since presenting an
+	// unreproducible interleaving as a finding is worse than admitting the doubt.
+	NotConfirmed       bool
+	NotConfirmedReason string
+
+	// CarriedState records that the model read a location it had not written in that
+	// run and got a different value than the first schedule read there — a value that
+	// flowed from one schedule into the next. Evidence only, never a failure of its
+	// own: CarriedStateReason names both source positions so a report can point at
+	// the read and at whatever wrote it.
+	CarriedState       bool
+	CarriedStateReason string
+
+	// WarmupDiverged records that the model's FIRST run differed from its second,
+	// while runs 2 and 3 agreed — the signature of state initialized exactly once.
+	// This is not an error on its own: the standard library does it all the time
+	// (sync.Pool registers itself under a lock on first use, lazy singletons abound),
+	// so failing here would make weave unusable for any model that calls fmt.Sprint
+	// or t.Log. Exploration proceeds on the post-warm-up model, which is
+	// self-consistent. The evidence is kept so other reports can cite it: when the
+	// one-shot state is the MODEL's own (a package-level sync.Once or cache), the
+	// schedules that initialize it are exactly the ones going unexplored.
+	WarmupDiverged       bool
+	WarmupDivergedReason string
+
 	// Truncated is set when exploration stopped before the state space was
 	// exhausted (schedule budget reached, or a capacity limit hit). A truncated
 	// run that found no failure is inconclusive, not a clean pass; callers must
@@ -128,10 +170,26 @@ type explorer struct {
 	selStepIdx   []int32  // scheduling-step index of each select event
 	res          Result
 	f            func() // the model; panics (main or spawned) are captured by the runtime wrapper
+
+	// The transitions the next run must reproduce, snapshotted when a backtrack is
+	// scheduled (see snapshotPrefix/checkPrefix).
+	expectWid   []int32
+	expectOp    []int32
+	expectPC    []uint64
+	expectValid bool
+	expectFull  bool // the snapshot is a whole trace, so the length must match too
+	expectSoft  bool // a mismatch is warm-up evidence, not a hard error
+	probe       int  // 0 = warm-up run pending, 1 = baseline run pending, 2 = probe done
+
+	// Cross-schedule state evidence: the first value each location was seen to hold
+	// before being written, and where it was last written (see checkCarriedState).
+	firstRead map[int64]readObs
+	lastWrite map[int64]uint64
 }
 
 func newExplorer(f func()) *explorer {
 	return &explorer{
+		lastWrite:    map[int64]uint64{},
 		traceWid:     make([]int32, traceCap),
 		traceOp:      make([]int32, traceCap),
 		traceAddr:    make([]int64, traceCap),
@@ -456,11 +514,21 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 				break
 			}
 		}
+		// Before drawing any conclusion from this run, make sure it actually
+		// reproduced the prefix it was told to replay.
+		if !e.checkPrefix(wid, op, e.tracePC[:steps]) {
+			return e.res
+		}
+		e.checkCarriedState(op, addr, e.tracePC[:steps], e.traceValSet[:steps], e.traceVal[:steps])
+
 		selTrace := e.selTrace[:nsel]
 		selBranch := e.selBranch[:nsel]
 		selStepIdx := e.selStepIdx[:nsel]
 
 		if failure != nil {
+			if e.confirm(selPlan, wid, false); e.res.NotConfirmed {
+				return e.res // withhold a counterexample that does not rerun
+			}
 			e.res.Failed = true
 			e.res.Value = failure
 			e.res.Seed = encodeSeed(wid, selTrace)
@@ -469,6 +537,9 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 			return e.res
 		}
 		if outcome == 1 {
+			if e.confirm(selPlan, wid, true); e.res.NotConfirmed {
+				return e.res // withhold a counterexample that does not rerun
+			}
 			e.res.Deadlock = true
 			e.res.Seed = encodeSeed(wid, selTrace)
 			e.res.Trace = buildTrace(wid, op, addr, e.tracePC[:steps], e.traceValSet[:steps], e.traceVal[:steps])
@@ -479,6 +550,28 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 			e.res.Truncated = true
 			e.res.TruncatedReason = "capacity limit (too many participants or trace recording space)"
 			return e.res
+		}
+		// Reproducibility probe, run once per exploration on a model that came back
+		// clean. The prefix check above only covers the transitions a run was told to
+		// replay, so behaviour that drifts LATER than the forced choice point would
+		// slip through — a package-level sync.Once being the canonical example. Run the
+		// default schedule again and require the WHOLE trace to match: same starting
+		// state, same choices, therefore same transitions.
+		//
+		// The first run is deliberately discarded as a warm-up. A model that so much as
+		// calls fmt.Sprint or t.Log differs between its first and second run for
+		// reasons that have nothing to do with the model: sync.Pool registers itself
+		// under a lock on first use and takes an atomic fast path afterwards, and lazy
+		// singletons all through the standard library behave the same way. Comparing
+		// runs 2 and 3 skips that class entirely while still catching state the model
+		// itself accumulates, which keeps drifting on every later run.
+		//
+		// Skipped when the schedule budget cannot afford three runs, so a budget of one
+		// still means exactly one run.
+		if e.probe < 2 && (maxSchedules <= 0 || maxSchedules >= 3) {
+			e.snapshot(steps, wid, op, e.tracePC[:steps], true, e.probe == 0)
+			e.probe++
+			continue // rerun with the same plan; the analysis happens once the probe is done
 		}
 
 		for len(stack) < steps {
@@ -664,6 +757,7 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 			}
 			selPlan = append(selPlan[:0], selTrace[:cnt]...)
 			stack = stack[:d+1] // discard the now-stale subtree below d
+			e.snapshotPrefix(d, wid, op, e.tracePC[:steps])
 		case selD >= 0:
 			// select-case backtrack: rerun the same prefix but fire a different ready
 			// case at this select. Force the same participant at step selD and the
@@ -675,10 +769,277 @@ func ExploreBounded(f func(), maxSchedules, maxPreemptions int, maxDuration time
 			selPlan = append(selPlan[:0], selTrace[:fr.selEvent]...)
 			selPlan = append(selPlan, selCase)
 			stack = stack[:selD+1]
+			e.snapshotPrefix(selD, wid, op, e.tracePC[:steps])
 		default:
 			return e.res
 		}
 	}
+}
+
+// confirm reruns the schedule that just failed, with the identical choice vector,
+// and records whether the failure happened again. It is the last thing weave does
+// before handing a counterexample to the reader: a reported interleaving that does
+// not reproduce is either an artifact of state left behind by an earlier schedule or
+// a bug in weave, and in both cases saying so beats printing a trace the reader
+// cannot act on.
+//
+// Only one extra run, and only when something is actually being reported.
+func (e *explorer) confirm(selPlan, wid []int32, wantDeadlock bool) {
+	// Force the whole schedule, not just its prefix: the choices past the backtrack
+	// point were made by the default policy, and replaying them explicitly is what
+	// makes this a rerun of the same interleaving rather than of the same prefix.
+	full := append([]int32(nil), wid...)
+	sel := append([]int32(nil), selPlan...)
+	c := newExplorer(e.f)
+	_, _, outcome, failure, _ := runSchedule(c.f, full, c.traceWid, c.traceOp, c.traceValSet, sel,
+		c.selTrace, c.selBranch, c.selStepIdx, c.traceAddr, c.traceSize, c.traceEnabled, c.tracePC,
+		c.spawnPC, c.traceVal, false)
+	e.res.Runs++
+	again := failure != nil
+	if wantDeadlock {
+		again = outcome == 1
+	}
+	if again {
+		return
+	}
+	what := "the panic did not happen again"
+	if wantDeadlock {
+		what = "the deadlock did not happen again"
+	}
+	e.res.NotConfirmed = true
+	e.res.NotConfirmedReason = what + " when the same schedule was rerun"
+}
+
+// checkCarriedState looks for a value that flowed from one schedule into the next.
+//
+// The interesting event is not that the model WROTE something outliving a schedule —
+// collecting results in an outer slice or bumping a counter is normal, and complaining
+// about it would rule out most coarse-grained tests. It is that the model READ a
+// location it had not yet written in this run, and got a different value than the
+// first run read there. That is precisely "this schedule's behaviour can depend on
+// what an earlier schedule did", and nothing else trips it:
+//
+//   - a location the model only ever writes is never read first, so it never appears;
+//   - a location nobody writes reads the same value every run;
+//   - freshly allocated memory is zero-initialized, so a reused address reads 0 in
+//     both runs — which is what makes this safe without tracking allocations. Only
+//     memory that outlives a schedule can read differently, and closure-captured
+//     variables qualify: they are allocated once, kept alive by the closure, and Go's
+//     collector does not move them, so their addresses are stable across runs.
+//
+// This is evidence for other reports to cite, never a failure of its own (see
+// Result.CarriedState). Requires -weave: without memory instrumentation there are no
+// read/write transitions to inspect.
+func (e *explorer) checkCarriedState(op []int32, addr []int64, pc []uint64, valSet []int32, val []uint64) {
+	if e.res.CarriedState {
+		return // one piece of evidence is enough; the first is the most relevant
+	}
+	written := make(map[int64]bool, 8)
+	first := e.firstRead
+	if first == nil {
+		first = map[int64]readObs{}
+		e.firstRead = first
+	}
+	for i := range op {
+		a := addr[i]
+		if a == 0 || valSet[i] == 0 {
+			continue
+		}
+		switch uint8(op[i]) {
+		case opWrite:
+			written[a] = true
+			e.lastWrite[a] = pc[i]
+		case opRead:
+			if written[a] {
+				continue // this run established the value itself
+			}
+			if val[i] >= carriedValueLimit {
+				// Only small scalars are usable evidence. A pointer-sized value differs
+				// between runs because it points at a freshly allocated object, not
+				// because any state was carried over — comparing those would report every
+				// model that reads a pointer it did not just write.
+				continue
+			}
+			obs, seen := first[a]
+			if !seen {
+				first[a] = readObs{val: val[i], pc: pc[i]}
+				continue
+			}
+			if obs.val == val[i] || obs.val >= carriedValueLimit {
+				continue
+			}
+			b := []byte("read ")
+			b = appendInt(b, int(val[i]))
+			b = appendAt(b, pc[i])
+			b = append(b, ", but the first schedule read "...)
+			b = appendInt(b, int(obs.val))
+			b = appendAt(b, obs.pc)
+			if w, ok := e.lastWrite[a]; ok && w != 0 {
+				b = append(b, "; an earlier schedule wrote it"...)
+				b = appendAt(b, w)
+			}
+			e.res.CarriedState = true
+			e.res.CarriedStateReason = string(b)
+			return
+		}
+	}
+}
+
+// readObs is the first value a location was seen to hold before this exploration
+// wrote it, and where that read happened.
+type readObs struct {
+	val uint64
+	pc  uint64
+}
+
+// appendAt appends " at file:line" for a PC, or nothing if it has no position.
+func appendAt(b []byte, pc uint64) []byte {
+	if pc == 0 {
+		return b
+	}
+	fr, _ := runtime.CallersFrames([]uintptr{uintptr(pc)}).Next()
+	if fr.File == "" {
+		return b
+	}
+	b = append(b, " at "...)
+	b = append(b, baseName(fr.File)...)
+	b = append(b, ':')
+	return appendInt(b, fr.Line)
+}
+
+// carriedValueLimit bounds the values checkCarriedState is willing to reason about.
+// Counters, flags, lengths and small ids live well below it; anything above is a
+// pointer, a hash or a nanosecond timestamp, none of which say anything about state
+// crossing a schedule boundary. It also keeps appendInt within its digit budget.
+const carriedValueLimit = 1 << 32
+
+// snapshotPrefix records the transitions the next run must reproduce: everything
+// strictly before the step whose choice we are about to change. Step d itself is
+// deliberately excluded — that is the new choice, so it is expected to differ.
+func (e *explorer) snapshotPrefix(d int, wid, op []int32, pc []uint64) {
+	e.snapshot(d, wid, op, pc, false, false)
+}
+
+// snapshot records the transitions the next run must reproduce. full says the
+// snapshot covers a whole run, in which case the next run must also END there; a
+// prefix snapshot only constrains its own first d transitions, since the run
+// legitimately continues past them.
+func (e *explorer) snapshot(d int, wid, op []int32, pc []uint64, full, soft bool) {
+	e.expectWid = append(e.expectWid[:0], wid[:d]...)
+	e.expectOp = append(e.expectOp[:0], op[:d]...)
+	e.expectPC = append(e.expectPC[:0], pc[:d]...)
+	e.expectValid = true
+	e.expectFull = full
+	e.expectSoft = soft
+}
+
+// checkPrefix verifies that a forced prefix replayed to the same transitions. A
+// mismatch means the model is not reproducible: replaying the same choices from the
+// same starting state produced different behaviour, so every conclusion the search
+// draws is meaningless. The usual cause is state that outlives one schedule (a
+// package-level sync.Once or cache, or a variable declared outside the closure), but
+// any nondeterminism the scheduler does not control does it too — rand, real time,
+// an un-determinized map iteration, behaviour that depends on an address.
+//
+// Only wid and op are compared. Addresses and values legitimately differ between
+// runs (the heap layout moves), which is exactly why divergence has to be detected
+// at the level of "which participant did what kind of operation".
+func (e *explorer) checkPrefix(wid, op []int32, pc []uint64) bool {
+	if !e.expectValid {
+		return true
+	}
+	e.expectValid = false
+	soft := e.expectSoft
+	e.expectSoft = false
+	report := func(reason string) bool {
+		if soft {
+			e.res.WarmupDiverged = true
+			e.res.WarmupDivergedReason = reason
+			return true // exploration continues on the post-warm-up model
+		}
+		e.res.Diverged = true
+		e.res.DivergedReason = reason
+		return false
+	}
+	// Compare the transitions they have in common first: that pinpoints the step, and
+	// is more useful than "the trace got shorter". Only if every common transition
+	// matches is a length difference the signal — which is the shape a skipped
+	// initializer takes (the same operations happen, there are just fewer of them).
+	if len(wid) < len(e.expectWid) && !e.expectFull {
+		// The run ended before it finished replaying the prefix it was given.
+		e.expectFull = true // reuse the length branch below for the message
+	}
+	n := min(len(wid), len(e.expectWid))
+	for i := 0; i < n; i++ {
+		// Only the participant sequence is compared, not the operations. DPOR forces
+		// wids, so a wid mismatch means the replay did not happen; whereas "same
+		// goroutine, different operation" is dominated by library warm-up that has
+		// nothing to do with the model — sync.Pool taking a lock on first use and an
+		// atomic afterwards, a lazily grown output buffer inside testing. Flagging
+		// those would make weave unusable for any model that calls fmt.Sprint or t.Log.
+		if wid[i] == e.expectWid[i] {
+			continue
+		}
+		b := []byte("diverged at step ")
+		b = appendInt(b, i+1)
+		b = append(b, ": expected "...)
+		b = appendStep(b, e.expectWid[i], e.expectOp[i], e.expectPC[i])
+		b = append(b, ", got "...)
+		b = appendStep(b, wid[i], op[i], pc[i])
+		return report(string(b))
+	}
+	if e.expectFull && len(wid) != len(e.expectWid) {
+		b := []byte("diverged at step ")
+		b = appendInt(b, n+1)
+		b = append(b, ": the same choices produced "...)
+		b = appendInt(b, len(wid))
+		b = append(b, " transition(s) instead of "...)
+		b = appendInt(b, len(e.expectWid))
+		if len(wid) < len(e.expectWid) {
+			b = append(b, " — it stopped short of "...)
+			b = appendStep(b, e.expectWid[n], e.expectOp[n], e.expectPC[n])
+		} else {
+			b = append(b, " — it continued with "...)
+			b = appendStep(b, wid[n], op[n], pc[n])
+		}
+		return report(string(b))
+	}
+	return true
+}
+
+// appendStep renders one transition for a divergence message, e.g.
+// "g1 once (cache.go:18)". Formatted by hand to keep this package's dependencies at
+// runtime+time (see the seed encoder, which does the same).
+func appendStep(b []byte, wid, op int32, pc uint64) []byte {
+	if wid == ClockWid {
+		b = append(b, "clock"...)
+	} else {
+		b = append(b, 'g')
+		b = appendInt(b, int(wid))
+	}
+	b = append(b, ' ')
+	b = append(b, opName(uint8(op))...)
+	if pc != 0 {
+		if fr, _ := runtime.CallersFrames([]uintptr{uintptr(pc)}).Next(); fr.File != "" {
+			b = append(b, " ("...)
+			b = append(b, baseName(fr.File)...)
+			b = append(b, ':')
+			b = appendInt(b, fr.Line)
+			b = append(b, ')')
+		}
+	}
+	return b
+}
+
+// baseName is filepath.Base for the forward-slash paths runtime reports, avoiding a
+// path/filepath dependency.
+func baseName(path string) string {
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '/' {
+			return path[i+1:]
+		}
+	}
+	return path
 }
 
 // Replay deterministically re-runs the single interleaving encoded by seed (as
@@ -694,6 +1055,19 @@ func Replay(seed string, f func()) Result {
 			e.res.ClockAdvanced = true
 			break
 		}
+	}
+	// A seed is a vector of forced choices; if the run did not follow it, the seed
+	// does not describe this model (a stale seed, or a model that is not
+	// reproducible). weaveChoose falls back to the lowest runnable wid in that case,
+	// which used to make the mismatch silent — and a silent fallback reports
+	// "replayed, no failure", the most misleading answer possible.
+	if n := min(len(plan), min(steps, traceCap)); n > 0 {
+		e.expectWid = append(e.expectWid[:0], plan[:n]...)
+		e.expectOp = append(e.expectOp[:0], e.traceOp[:n]...) // ops are not forced; compare wid only
+		e.expectPC = append(e.expectPC[:0], e.tracePC[:n]...)
+		e.expectValid = true
+		e.expectSoft = false
+		e.checkPrefix(e.traceWid[:n], e.traceOp[:n], e.tracePC[:n])
 	}
 	e.res.Seed = seed
 	// Same clamp/outcome ordering as ExploreBounded: the runtime keeps counting

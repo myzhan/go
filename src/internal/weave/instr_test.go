@@ -14,7 +14,9 @@ package weave
 
 import (
 	"fmt"
+	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -561,6 +563,147 @@ func TestStructTearingObservable(t *testing.T) {
 		t.Fatalf("expected a torn read of the two-field struct; explored %d schedules (field-by-field store missing? rebuild cmd/compile)", res.Runs)
 	}
 	t.Logf("struct tearing observed after %d schedule(s)", res.Runs)
+}
+
+// carriedInt outlives one schedule on purpose (see the two tests below).
+var carriedInt int
+
+// The evidence that actually helps a reader is not "you touched outer state" but
+// "this schedule read a value an earlier schedule left" — and where both happened.
+// Requires -weave, since it is read out of the memory transitions.
+func TestCarriedStateNamesBothPositions(t *testing.T) {
+	carriedInt = 0
+	res := Explore(func() {
+		n := carriedInt // reads what the previous schedule left
+		carriedInt = n + 1
+		ch := make(chan int, 1)
+		go func() { ch <- 1 }()
+		<-ch
+		Wait()
+	})
+	if !res.CarriedState {
+		t.Fatalf("a counter read from a previous schedule must be noticed; got %+v after %d schedule(s)",
+			res, res.Runs)
+	}
+	// Both the read and the earlier write should be named, by file:line.
+	for _, want := range []string{"instr_test.go", "read ", "but the first schedule read "} {
+		if !strings.Contains(res.CarriedStateReason, want) {
+			t.Errorf("evidence %q does not mention %q", res.CarriedStateReason, want)
+		}
+	}
+	t.Logf("carried state: %s", res.CarriedStateReason)
+}
+
+// Writing outer state without reading it back is normal and must stay silent: that
+// is what keeps weave usable on coarse-grained tests.
+func TestWriteOnlyCarriedStateIsSilent(t *testing.T) {
+	carriedInt = 0
+	collected := []int{} // outside the model, written every schedule
+	res := Explore(func() {
+		ch := make(chan int, 2)
+		go func() { ch <- 1 }()
+		go func() { ch <- 2 }()
+		a, b := <-ch, <-ch
+		carriedInt = a + b                 // write-only: never read back
+		collected = append(collected, a+b) // ditto
+		Wait()
+	})
+	if res.CarriedState {
+		t.Fatalf("write-only outer state must not be reported: %s", res.CarriedStateReason)
+	}
+	if res.Failed || res.Deadlock || res.NotConfirmed {
+		t.Fatalf("model is correct; got %+v", res)
+	}
+	if res.Runs < 3 {
+		t.Fatalf("only %d schedule(s): the cross-schedule check never had two runs to compare", res.Runs)
+	}
+	t.Logf("write-only outer state stayed silent across %d schedule(s) (collected %d results)",
+		res.Runs, len(collected))
+}
+
+// A model that reads a POINTER it has not written must stay silent, even though the
+// value differs between runs: it differs because it points at a freshly allocated
+// object, not because anything crossed a schedule boundary. Regression for the first
+// version of this check, which reported every double-checked-locking style model —
+// and, formatting a pointer-sized value, panicked while doing it.
+func TestPointerValuesAreNotCarriedState(t *testing.T) {
+	type cfg struct{ val int }
+	res := Explore(func() {
+		var mu sync.Mutex
+		var instance *cfg // freshly allocated each schedule; its address is not
+		get := func() *cfg {
+			if instance == nil { // reads a pointer it has not written yet
+				mu.Lock()
+				if instance == nil {
+					instance = &cfg{val: 42}
+				}
+				mu.Unlock()
+			}
+			return instance
+		}
+		go func() { _ = get() }()
+		go func() {
+			if c := get(); c != nil && c.val != 42 {
+				panic("half-constructed object")
+			}
+		}()
+		Wait()
+	})
+	if res.CarriedState {
+		t.Fatalf("a pointer read is not evidence of carried state: %s", res.CarriedStateReason)
+	}
+	if res.Failed || res.Deadlock || res.NotConfirmed {
+		t.Fatalf("model is correct under sequential consistency; got %+v", res)
+	}
+	t.Logf("pointer-valued reads stayed silent across %d schedule(s)", res.Runs)
+}
+
+// Every transition should carry the source position the user would recognize, not
+// the position inside the primitive that implements it. The library hooks are called
+// from within sync/sync-atomic, so they reach past themselves and past the method
+// that called them (see runtime.weaveSchedPointSkip) — a fixed frame count that this
+// test pins down, because a refactor of those helpers would silently shift it and
+// every report would start blaming sync/mutex.go instead of the caller.
+func TestTransitionsCarryCallerPosition(t *testing.T) {
+	var mu sync.Mutex
+	var flag atomic.Bool
+	ch := make(chan int)
+	var lockLine, atomicLine, chanLine int
+	res := Explore(func() {
+		go func() {
+			mu.Lock() // lockLine
+			_, _, lockLine, _ = runtime.Caller(0)
+			mu.Unlock()
+			flag.Store(true) // atomicLine
+			_, _, atomicLine, _ = runtime.Caller(0)
+			ch <- 1 // chanLine
+			_, _, chanLine, _ = runtime.Caller(0)
+		}()
+		<-ch
+		Wait()
+		panic("report the trace") // the only way to get the trace out
+	})
+	if !res.Failed {
+		t.Fatalf("expected the model to panic so its trace is reported; got %+v", res)
+	}
+	// runtime.Caller(0) reports the line it is called on, one below the operation.
+	want := map[string]int{"lock": lockLine - 1, "atomic store": atomicLine - 1, "chan send": chanLine - 1}
+	got := map[string]int{}
+	for _, s := range res.Trace {
+		if _, ok := want[s.Op]; ok && got[s.Op] == 0 {
+			got[s.Op] = s.Line
+		}
+	}
+	for op, wantLine := range want {
+		if got[op] != wantLine {
+			t.Errorf("%q transition reported line %d, want %d (the caller's line) — the frame skip in the %s hook is off",
+				op, got[op], wantLine, op)
+		}
+	}
+	if !t.Failed() {
+		t.Logf("lock/atomic/chan transitions all report the caller's line (%d/%d/%d)",
+			got["lock"], got["atomic store"], got["chan send"])
+	}
 }
 
 // --- sync-primitive hooks (weave-only since ADR D20) -----------------------

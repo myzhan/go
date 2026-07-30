@@ -56,6 +56,10 @@ func weaveExplore(t *testing.T, f func(*testing.T)) bool {
 		switch {
 		case weaveSkipped(res):
 			t.SkipNow()
+		case res.Diverged:
+			t.Errorf("weave: replay of seed %s did not follow the seed (%s); the seed was "+
+				"produced by a different build of this test, or the model is not reproducible "+
+				"across runs.", seed, res.DivergedReason)
 		case !replayInconclusive(res):
 			t.Logf("weave: replayed seed %s, no failure", seed)
 		case res.Truncated:
@@ -95,12 +99,18 @@ func weaveExplore(t *testing.T, f func(*testing.T)) bool {
 		// The model skipped itself; there is nothing to explore. The skip reason was
 		// already logged, so just skip the real test.
 		t.SkipNow()
+	case res.NotConfirmed:
+		t.Errorf("weave: found a failing interleaving after %d schedule(s) but %s, so it is not "+
+			"reported: an interleaving you cannot reproduce is not a finding. Either the model "+
+			"depends on state an earlier schedule left behind (declare shared state inside the "+
+			"closure passed to synctest.Test), or this is a bug in weave itself.%s",
+			res.Runs, res.NotConfirmedReason, notReproducibleNote(res))
 	case res.Failed, res.Deadlock:
 		lab := newAddrLabeler()
 		t.Errorf("weave: found failing interleaving after %d schedule(s):\n%s%s%s\n"+
-			"reproduce with: %s",
+			"reproduce with: %s%s",
 			res.Runs, formatGoroutines(res.Goroutines), formatTrace(res.Trace, lab), formatOutcome(res, lab),
-			replayCommand(res.Seed, t.Name(), res.Trace))
+			replayCommand(res.Seed, t.Name(), res.Trace), notReproducibleNote(res))
 	case res.Truncated:
 		hint := ""
 		if maxPreempt < 0 {
@@ -115,7 +125,8 @@ func weaveExplore(t *testing.T, f func(*testing.T)) bool {
 		if maxPreempt < 0 {
 			note = " (default ceiling; set WEAVE_MAX_PREEMPTIONS to search deeper)"
 		}
-		t.Logf("weave: ok, explored %d schedule(s) up to %d preemption(s)%s", res.Runs, ceiling, note)
+		t.Logf("weave: ok, explored %d schedule(s) up to %d preemption(s)%s%s", res.Runs, ceiling, note,
+			notReproducibleNote(res))
 		if res.UnfiredTimer && !res.ClockAdvanced {
 			// Advancing the clock is a scheduling choice now (D22), so a stranded timer
 			// only matters when that choice was never taken anywhere — which within a
@@ -175,7 +186,7 @@ func exploreIterative(body func(), budget, ceiling int, timeout time.Duration) w
 		spent += res.Runs
 		unfired = unfired || res.UnfiredTimer
 		advanced = advanced || res.ClockAdvanced
-		if res.Failed || res.Deadlock || res.Truncated {
+		if res.Diverged || res.NotConfirmed || res.Failed || res.Deadlock || res.Truncated {
 			res.UnfiredTimer = unfired
 			res.ClockAdvanced = advanced
 			return res
@@ -199,6 +210,39 @@ func resolveTimeout(env string) time.Duration {
 		return defaultTimeout
 	}
 	return d
+}
+
+// notReproducibleNote returns the caveat to append to a report when the model was
+// observed not to behave identically across runs. weave replays earlier choices to
+// explore, so a model that drifts undermines everything the search concludes: a
+// reported counterexample may be an artifact of state left by an earlier schedule
+// rather than a concurrency bug, and a clean result may have explored a different
+// program than the one under test.
+//
+// It is deliberately a note and never a failure of its own. Anything a model does
+// through the *testing.T it was handed — t.Log, t.Helper — appends to the parent
+// test's output, so a model that logs is non-reproducible by construction; so is one
+// that calls fmt.Sprint, since sync.Pool takes a lock on first use and an atomic
+// afterwards. Failing on that would rule out most real tests.
+func notReproducibleNote(res weave.Result) string {
+	// The value-level evidence is the most actionable, since it names both source
+	// positions: prefer it over the transition-level one.
+	reason := res.CarriedStateReason
+	if reason == "" {
+		reason = res.DivergedReason
+	}
+	if reason == "" {
+		reason = res.WarmupDivergedReason
+	}
+	if reason == "" {
+		return ""
+	}
+	return "\nweave: note: the model did not behave identically across runs (" + reason + "). " +
+		"If that is state of your own outliving a schedule — a package-level sync.Once or " +
+		"cache, or a variable declared OUTSIDE the closure passed to synctest.Test — then " +
+		"this result is about a program that changes between schedules: declare that state " +
+		"inside the closure, or reset it at the top of the model. (Logging through t inside " +
+		"the model has the same effect and is harmless.)"
 }
 
 // weaveSkipped reports whether the model skipped itself (t.Skip/SkipNow inside the

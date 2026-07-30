@@ -6,6 +6,7 @@ package weave
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -183,6 +184,164 @@ func TestClockAdvanceSeedReplays(t *testing.T) {
 		}
 	}
 	t.Logf("clock-advance seed %q replays deterministically", found.Seed)
+}
+
+// leakyOnce and leakyCount outlive one schedule on purpose: they are the state a
+// model must NOT depend on, and the tests below assert weave says so.
+var (
+	leakyOnce  sync.Once
+	leakyCount int
+)
+
+// Exploration works by replaying a prefix of its earlier choices, which is only
+// meaningful if the model behaves identically given the same choices. A
+// package-level sync.Once breaks that: the first schedule runs the initializer, the
+// rest skip it, so from the second schedule onwards weave is exploring a different
+// program than the one it recorded. That used to be entirely silent — weave would
+// report "explored N schedules, ok" about a model it never actually explored. It must
+// now be noticed, with the step named, so the report can carry the caveat.
+func TestNonReproducibleModelDetected(t *testing.T) {
+	leakyOnce = sync.Once{}
+	res := Explore(func() {
+		ch := make(chan int, 1)
+		go func() {
+			leakyOnce.Do(func() { ch <- 1 }) // only the first schedule sends
+			ch <- 2
+		}()
+		<-ch
+		Wait()
+	})
+	// A sync.Once initializes exactly once, so the difference is between the first
+	// run and the second; runs 2 and 3 then agree. That is recorded as warm-up
+	// evidence rather than a hard error, because the standard library's own lazy
+	// initialization looks identical (see WarmupDiverged) — the point of this test is
+	// that weave notices at all, and can say where.
+	if !res.WarmupDiverged {
+		t.Fatalf("a package-level sync.Once makes the first schedule differ from the rest, "+
+			"but exploration noticed nothing: %+v after %d schedule(s)", res, res.Runs)
+	}
+	if res.Failed || res.Deadlock {
+		t.Errorf("one-shot state must not be reported as a found bug: %+v", res)
+	}
+	if !strings.Contains(res.WarmupDivergedReason, "diverged at step") {
+		t.Errorf("reason %q does not name the diverging step", res.WarmupDivergedReason)
+	}
+	t.Logf("one-shot outer state noticed: %s", res.WarmupDivergedReason)
+}
+
+// State that keeps changing on every run — as opposed to initializing once — cannot
+// be explained away as warm-up: runs 2 and 3 differ too, so the search is exploring a
+// moving target. weave must notice and be able to say where, so the report can carry
+// the caveat (it is evidence rather than a verdict: see Result.Diverged).
+func TestAccumulatingOuterStateReported(t *testing.T) {
+	leakyCount = 0
+	res := Explore(func() {
+		leakyCount++
+		n := leakyCount // grows with every schedule, so no two runs agree
+		ch := make(chan int, 8)
+		go func() {
+			for i := 0; i < n; i++ {
+				ch <- i
+			}
+			close(ch)
+		}()
+		for range ch {
+		}
+		Wait()
+	})
+	if !res.Diverged {
+		t.Fatalf("state that changes on every run must be noticed; got %+v after %d schedule(s)",
+			res, res.Runs)
+	}
+	if !strings.Contains(res.DivergedReason, "diverged at step") {
+		t.Errorf("reason %q does not name the diverging step", res.DivergedReason)
+	}
+	t.Logf("accumulating outer state reported: %s", res.DivergedReason)
+}
+
+// The check must not fire on the common and harmless shape: a model that WRITES
+// state outliving the schedule (collecting results, bumping a counter) without its
+// own behaviour depending on it. Flagging this would make weave unusable for
+// coarse-grained tests, which legitimately touch plenty of outer state.
+func TestWriteOnlyOuterStateIsFine(t *testing.T) {
+	leakyCount = 0
+	collected := []int{} // declared outside the model on purpose
+	res := Explore(func() {
+		ch := make(chan int, 2)
+		go func() { ch <- 1 }()
+		go func() { ch <- 2 }()
+		a, b := <-ch, <-ch
+		leakyCount++                       // accumulates across schedules
+		collected = append(collected, a+b) // grows across schedules
+		Wait()
+	})
+	if res.Diverged {
+		t.Fatalf("write-only outer state must not be reported as non-reproducible: %s", res.DivergedReason)
+	}
+	if res.Failed || res.Deadlock {
+		t.Fatalf("model is correct; got %+v", res)
+	}
+	if res.Runs < 2 {
+		t.Fatalf("model explored only %d schedule(s), so the cross-run check never ran", res.Runs)
+	}
+	t.Logf("write-only outer state stayed silent across %d schedule(s) (counter reached %d)", res.Runs, leakyCount)
+}
+
+// A "failure" that only happens because an earlier schedule left state behind is
+// not a finding: rerunning the very same choices does not reproduce it. weave must
+// notice that before handing the reader a counterexample they cannot act on.
+//
+// The model below panics exactly once — on the schedule where the counter reaches 2 —
+// so the confirming rerun sees 3 and no panic. A real concurrency bug reproduces from
+// the same choices every time, which the next test asserts.
+func TestUnreproducibleFailureIsNotReported(t *testing.T) {
+	leakyCount = 0
+	res := Explore(func() {
+		leakyCount++
+		if leakyCount == 2 {
+			panic("only on the second schedule")
+		}
+		ch := make(chan int, 1)
+		go func() { ch <- 1 }()
+		<-ch
+		Wait()
+	})
+	if !res.NotConfirmed {
+		t.Fatalf("a failure that does not rerun must not be reported as a finding; got %+v", res)
+	}
+	if res.Failed || res.Deadlock {
+		t.Errorf("an unconfirmed failure must not also be presented as one: %+v", res)
+	}
+	if res.Trace != nil {
+		t.Errorf("an unconfirmed failure must not carry a trace: %+v", res.Trace)
+	}
+	t.Logf("unreproducible failure withheld: %s", res.NotConfirmedReason)
+}
+
+// The counterpart: a real schedule-dependent bug reproduces when the same choices are
+// replayed, so confirmation must not get in the way of reporting it.
+func TestReproducibleFailureStillReported(t *testing.T) {
+	res := Explore(func() {
+		ch := make(chan int, 2)
+		done := make(chan bool, 2)
+		go func() { ch <- 1; done <- true }()
+		go func() { ch <- 2; done <- true }()
+		<-done
+		<-done
+		if first := <-ch; first != 1 {
+			panic("order-dependent receive")
+		}
+	})
+	if !res.Failed {
+		t.Fatalf("expected the order-dependent panic to be found and reported; got %+v", res)
+	}
+	if res.NotConfirmed {
+		t.Fatalf("a genuine schedule-dependent bug must reproduce on rerun: %s", res.NotConfirmedReason)
+	}
+	if len(res.Trace) == 0 || res.Seed == "" {
+		t.Errorf("a confirmed failure must carry its trace and seed; got %+v", res)
+	}
+	t.Logf("confirmed failure reported after %d schedule(s), including the confirming rerun", res.Runs)
 }
 
 // A genuine deadlock with no pending timer must still be reported as a deadlock,
