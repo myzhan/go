@@ -344,6 +344,56 @@ func TestReproducibleFailureStillReported(t *testing.T) {
 	t.Logf("confirmed failure reported after %d schedule(s), including the confirming rerun", res.Runs)
 }
 
+// A seed is a vector of forced choices, so a run that does not follow it is not the
+// interleaving the seed describes — the seed came from a different build of the test,
+// or the model is not reproducible. weaveChoose falls back to the lowest runnable
+// participant when a planned wid cannot run, and that fallback used to be silent,
+// which turned a stale seed into the most misleading answer available: "replayed, no
+// failure". Unlike divergence during exploration, this one is unambiguous and is
+// reported.
+func TestReplayRejectsSeedItCannotFollow(t *testing.T) {
+	model := func() {
+		ch := make(chan int, 1)
+		go func() { ch <- 1 }()
+		<-ch
+		Wait()
+	}
+	// wid 7 never exists in this model (it has two participants), so the plan cannot
+	// be followed and the fallback kicks in.
+	res := Replay("0.7.0.0", model)
+	if !res.Diverged {
+		t.Fatalf("a seed naming a participant that does not exist must be rejected; got %+v", res)
+	}
+	if !strings.Contains(res.DivergedReason, "diverged at step") {
+		t.Errorf("reason %q does not say where the replay left the seed", res.DivergedReason)
+	}
+	// A seed the model does follow must replay silently.
+	good := Explore(func() {
+		ch := make(chan int, 1)
+		go func() { ch <- 1 }()
+		<-ch
+		Wait()
+		panic("boom")
+	})
+	if !good.Failed || good.Seed == "" {
+		t.Fatalf("setup: expected a seed to replay; got %+v", good)
+	}
+	rep := Replay(good.Seed, func() {
+		ch := make(chan int, 1)
+		go func() { ch <- 1 }()
+		<-ch
+		Wait()
+		panic("boom")
+	})
+	if rep.Diverged {
+		t.Errorf("a seed produced by this model must replay without complaint: %s", rep.DivergedReason)
+	}
+	if !rep.Failed {
+		t.Errorf("replaying the failing seed should reproduce the panic; got %+v", rep)
+	}
+	t.Logf("stale seed rejected: %s", res.DivergedReason)
+}
+
 // A genuine deadlock with no pending timer must still be reported as a deadlock,
 // not mistaken for a clock-advance opportunity.
 func TestFakeClockNoTimerStillDeadlock(t *testing.T) {

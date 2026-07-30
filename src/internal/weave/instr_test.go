@@ -706,6 +706,126 @@ func TestTransitionsCarryCallerPosition(t *testing.T) {
 	}
 }
 
+// Every primitive weave claims to instrument must actually leave its own transition
+// in the trace. The models elsewhere in this file assert OUTCOMES, and an outcome can
+// usually be reached some other way — under -weave every memory access is a
+// scheduling point too, so a missing lock or Once hook is invisible to them. Deleting
+// the whole sync-package hook set (RWMutex, Once, Cond, WaitGroup) used to leave all
+// 56 tests here and all 37 demos passing, with only the exploration time quietly
+// collapsing. This test is the direct check that each op is recorded.
+func TestEveryPrimitiveIsASchedulingPoint(t *testing.T) {
+	res := Explore(func() {
+		var mu sync.Mutex
+		var rw sync.RWMutex
+		var once sync.Once
+		var wg sync.WaitGroup
+		var flag atomic.Bool
+		cond := sync.NewCond(&sync.Mutex{})
+		ch := make(chan int, 1)
+		other := make(chan int, 1)
+
+		mu.Lock()
+		mu.Unlock()
+		if mu.TryLock() {
+			mu.Unlock()
+		}
+		rw.Lock()
+		rw.Unlock()
+		rw.RLock()
+		rw.RUnlock()
+		once.Do(func() {})
+		flag.Store(true)
+		_ = flag.Load()
+		flag.CompareAndSwap(true, false)
+
+		// The rendezvous forces the waiter to reach cond.Wait before the predicate is
+		// set: otherwise the default schedule runs the setter first and Wait never
+		// happens, so the op would be missing for a reason unrelated to instrumentation.
+		ready := false
+		reached := make(chan int)
+		wg.Add(1)
+		go func() {
+			cond.L.Lock()
+			reached <- 1
+			for !ready {
+				cond.Wait()
+			}
+			cond.L.Unlock()
+			wg.Done()
+		}()
+		<-reached     // the waiter holds cond.L here
+		cond.L.Lock() // blocks until Wait releases it
+		ready = true
+		cond.Signal()
+		cond.Broadcast()
+		cond.L.Unlock()
+		wg.Wait()
+
+		ch <- 1
+		<-ch
+		other <- 2
+		select { // one case plus default compiles to a non-blocking receive
+		case <-other:
+		default:
+		}
+		ch <- 3
+		other <- 4
+		select { // two real cases exercise selectgo itself
+		case <-ch:
+		case <-other:
+		}
+		close(ch)
+		Wait()
+		panic("report the trace") // the trace is only surfaced on failure
+	})
+	if !res.Failed {
+		t.Fatalf("expected the model to panic so its trace is reported; got %+v", res)
+	}
+	seen := map[string]bool{}
+	for _, s := range res.Trace {
+		seen[s.Op] = true
+	}
+	// One entry per hook that must exist. rlock/runlock are distinct from lock/unlock
+	// on purpose (D20), so a read lock recorded as "lock" is also a failure here.
+	for _, op := range []string{
+		"lock", "unlock", "rlock", "runlock", "once",
+		"cond wait", "cond signal", "cond broadcast", "wg add", "wg wait",
+		"atomic load", "atomic store", "atomic rmw",
+		"chan send", "chan recv", "chan close", "chan recv (nb)", "select",
+	} {
+		if !seen[op] {
+			t.Errorf("no %q transition in the trace: that primitive is not a scheduling point", op)
+		}
+	}
+	if !t.Failed() {
+		t.Logf("all %d instrumented primitives recorded their own transition", len(seen))
+	}
+}
+
+// The read lock in particular needs its own behavioural check, because an outcome
+// test can reach the same state through the memory accesses around it. Here the two
+// RLock calls have NOTHING between them — no memory access, no other operation — so
+// the only way a writer can slip in between and deadlock the reader (RWMutex is not
+// re-entrant and gives writers priority) is if RLock itself is a scheduling point.
+func TestReadLockIsASchedulingPoint(t *testing.T) {
+	res := Explore(func() {
+		var rw sync.RWMutex
+		go func() {
+			rw.Lock()
+			rw.Unlock()
+		}()
+		rw.RLock()
+		rw.RLock() // blocks behind the queued writer, which holds the first RLock
+		rw.RUnlock()
+		rw.RUnlock()
+	})
+	if !res.Deadlock {
+		t.Fatalf("re-entrant RLock with a queued writer must deadlock in some schedule; "+
+			"explored %d schedule(s): %+v — is the RLock hook still there?", res.Runs, res)
+	}
+	t.Logf("re-entrant read lock deadlock found after %d schedule(s)", res.Runs)
+}
+
 // --- sync-primitive hooks (weave-only since ADR D20) -----------------------
 //
 // RWMutex/Once/Cond/WaitGroup hooks are compiled in under the "weave" build tag,
